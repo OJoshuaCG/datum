@@ -2848,3 +2848,59 @@ Quedan abiertos, y se señalan: la carrera check-then-write al asignar un bluepr
 una base sin blueprint); el `generic_exception_handler` registra `str(exc)` de excepciones no mapeadas que no sean
 de SQLAlchemy (un error de motor mapeado no lleva texto del motor, pero uno inesperado va al log, no a la
 respuesta).
+
+## Canales de liberación de blueprints
+
+Guía de uso en [`release-channels.md`](../features/release-channels.md); contrato en `api-reference-v46.md`.
+
+### `blueprints.promote` es una capacidad aparte y sensible; `release_channels.write` no
+
+Mover el puntero de `stable` decide qué versión llega a bases reales, y eso no es autoría (`blueprints.write`,
+`operator`) ni ejecución (`blueprints.apply`). Se creó `blueprints.promote` (eje entorno, solo `owner`, step-up) y,
+como todo lo exclusivo de `owner`, entra al conjunto sensible: 16 pasa a 17 y los conteos fijados en tests y en el
+fixture de la SPA cambian en la misma unidad. `release_channels.write` copia a `environments.write` (global,
+`security_officer`, sin respaldo de `access.admin`) y **no** se agrega al conjunto sensible: es global y no se
+otorga suelta, así que un segundo aprobador no tendría qué aprobar. No hay que «igualarlas».
+
+### El puntero apunta a un id de versión, no a una etiqueta
+
+`blueprint_channel_pointers.model_migration_id` es una FK a `model_migrations.id`, no un texto como `0007`. Un
+renumerado cambia las etiquetas pero no los ids, así que el puntero sobrevive solo. El historial, en cambio,
+guarda la etiqueta al momento del evento (y los ids sin FK) para que un borrado o renumerado posterior no lo
+reescriba ni lo pierda. La FK es `ON DELETE SET NULL` y es solo la red de seguridad: la aplicación mueve el puntero
+**antes** de borrar la versión.
+
+### Borrar la versión apuntada: se mueve el puntero y se pide confirmación
+
+El destino es la versión **revisada** inmediatamente menor (o `NULL`): así se conserva el invariante «los
+punteros solo están sobre versiones revisadas». `requires_confirmation` pasó de `bool(stamp_plan)` a
+`bool(stamp_plan) or bool(channel_moves)` a propósito: retroceder `stable` es una decisión de liberación, y borrar
+una punta apuntada por un canal manual ahora exige el token del plan aunque no haya bases que re-marcar. Es un
+cambio de comportamiento deliberado. La huella del plan incluye los movimientos, de modo que un puntero que se
+mueve entre el plan y el borrado invalida el token; por la misma razón, **desplegar invalida los tokens
+pendientes**.
+
+El movimiento ocurre dentro de `_apply_renumber`, después de tomar el lock de la fila de `DatabaseModel` y antes de
+borrar la versión. `promote` toma el mismo lock, así que no hay carrera. Los stamps (escritura remota) siguen
+yendo antes; los punteros son solo la fase local. Si al re-leer los punteros no coinciden con el plan, se responde
+`409` de plan vencido y se dispara la compensación de stamps de siempre.
+
+### `derived`: estricto para consumir, tolerante para mirar
+
+Los consumidores (alta, aplicar a todas, integración) leen en vivo y **fallan cerrado**: con una base muda, el
+mínimo de las demás podría quedar por encima del real y el lote avanzaría sobre una base que no se pudo ver. Pero
+una pantalla que respondiera `409` ante una base caída no mostraría nada justo cuando más hace falta saber qué pasa.
+Por eso el listado y `resolve` son tolerantes (`200`, `resolved: false`, `readable` por base) y el listado usa la
+caché del inventario rotulada `inventory_cache`: un `GET` no puede abrir una conexión por base. Ningún consumidor
+usa la caché.
+
+### `latest` incluye la punta sin revisar
+
+Es la semántica que ya tenía «aplicar la última». Aprovisionar con `channel=development` sobre una punta sin
+revisar lo rechazan las guardas de revisión existentes. No se agregó una segunda regla en el resolver.
+
+### Lo que NO se cierra
+
+Un puntero manual cuya versión pierde después la marca de revisada **sigue resolviendo**: se confía en las guardas
+de cada consumidor. Es una decisión abierta, no un descuido.
+
