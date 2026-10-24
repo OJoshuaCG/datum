@@ -59,6 +59,11 @@ from app.models.project import Project, ProjectDatabaseModel
 from app.models.schema_comparison import SchemaComparison
 from app.models.schema_comparison_item import SchemaComparisonItem
 from app.models.query_execution import QueryExecution
+from app.models.release_channel import (
+    BlueprintChannelPointer,
+    BlueprintChannelPointerEvent,
+    ReleaseChannel,
+)
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.models.sod_exception import SodException
@@ -85,6 +90,9 @@ __all__ = [
     "ManagedDatabase",
     "ManagedDatabaseDataCredential",
     "Environment",
+    "ReleaseChannel",
+    "BlueprintChannelPointer",
+    "BlueprintChannelPointerEvent",
     "ModelMigration",
     "DatabaseMigrationHistory",
     "MigrationStatementProgress",

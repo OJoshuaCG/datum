@@ -3,7 +3,7 @@ Migración ``f8b0d2e4a6c9``: tabla ``sod_exceptions`` y herencia de las combinac
 
 Corre sobre SQLite en memoria con el ``Operations`` de Alembic, con las tablas mínimas de las que
 lee la herencia. Prueba el DDL real contra el modelo, la idempotencia (también de la herencia),
-el downgrade, y que la foto de capacidades exclusivas de ``owner`` coincide con el catálogo.
+el downgrade, y que la foto de capacidades exclusivas de ``owner`` sigue contenida en el catálogo.
 """
 
 import importlib.util
@@ -111,9 +111,14 @@ def test_model_is_registered_in_metadata():
     assert app.models.SodException is SodException
 
 
-def test_owner_only_snapshot_matches_the_catalog():
-    """La foto de la migración es la del catálogo HOY. Si el catálogo cambia, este test lo dice."""
-    assert set(mig._OWNER_ONLY) == {c.value for c in OWNER_ONLY_CAPABILITIES}
+def test_owner_only_snapshot_is_still_owner_only_in_the_catalog():
+    """
+    La foto está congelada a propósito (la migración ya corrió y no importa código de la app), así
+    que el catálogo puede sumar capacidades owner-only sin tocarla. Lo que no puede pasar en
+    silencio es que una capacidad de la foto deje de ser owner-only: la herencia de la migración
+    habría exceptuado combinaciones con un criterio que el catálogo ya no aplica.
+    """
+    assert set(mig._OWNER_ONLY) <= {c.value for c in OWNER_ONLY_CAPABILITIES}
     assert (mig._RULE_OWNER, mig._RULE_ACCESS_ADMIN) == (SOD_RULE_OWNER, SOD_RULE_ACCESS_ADMIN)
 
 

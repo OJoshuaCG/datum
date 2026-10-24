@@ -39,7 +39,7 @@ o cambia de forma irreversible datos o estructura del tercero.
 
 ### 1.1 Tabla del catálogo
 
-Generada desde `capability_matrix()` (32 filas). `✓` = sí, `—` = no. *Cursiva* = capacidad global.
+Generada desde `capability_matrix()` (32 filas al escribirse; los canales de liberación suman 3, ver abajo). `✓` = sí, `—` = no. *Cursiva* = capacidad global.
 "Sensible" = otorgarla suelta pide un segundo aprobador (§3).
 
 | Capacidad | Módulo | Nivel | Eje | mutates | discloses | destructive | step-up | agente | otorgable | sensible | Roles / global |
@@ -59,6 +59,7 @@ Generada desde `capability_matrix()` (32 filas). `✓` = sí, `—` = no. *Cursi
 | `blueprints.read` | blueprints | read | environment | — | — | — | — | ✓ | ✓ | — | viewer, operator, owner |
 | `blueprints.write` | blueprints | write | environment | ✓ | — | — | — | — | ✓ | — | operator, owner |
 | `blueprints.apply` | blueprints | apply | environment | ✓ | — | ✓ | ✓ | — | ✓ | ✓ | owner |
+| `blueprints.promote` | blueprints | promote | environment | ✓ | — | — | ✓ | — | ✓ | ✓ | owner |
 | `blueprints.captures` | blueprints | captures | environment | — | ✓ | — | ✓ | — | ✓ | ✓ | owner |
 | `schema.definitions` | schema | definitions | environment | — | — | — | — | — | ✓ | — | operator, owner |
 | `schema_diff.read` | schema_diff | read | environment | — | — | — | — | ✓ | ✓ | — | viewer, operator, owner |
@@ -76,11 +77,23 @@ Generada desde `capability_matrix()` (32 filas). `✓` = sí, `—` = no. *Cursi
 | `catalogs.write` | catalogs | write | global | ✓ | — | — | ✓ | — | — | — | *security_officer* |
 | `environments.read` | environments | read | global | — | — | — | — | — | — | — | viewer, operator, owner |
 | `environments.write` | environments | write | global | ✓ | — | — | ✓ | — | — | — | *security_officer* |
+| `release_channels.read` | release_channels | read | global | — | — | — | — | — | — | — | viewer, operator, owner |
+| `release_channels.write` | release_channels | write | global | ✓ | — | — | ✓ | — | — | — | *security_officer* |
 | `access.admin` | access | admin | global | ✓ | — | — | ✓ | — | — | — | *access_admin* |
 | `audit.read` | audit | read | global | — | — | — | — | — | — | — | *security_officer* |
 | `crypto.rotate` | crypto | rotate | global | ✓ | — | — | ✓ | — | — | — | *security_officer* |
 
 Conteos de la tabla original (anterior a `tokens.own`, `data.*`, v41): 16 con step-up, 7 destructivas, 24 otorgables, 11 sensibles, 3 permitidas a agentes. La tabla ya no está completa (`tokens.own` y `data.*` no figuran); manda `GET /authz/catalog`.
+
+**Canales de liberación (v46).** Tres capacidades nuevas, detalladas en
+[`release-channels.md`](release-channels.md):
+
+- `release_channels.read` (global, `viewer`, `operator`, `owner`): ver el catálogo de canales.
+- `release_channels.write` (global, `security_officer`, step-up): crear, editar y borrar canales. Igual que
+  `environments.write`, **no** es sensible: es global, no se otorga suelta y no hay `access.admin` de respaldo.
+- `blueprints.promote` (eje entorno, solo `owner`, step-up, **sensible**): mover o retroceder el puntero de un
+  canal en un blueprint. Es una decisión de liberación, distinta de la autoría (`blueprints.write`, `operator`).
+  Otorgarla suelta pide segundo aprobador (el conjunto sensible pasó de 16 a 17).
 
 **Qué tiene cada rol**, en palabras:
 
@@ -92,7 +105,7 @@ Conteos de la tabla original (anterior a `tokens.own`, `data.*`, v41): 16 con st
   `schema.definitions` no se marca `discloses`: ver `api-reference-v41.md`). No delega privilegios
   (`engine_users.grant_admin` es solo de `owner`).
 - `owner`: todo lo **operativo** del alcance: `operator` + las capacidades exclusivas de `owner`
-  (las *sensibles* de la tabla: 16 desde v44, que suma `data.blueprint_sql`; eran 15 desde v41). No
+  (las *sensibles* de la tabla: 17 desde v46, que suma `blueprints.promote`; eran 16 desde v44 y 15 desde v41). No
   incluye ninguna capacidad global.
 
 `self.read`, `catalogs.read` y `environments.read` son globales pero de la cadena de roles: las
@@ -103,7 +116,7 @@ tiene todo usuario.
 | Global | Capacidades | Deber |
 |---|---|---|
 | `access_admin` | `access.admin` (exactamente esa, invariante 10) | Administra usuarios del gateway, sus accesos, capacidades puntuales, tokens de agente, sesiones de otras personas, `scope-readiness` y `sod-report`. **Explícitamente no operativo**: no aplica migraciones, no dropea, no revela contraseñas. |
-| `security_officer` | `audit.read`, `crypto.rotate`, `servers.admin`, `catalogs.write`, `environments.write` | Escribe **datos de política**: el inventario de servidores (host y credencial), los catálogos de privilegios/perfiles/charsets, los entornos y su política (incluida la apertura de una BD a agentes y la reclasificación), la rotación del cifrado y la **lectura de la auditoría**. No administra usuarios. |
+| `security_officer` | `audit.read`, `crypto.rotate`, `servers.admin`, `catalogs.write`, `environments.write`, `release_channels.write` | Escribe **datos de política**: el inventario de servidores (host y credencial), los catálogos de privilegios/perfiles/charsets, los entornos y su política (incluida la apertura de una BD a agentes y la reclasificación), el catálogo de canales de liberación, la rotación del cifrado y la **lectura de la auditoría**. No administra usuarios. |
 
 Los conjuntos son **disjuntos de a pares** (invariante 9) y ninguna global está en la cadena de
 roles (invariante 7). `gateway.admin`, la capacidad que tenían las dos, está **retirada**

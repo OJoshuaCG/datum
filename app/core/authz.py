@@ -440,6 +440,7 @@ DatabasesDrop = Annotated[Actor, Depends(require(Capability.DATABASES_DROP))]
 BlueprintsRead = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_READ))]
 BlueprintsWrite = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_WRITE))]
 BlueprintsApply = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_APPLY))]
+BlueprintsPromote = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_PROMOTE))]
 BlueprintsCaptures = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_CAPTURES))]
 
 #: Código de vistas, rutinas, triggers y eventos. Ninguna ruta lo usa como guard (el guard de esas
@@ -468,6 +469,8 @@ CatalogsWrite = Annotated[Actor, Depends(require(Capability.CATALOGS_WRITE))]
 
 EnvironmentsRead = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_READ))]
 EnvironmentsWrite = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_WRITE))]
+ReleaseChannelsRead = Annotated[Actor, Depends(require(Capability.RELEASE_CHANNELS_READ))]
+ReleaseChannelsWrite = Annotated[Actor, Depends(require(Capability.RELEASE_CHANNELS_WRITE))]
 
 #: Datos de bases gestionadas para agentes (excepción cerrada del catálogo). Las rutas HTTP de
 #: opt-in usan ``require_at(Capability.DATA_READ, target=database)`` (capa 2); estos alias existen

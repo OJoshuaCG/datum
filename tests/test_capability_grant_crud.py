@@ -171,7 +171,7 @@ def test_the_unique_constraint_backs_up_the_precheck(admin_client, target):
 
 @pytest.mark.parametrize(
     "capability",
-    ["servers.admin", "catalogs.write", "environments.write", "access.admin", "policy.admin",
+    ["servers.admin", "catalogs.write", "environments.write", "release_channels.write", "access.admin", "policy.admin",
      "audit.read", "crypto.rotate", "gateway.admin", "self.read", "access_admin", "security_officer", "no.existe"],
 )
 def test_global_or_unknown_capabilities_are_not_grantable(admin_client, target, capability):

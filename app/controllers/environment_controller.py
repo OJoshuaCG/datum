@@ -24,6 +24,7 @@ from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
 from app.models.environment import Environment
 from app.models.managed_database import ManagedDatabase
+from app.models.release_channel import ReleaseChannel
 from app.services import audit
 from app.services import environment_catalog as ecodes
 
@@ -440,6 +441,31 @@ class EnvironmentController:
                     public_context={
                         "code": ecodes.CODE_HAS_DATABASES,
                         "database_count": count,
+                    },
+                    context={"environment_id": env.id},
+                )
+            # Un canal enlazado a este entorno (en modo derived lo necesita para resolver) no
+            # puede quedar apuntando a la nada: se rechaza en vez de anular el enlace. La FK es
+            # RESTRICT, pero SQLite no aplica claves foráneas, así que se cuenta acá.
+            linked_channel_slugs = [
+                slug
+                for (slug,) in session.query(ReleaseChannel.slug)
+                .filter(ReleaseChannel.environment_id == env.id)
+                .order_by(ReleaseChannel.id.asc())
+                .all()
+            ]
+            if linked_channel_slugs:
+                raise AppHttpException(
+                    message=(
+                        f"El entorno '{env.slug}' está enlazado a {len(linked_channel_slugs)} "
+                        "canal(es) de liberación. Desvinculalos o borralos antes de borrar "
+                        "el entorno."
+                    ),
+                    status_code=409,
+                    public_context={
+                        "code": ecodes.CODE_HAS_RELEASE_CHANNELS,
+                        "channel_count": len(linked_channel_slugs),
+                        "channel_slugs": linked_channel_slugs,
                     },
                     context={"environment_id": env.id},
                 )

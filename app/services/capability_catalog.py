@@ -167,6 +167,7 @@ class Capability(StrEnum):
     BLUEPRINTS_READ = "blueprints.read"
     BLUEPRINTS_WRITE = "blueprints.write"
     BLUEPRINTS_APPLY = "blueprints.apply"
+    BLUEPRINTS_PROMOTE = "blueprints.promote"
     BLUEPRINTS_CAPTURES = "blueprints.captures"
 
     # -- CÓDIGO de los objetos de esquema ----------------------------------- #
@@ -204,6 +205,10 @@ class Capability(StrEnum):
     # -- Entornos ----------------------------------------------------------- #
     ENVIRONMENTS_READ = "environments.read"
     ENVIRONMENTS_WRITE = "environments.write"
+
+    # -- Canales de liberación de blueprints -------------------------------- #
+    RELEASE_CHANNELS_READ = "release_channels.read"
+    RELEASE_CHANNELS_WRITE = "release_channels.write"
 
     # -- Lectura de DATOS por agentes (MCP) --------------------------------- #
     # Las ÚNICAS capacidades que divulgan filas de un tercero y a la vez viven en el techo de
@@ -430,6 +435,16 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         destructive=True,
     ),
+    # Mover el puntero de un canal (``stable``…) decide qué versión consumen las integraciones
+    # sobre bases reales: es una decisión de liberación, no de autoría ni de ejecución, así que
+    # no se cuelga de ``blueprints.write`` (operator) ni de ``blueprints.apply``. Solo owner y,
+    # como todo lo que solo tiene owner, exige segundo aprobador al otorgarse suelta.
+    _spec(
+        Capability.BLUEPRINTS_PROMOTE,
+        "Promover y retroceder la versión de un blueprint en un canal de liberación",
+        mutates=True,
+        step_up=True,
+    ),
     # Las capturas son DATOS DE NEGOCIO de la base del tercero: divulgación, no lectura.
     _spec(
         Capability.BLUEPRINTS_CAPTURES,
@@ -541,6 +556,22 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         axis="global",
     ),
     _spec(
+        Capability.RELEASE_CHANNELS_READ,
+        "Ver los canales de liberación de blueprints",
+        axis="global",
+    ),
+    # Catálogo de política de liberación: define qué canales existen y cómo se resuelven. Mismo
+    # criterio que ``environments.write``: solo ``security_officer``, sin fallback a
+    # ``access.admin``. NO es sensible (no es de owner): no necesita segundo aprobador porque
+    # es global y no se otorga suelta.
+    _spec(
+        Capability.RELEASE_CHANNELS_WRITE,
+        "Crear, editar y borrar canales de liberación",
+        mutates=True,
+        step_up=True,
+        axis="global",
+    ),
+    _spec(
         Capability.ACCESS_ADMIN_CAP,
         "Administrar usuarios del gateway, accesos, capacidades puntuales y tokens",
         mutates=True,
@@ -625,6 +656,7 @@ _VIEWER: frozenset[Capability] = frozenset(
         Capability.SQL_CONSOLE_HISTORY,
         Capability.CATALOGS_READ,
         Capability.ENVIRONMENTS_READ,
+        Capability.RELEASE_CHANNELS_READ,
     }
 )
 
@@ -662,6 +694,7 @@ _OWNER: frozenset[Capability] = _OPERATOR | {
     Capability.ENGINE_USERS_GRANT_ADMIN,
     Capability.DATABASES_DROP,
     Capability.BLUEPRINTS_APPLY,
+    Capability.BLUEPRINTS_PROMOTE,
     Capability.BLUEPRINTS_CAPTURES,
     Capability.SCHEMA_DIFF_EXECUTE,
     Capability.EXPORTS_DOWNLOAD,
@@ -693,6 +726,7 @@ GLOBAL_CAPABILITIES: Mapping[GlobalCapability, frozenset[Capability]] = MappingP
                 Capability.SERVERS_ADMIN,
                 Capability.CATALOGS_WRITE,
                 Capability.ENVIRONMENTS_WRITE,
+                Capability.RELEASE_CHANNELS_WRITE,
             }
         ),
     }
@@ -860,9 +894,9 @@ def is_sensitive(capability: Capability | str) -> bool:
     Antes eran las que divulgan o son de nivel ``drop`` (8). Al retirar el techo por tenencia
     (C3), ``blueprints.apply``, ``schema_diff.execute`` y ``collation.execute`` —destructivas y
     solo de ``owner``— quedaban otorgables por UN solo administrador, porque lo único que las
-    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (16: las 11
-    de siempre más ``data.read``, ``data.query``, ``data.definitions``, ``data.blueprint_sql`` y
-    ``engine_users.grant_admin``) y exige que siga conteniendo todo lo que divulga o es ``drop``.
+    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (17: las 11
+    de siempre más ``data.read``, ``data.query``, ``data.definitions``, ``data.blueprint_sql``,
+    ``engine_users.grant_admin`` y ``blueprints.promote``) y exige que siga conteniendo todo lo que divulga o es ``drop``.
     """
     try:
         cap = Capability(capability)
@@ -1127,6 +1161,8 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
         "blueprints.apply",
         "schema_diff.execute",
         "collation.execute",
+        # Mover el puntero de un canal decide qué versión consumen las integraciones.
+        "blueprints.promote",
     }
 )
 
@@ -1212,7 +1248,7 @@ def _assert_invariants() -> None:
             if s.id in ROLE_CAPABILITIES[role]:
                 raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
-    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 16 (owner
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 17 (owner
     #    menos operator, otorgables): si el catálogo crece, esto obliga a decidirlo a propósito.
     #    Y el criterio viejo (divulga o es `drop`) sigue contenido: ninguna otorgable que divulgue
     #    o borre puede quedar sin segundo aprobador.

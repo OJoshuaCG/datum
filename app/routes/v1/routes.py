@@ -22,6 +22,7 @@ from app.routes.v1 import (
     managed_databases,
     model_migrations,
     permission_profiles,
+    release_channels,
     privileges,
     projects,
     schema_comparisons,
@@ -54,6 +55,7 @@ router.include_router(privileges.router)
 router.include_router(projects.router)
 router.include_router(projects.model_router)
 router.include_router(environments.router)
+router.include_router(release_channels.router)
 router.include_router(charset_collation_options.router)
 router.include_router(permission_profiles.router)
 router.include_router(crypto.router)

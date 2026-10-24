@@ -23,6 +23,7 @@ from app.routes.v1.routes import router as v1_router
 from app.services.charset_catalog import seed_charset_options
 from app.services.db_admin import migration_results
 from app.services.environment_catalog import seed_environments
+from app.services.release_channel_catalog import seed_release_channels
 from app.services.privilege_catalog import seed_privileges
 
 logger = get_logger(__name__)
@@ -105,6 +106,8 @@ async def lifespan(app: FastAPI):
     seed_privileges()
     seed_charset_options()
     seed_environments()
+    # Después de los entornos: ``stable`` se enlaza a ``production`` si ya existe.
+    seed_release_channels()
     # Asegurar una DEK persistida (envelope encryption) en sistema fresco; idempotente.
     from app.core import crypto as _crypto
 

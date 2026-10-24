@@ -209,6 +209,16 @@ def test_los_codigos_de_blueprint_estan_en_el_vocabulario_cerrado():
     assert all(c.startswith("database_model.") for c in codigos)
 
 
+def test_los_codigos_de_canales_estan_en_el_vocabulario_cerrado():
+    """Mismo invariante para el catálogo de canales de liberación (``release_channel_catalog``)."""
+    from app.services import release_channel_catalog as channel_codes
+
+    codigos = {v for k, v in vars(channel_codes).items() if k.startswith("CODE_")}
+    assert codigos, "no se encontró ningún código de canal"
+    assert codigos <= channel_codes.ERROR_CODES
+    assert all(c.startswith("release_channel.") for c in codigos)
+
+
 # --------------------------------------------------------------------------- #
 # Lote de clonación                                                            #
 # --------------------------------------------------------------------------- #

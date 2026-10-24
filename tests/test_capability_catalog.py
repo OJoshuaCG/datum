@@ -236,6 +236,7 @@ def test_the_global_sets_are_pinned():
             Capability.SERVERS_ADMIN,
             Capability.CATALOGS_WRITE,
             Capability.ENVIRONMENTS_WRITE,
+            Capability.RELEASE_CHANNELS_WRITE,
         }
     )
 

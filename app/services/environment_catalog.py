@@ -62,6 +62,7 @@ logger = get_logger(__name__)
 CODE_NOT_FOUND = "environment.not_found"
 CODE_INACTIVE = "environment.inactive"
 CODE_HAS_DATABASES = "environment.has_databases"
+CODE_HAS_RELEASE_CHANNELS = "environment.has_release_channels"
 CODE_NAME_TAKEN = "environment.name_taken"
 CODE_SLUG_TAKEN = "environment.slug_taken"
 CODE_DEFAULT_MUST_BE_ACTIVE = "environment.default_must_be_active"
@@ -76,6 +77,7 @@ ERROR_CODES = frozenset(
         CODE_NOT_FOUND,
         CODE_INACTIVE,
         CODE_HAS_DATABASES,
+        CODE_HAS_RELEASE_CHANNELS,
         CODE_NAME_TAKEN,
         CODE_SLUG_TAKEN,
         CODE_DEFAULT_MUST_BE_ACTIVE,
