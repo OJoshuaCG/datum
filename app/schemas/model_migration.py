@@ -4,6 +4,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.blueprint_channel import ResolvedChannelOut
+
 # Versión: solo dígitos (4–10). Se compara/ordena NUMÉRICAMENTE (no lexicográfico).
 _VERSION = r"^\d{4,10}$"
 # Cota de tamaño del SQL de una migración (256 KB). Falla temprano con 422 en vez de
@@ -517,6 +519,14 @@ class MigrationApplyOut(BaseModel):
         None, description="Versión objetivo solicitada; null = última disponible"
     )
     applied_count: int = 0
+    resolved_channel: ResolvedChannelOut | None = Field(
+        None,
+        description=(
+            "Solo cuando el apply vino por canal (API de integración): {slug, mode, version, "
+            "source} tal como se resolvió. El canal es un puntero que se mueve; esto fija qué "
+            "versión significaba en esta corrida."
+        ),
+    )
     failed: bool = False
     quarantined: bool = False
     no_op: bool = Field(False, description="True si no había migraciones que aplicar")
@@ -841,6 +851,21 @@ class ApplyAllOut(BaseModel):
         ),
     )
     processed: int
+    target_version: str | None = Field(
+        None,
+        description=(
+            "Tope aplicado a TODO el lote (pedido o resuelto desde el canal); null = hasta la "
+            "última. Una BD ya por encima de este tope no se toca: reporta cero pendientes."
+        ),
+    )
+    resolved_channel: ResolvedChannelOut | None = Field(
+        None,
+        description=(
+            "Solo con 'channel': {slug, mode, version, source} tal como se resolvió al "
+            "empezar el lote. El canal es un puntero que se mueve, así que esto es lo único "
+            "que dice qué versión significaba al momento de la corrida."
+        ),
+    )
     results: list[ApplyAllItemOut]
 
 
@@ -975,6 +1000,21 @@ class MigrationDeleteBlocker(BaseModel):
     current_version: str | None = None
 
 
+class MigrationChannelMoveItem(BaseModel):
+    """
+    Un canal de liberación cuyo puntero apunta a la versión que se borra y adónde se moverá.
+
+    ``to_version`` es la versión REVISADA más cercana por debajo, o null si no hay ninguna (el
+    canal queda sin versión). Es una operación local del gateway: no escribe en ningún motor.
+    """
+
+    release_channel_id: int
+    channel_slug: str
+    from_version: str
+    to_version: str | None = None
+    to_migration_id: int | None = None
+
+
 class MigrationDeletePlanOut(BaseModel):
     """Preview del borrado de una versión. No modifica nada."""
 
@@ -990,6 +1030,13 @@ class MigrationDeletePlanOut(BaseModel):
     stamp_plan: list[MigrationStampItem] = Field(
         default_factory=list,
         description="BDs cuyo puntero se moverá. Cada entrada es una escritura REMOTA sobre ese motor.",
+    )
+    channel_moves: list[MigrationChannelMoveItem] = Field(
+        default_factory=list,
+        description=(
+            "Canales de liberación cuyo puntero apunta a esta versión y se moverán con el "
+            "borrado. Nunca bloquean, pero si hay alguno el DELETE exige 'confirm_token'."
+        ),
     )
     blockers: list[MigrationDeleteBlocker] = Field(default_factory=list)
     unstampable: list[dict] = Field(
@@ -1008,7 +1055,10 @@ class MigrationDeletePlanOut(BaseModel):
         ),
     )
     requires_confirmation: bool = Field(
-        description="True = el DELETE exigirá 'confirm_token'. Solo ocurre si hay punteros que mover."
+        description=(
+            "True = el DELETE exigirá 'confirm_token'. Ocurre si hay punteros de BD que mover "
+            "o canales de liberación que reubicar."
+        )
     )
     confirm_token: str | None = Field(
         None, description="Token para el DELETE. Null si no hace falta o si el plan está bloqueado."
@@ -1024,6 +1074,12 @@ class MigrationDeleteOut(BaseModel):
     version: str
     renumbered: list[MigrationRenumberItem] = Field(default_factory=list)
     stamped: list[MigrationStampItem] = Field(default_factory=list)
+    channel_moves: list[MigrationChannelMoveItem] = Field(
+        default_factory=list,
+        description="Punteros de canal que se movieron con el borrado (quedan en su historial).",
+    )
+
+
 class MigrationEditPreviewIn(BaseModel):
     """
     Cuerpo de ``POST .../migrations/{version}/edit-preview``.

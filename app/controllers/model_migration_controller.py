@@ -37,7 +37,7 @@ from app.core.environments import (
     SNAPSHOT_MAX_SQL_PER_VERSION,
 )
 from app.core.logger import get_logger
-from app.core.remote_engine import UNKNOWN_DATABASE_CODES
+from app.core.remote_engine import UNKNOWN_DATABASE_CODES, ServerTarget
 from app.exceptions import AppHttpException
 from app.models.audit_log import AuditLog
 from app.models.database_migration_history import DatabaseMigrationHistory
@@ -46,9 +46,12 @@ from app.models.enums import EngineType, MigrationStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
+from app.models.release_channel import BlueprintChannelPointer
 from app.services import audit
+from app.services import blueprint_channel_pointers as channel_pointers
 from app.services import confirm_token as confirm_token_service
 from app.services import migration_freeze_catalog as freeze_codes
+from app.services import release_channel_catalog as channel_codes
 from app.services.db_admin import migration_facts, migration_progress, migration_results
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import references_gateway_internal_table
@@ -1970,8 +1973,25 @@ class ModelMigrationController:
             and str(ctx.get("remote_error_code") or "") in UNKNOWN_DATABASE_CODES
         )
 
-    def _blueprint_database_states(self, session, model: DatabaseModel) -> list[dict]:
+    def _blueprint_database_states(
+        self,
+        session,
+        model: DatabaseModel,
+        *,
+        environment_id: int | None = None,
+        skip_live_read_ids: set[int] | None = None,
+    ) -> list[dict]:
         """Estado EN VIVO de TODAS las BDs del blueprint, leyendo la versión del motor.
+
+        ``environment_id`` restringe la enumeración a las BDs de ese entorno: lo usa el
+        resolver de canales ``derived``, que mira solo el parque de un entorno. El camino de
+        borrado NO lo pasa y sigue viendo el blueprint completo, que es lo que su fail-closed
+        necesita.
+
+        ``skip_live_read_ids`` son BDs cuyo resultado el llamador va a descartar (el resolver
+        ``derived`` pasa las que están en cuarentena): se devuelven sin abrir conexión, con
+        ``current_version=None``. El borrado NO lo pasa: ahí ninguna BD puede saltearse sin
+        romper su fail-closed.
 
         Se enumera el inventario completo del blueprint y **no** las BDs que aparecen en
         ``database_migration_history``, que es lo que hace ``_still_applied_live``. La
@@ -1989,12 +2009,12 @@ class ModelMigrationController:
             (fail-closed): no se puede probar que no esté parada en la versión a borrar, ni
             se la puede re-stampear si está adelante.
         """
-        rows = (
-            session.query(ManagedDatabase)
-            .filter(ManagedDatabase.model_id == model.id)
-            .order_by(ManagedDatabase.id)
-            .all()
+        database_query = session.query(ManagedDatabase).filter(
+            ManagedDatabase.model_id == model.id
         )
+        if environment_id is not None:
+            database_query = database_query.filter(ManagedDatabase.environment_id == environment_id)
+        rows = database_query.order_by(ManagedDatabase.id).all()
         if not rows:
             return []
         # Pre-filtro barato, y NO es una optimización cosmética: sin él, borrar una versión
@@ -2030,6 +2050,12 @@ class ModelMigrationController:
             for db_id in ids
         }
         runner = MigrationRunner()
+        skipped_ids = skip_live_read_ids or set()
+        # Un target por servidor, como ``apply_all``: varias BDs del blueprint suelen compartir
+        # servidor, y armarlo implica buscar la fila y descifrar la credencial pseudo-root.
+        # Solo se guardan los que se armaron bien: si falla, cada BD de ese servidor vuelve a
+        # intentarlo y queda ilegible por su cuenta, igual que sin caché.
+        target_by_server_id: dict[int, ServerTarget] = {}
         states: list[dict] = []
         for md in rows:
             state = {
@@ -2040,6 +2066,9 @@ class ModelMigrationController:
                 "database_exists": True,
                 "readable": True,
             }
+            if md.id in skipped_ids:
+                states.append(state)
+                continue
             if md.model_version is None and md.id not in con_historial:
                 # Queda con ``current_version=None``, que el planificador ya lee como "en
                 # base": ni bloquea ni entra en el plan de stamps. NO se toca
@@ -2048,8 +2077,11 @@ class ModelMigrationController:
                 states.append(state)
                 continue
             try:
-                server = get_server_or_404(session, md.server_id)
-                target = build_target(server)
+                target = target_by_server_id.get(md.server_id)
+                if target is None:
+                    server = get_server_or_404(session, md.server_id)
+                    target = build_target(server)
+                    target_by_server_id[md.server_id] = target
                 try:
                     state["current_version"] = runner.get_current_version(
                         target, md.name, model.slug
@@ -2107,7 +2139,12 @@ class ModelMigrationController:
         }
 
     @staticmethod
-    def _plan_fingerprint(model_id: int, version: str, states: list[dict]) -> str:
+    def _plan_fingerprint(
+        model_id: int,
+        version: str,
+        states: list[dict],
+        channel_moves: list[dict] | None = None,
+    ) -> str:
         """Huella del estado del parque que el preview congeló.
 
         Viaja como ``subject`` del ``confirm_token``, así que si entre el preview y la
@@ -2122,6 +2159,11 @@ class ModelMigrationController:
         transacción local abierta a través de N round-trips de red. Queda una ventana entre la
         fase de stamps y el commit; el escape para lo que caiga ahí es
         ``MigrationRunner.stamp(..., purge=True)``.
+
+        Los movimientos de punteros de canal (``channel_moves``) entran en la huella por la
+        misma razón que el parque: si entre el preview y la ejecución alguien promovió un
+        canal sobre la versión a borrar (o cambió su destino), el plan que el operador aprobó
+        ya no describe lo que se va a mover, y el token tiene que dejar de verificar.
         """
         parts = [str(model_id), version]
         for st in sorted(states, key=lambda s: s["managed_database_id"]):
@@ -2129,6 +2171,8 @@ class ModelMigrationController:
                 f"{st['managed_database_id']}:{st['current_version'] or ''}:"
                 f"{int(st['database_exists'])}:{int(st['readable'])}"
             )
+        for move in sorted(channel_moves or [], key=lambda mv: mv["release_channel_id"]):
+            parts.append(f"ch:{move['release_channel_id']}:{move['to_migration_id'] or ''}")
         return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
     def _build_delete_plan(self, session, model: DatabaseModel, m: ModelMigration) -> dict:
@@ -2244,17 +2288,23 @@ class ModelMigrationController:
                 ):
                     partial.append({**row, "direction": direction})
 
+        # Los canales que apuntan a esta versión se mueven con ella (a la revisada más cercana
+        # por debajo, o a NULL). Nunca bloquean el borrado, pero SÍ exigen confirmación: mover
+        # ``stable`` hacia atrás es una decisión de liberación.
+        channel_moves = channel_pointers.plan_channel_moves(session, m)
+
         return {
             "model_id": model.id,
             "version": m.version,
             "renumber": renumber,
             "stamp_plan": stamp_plan,
+            "channel_moves": channel_moves,
             "blockers": blockers,
             "unstampable": unstampable,
             "partial_applications": partial,
             "databases_keeping_ddl": keeps_ddl,
-            "requires_confirmation": bool(stamp_plan),
-            "fingerprint": self._plan_fingerprint(model.id, m.version, states),
+            "requires_confirmation": bool(stamp_plan) or bool(channel_moves),
+            "fingerprint": self._plan_fingerprint(model.id, m.version, states, channel_moves),
         }
 
     def _enforce_delete_plan(self, plan: dict) -> None:
@@ -2381,6 +2431,7 @@ class ModelMigrationController:
                 for old, new in sorted(plan["renumber"].items(), key=lambda kv: version_sort_key(kv[0]))
             ],
             "stamp_plan": plan["stamp_plan"],
+            "channel_moves": plan["channel_moves"],
             "blockers": plan["blockers"],
             "unstampable": plan["unstampable"],
             "partial_applications": plan["partial_applications"],
@@ -2406,6 +2457,13 @@ class ModelMigrationController:
                 f"Se moverá el puntero de {len(plan['stamp_plan'])} BD(s): es una escritura "
                 "sobre cada motor destino (UPDATE de la tabla de versión de Alembic), no una "
                 "operación local del gateway."
+            )
+        if plan["channel_moves"]:
+            moves_text = ModelMigrationController._channel_moves_text(plan["channel_moves"])
+            out.append(
+                f"Se moverá el puntero de {len(plan['channel_moves'])} canal(es) de "
+                f"liberación ({moves_text}): quien los consuma recibirá esa otra versión. "
+                "Es una operación local del gateway, no escribe en ningún motor."
             )
         return out
 
@@ -2461,15 +2519,17 @@ class ModelMigrationController:
                     raise AppHttpException(
                         message=(
                             f"Eliminar la versión {version} implica mover el puntero de "
-                            f"{len(plan['stamp_plan'])} BD(s) en sus motores. Pide el plan en "
-                            f"GET /database-models/{model_id}/migrations/{version}/delete-plan "
-                            "y reenvía su 'confirm_token'."
+                            f"{len(plan['stamp_plan'])} BD(s) en sus motores y de "
+                            f"{len(plan['channel_moves'])} canal(es) de liberación. Pide el "
+                            f"plan en GET /database-models/{model_id}/migrations/{version}"
+                            "/delete-plan y reenvía su 'confirm_token'."
                         ),
                         status_code=409,
                         public_context={
                             "code": freeze_codes.CODE_RENUMBER_CONFIRMATION_REQUIRED,
                             "version": version,
                             "stamp_plan": plan["stamp_plan"],
+                            "channel_moves": plan["channel_moves"],
                         },
                         context={"model_id": model_id, "version": version},
                     )
@@ -2535,7 +2595,7 @@ class ModelMigrationController:
 
         # --- Fase B: gateway (una sola transacción local) ----------------------------
         try:
-            self._apply_renumber(model_id, version, plan)
+            self._apply_renumber(model_id, version, plan, admin=admin)
         except Exception as exc:
             # El blueprint quedó intacto (la transacción revierte sola), así que los punteros
             # ya movidos son ahora los únicos que no describen la realidad: se devuelven.
@@ -2577,6 +2637,8 @@ class ModelMigrationController:
                 f"BD {s['managed_database_id']}: {s['from_version']}→{s['to_version']}"
                 for s in plan["stamp_plan"]
             )
+        if plan["channel_moves"]:
+            detail += " — canales: " + self._channel_moves_text(plan["channel_moves"])
         if affected_dbs:
             # El CASCADE ya se llevó el historial de esta versión: esta entrada es lo único
             # que queda de que corrió con éxito en esas BDs.
@@ -2603,6 +2665,7 @@ class ModelMigrationController:
                 )
             ],
             "stamped": plan["stamp_plan"],
+            "channel_moves": plan["channel_moves"],
         }
 
     def _delete_stamp_specs(self, session, model_id: int) -> list:
@@ -2731,7 +2794,9 @@ class ModelMigrationController:
                 left.append(item)
         return left
 
-    def _apply_renumber(self, model_id: int, version: str, plan: dict) -> None:
+    def _apply_renumber(
+        self, model_id: int, version: str, plan: dict, *, admin: "dict | Actor | None" = None
+    ) -> None:
         """Fase local: borra la versión y renumera las posteriores. UNA transacción.
 
         Tres cosas que no se pueden omitir:
@@ -2746,6 +2811,10 @@ class ModelMigrationController:
            ENTERO respondiendo 409 "la migración X fue alterada".
         3. **Las capturas de SELECT llevan el checksum viejo.** Sin actualizarlas, el endpoint
            de lectura las marcaría ``stale`` sin que su SQL haya cambiado.
+        4. **Los punteros de canal se mueven ANTES de borrar la versión.** Lo hace
+           ``_move_channel_pointers`` bajo el mismo lock y en la misma transacción. No se
+           delega al ``ON DELETE SET NULL`` de la FK: dejaría el canal sin versión en vez de
+           reubicarlo, y SQLite (los tests) no aplica claves foráneas.
         """
         session = self._session()
         try:
@@ -2757,8 +2826,11 @@ class ModelMigrationController:
             ).with_for_update().first()
 
             m = self._migration_or_404(session, model_id, version)
+            deleted_migration_id = m.id  # se lee ANTES del delete: después la fila está borrada
+            self._move_channel_pointers(session, m, plan, admin)
             session.delete(m)
             session.flush()  # libera el hueco antes de que la primera renumerada lo ocupe
+            self._assert_no_pointer_left(session, deleted_migration_id)
 
             for old in sorted(plan["renumber"], key=version_sort_key):
                 new = plan["renumber"][old]
@@ -2808,6 +2880,103 @@ class ModelMigrationController:
             raise
         finally:
             session.close()
+
+    def _move_channel_pointers(
+        self, session, m: ModelMigration, plan: dict, admin: "dict | Actor | None"
+    ) -> None:
+        """
+        Reubica los punteros de canal que apuntan a ``m`` y deja un evento ``version_deleted``
+        por cada uno. Corre bajo el lock del blueprint, dentro de la transacción del borrado.
+
+        Se RELEE el estado dentro del lock y se compara contra el plan que el operador
+        confirmó (canales y destino). Si alguien promovió un canal sobre ``m`` —o marcó como
+        no revisada la versión destino— entre el preview y ahora, mover lo que el plan dice
+        movería otra cosa distinta de lo aprobado: se aborta con 409 y la compensación de
+        stamps del llamador devuelve los punteros remotos.
+        """
+        pointers = (
+            session.query(BlueprintChannelPointer)
+            .filter(
+                BlueprintChannelPointer.database_model_id == m.model_id,
+                BlueprintChannelPointer.model_migration_id == m.id,
+            )
+            .all()
+        )
+        # La comparación usa la MISMA regla que armó el preview (``plan_channel_moves``): si
+        # se recalculara a mano aquí, las dos respuestas a "adónde cae el puntero" podrían
+        # divergir sin que nada falle.
+        current_moves = channel_pointers.plan_channel_moves(session, m)
+        planned_destination_by_channel = self._destination_by_channel(plan["channel_moves"])
+        current_destination_by_channel = self._destination_by_channel(current_moves)
+        if current_destination_by_channel != planned_destination_by_channel:
+            raise AppHttpException(
+                message=(
+                    f"Los canales de liberación que apuntan a la versión {m.version} cambiaron "
+                    "durante el borrado. No se modificó nada; vuelve a pedir el preview."
+                ),
+                status_code=409,
+                public_context={
+                    "code": freeze_codes.CODE_RENUMBER_PLAN_STALE,
+                    "version": m.version,
+                },
+                context={"model_id": m.model_id},
+            )
+
+        # Todos los movimientos comparten destino: la regla depende solo de la versión borrada.
+        current_destination_id = current_moves[0]["to_migration_id"] if current_moves else None
+        destination = (
+            session.get(ModelMigration, current_destination_id)
+            if current_destination_id is not None
+            else None
+        )
+        for pointer in pointers:
+            pointer.model_migration_id = current_destination_id
+            session.add(
+                channel_pointers.build_pointer_event(
+                    database_model_id=m.model_id,
+                    release_channel_id=pointer.release_channel_id,
+                    event_type=channel_codes.EVENT_VERSION_DELETED,
+                    from_migration=m,
+                    to_migration=destination,
+                    note=f"Versión {m.version} eliminada del blueprint",
+                    actor=admin,
+                )
+            )
+        session.flush()
+
+    @staticmethod
+    def _destination_by_channel(channel_moves: list[dict]) -> dict[int, int | None]:
+        """``{release_channel_id: to_migration_id}``: lo que se compara entre plan y relectura."""
+        return {move["release_channel_id"]: move["to_migration_id"] for move in channel_moves}
+
+    @staticmethod
+    def _channel_moves_text(channel_moves: list[dict]) -> str:
+        """Texto ``slug: desde→hasta`` de los movimientos de canal, para avisos y auditoría."""
+        return ", ".join(
+            f"{move['channel_slug']}: {move['from_version']}→"
+            f"{move['to_version'] or 'sin versión'}"
+            for move in channel_moves
+        )
+
+    @staticmethod
+    def _assert_no_pointer_left(session, migration_id: int) -> None:
+        """
+        Ningún puntero puede quedar sobre una fila borrada. SQLite no aplica la FK, así que sin
+        esta aserción un descuido en ``_move_channel_pointers`` dejaría un puntero colgando que
+        solo MySQL/PostgreSQL pondrían en NULL.
+        """
+        dangling_count = (
+            session.query(BlueprintChannelPointer)
+            .filter(BlueprintChannelPointer.model_migration_id == migration_id)
+            .count()
+        )
+        if dangling_count:
+            raise AppHttpException(
+                message="Quedó un puntero de canal sobre la versión borrada. No se modificó nada.",
+                status_code=409,
+                public_context={"code": channel_codes.CODE_POINTER_INCONSISTENT},
+                context={"model_migration_id": migration_id},
+            )
 
     def validate_migration(self, model_id: int, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """

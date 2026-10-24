@@ -349,8 +349,9 @@ def plan_delete_migration(
     versión en vivo. Es lo que hace que el veredicto sea autoritativo y no la caché que pinta
     el listado.
 
-    Emite ``confirm_token`` solo si el plan implica mover punteros. Si no hay nada que
-    stampear, el ``DELETE`` sigue sin exigir confirmación.
+    Emite ``confirm_token`` solo si el plan implica mover punteros de BD o de canal de
+    liberación (``channel_moves``). Si no hay nada que mover, el ``DELETE`` sigue sin exigir
+    confirmación.
     """
     return success(data=ModelMigrationController().plan_delete(model_id, version))
 
@@ -367,7 +368,8 @@ def delete_migration(
         None,
         description=(
             "Token del preview 'delete-plan'. OBLIGATORIO solo si el borrado implica mover "
-            "el puntero de alguna BD (escritura remota). Sin BDs adelante no se pide."
+            "el puntero de alguna BD (escritura remota) o reubicar un canal de liberación. "
+            "Sin BDs adelante ni canales apuntando a la versión no se pide."
         ),
     ),
 ):

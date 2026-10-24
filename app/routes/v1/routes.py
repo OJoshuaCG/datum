@@ -10,6 +10,7 @@ from app.routes.v1 import (
     integration,
     integration_tokens,
     auth,
+    blueprint_channels,
     charset_collation_options,
     collation_batches,
     collation_conversions,
@@ -44,6 +45,7 @@ router.include_router(servers.router)
 router.include_router(server_users.router)
 router.include_router(database_models.router)
 router.include_router(model_migrations.router)
+router.include_router(blueprint_channels.router)
 router.include_router(managed_databases.router)
 router.include_router(schema_comparisons.router)
 router.include_router(database_clones.router)
