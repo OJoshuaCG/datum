@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.enums import ProvisionStatus
+from app.schemas.blueprint_channel import ResolvedChannelOut
 
 # Whitelist alineada con identifiers.py (validación fail-fast en la API).
 _DBNAME = r"^[A-Za-z_][A-Za-z0-9_]{0,62}$"
@@ -56,6 +57,19 @@ class ManagedDatabaseCreate(BaseModel):
         description=(
             "Versión objetivo (inclusive) para 'apply_migrations'. Omitirla aplica hasta la "
             "última. Mismo criterio que el '?version=' de la ruta de apply."
+        ),
+    )
+    channel: str | None = Field(
+        None,
+        min_length=1,
+        max_length=60,
+        description=(
+            "Slug de un canal de liberación: alternativa EXCLUYENTE a 'target_version'. La BD "
+            "se crea en la versión que el canal sirve hoy para este blueprint, resuelta en "
+            "vivo y sin caer a la última si el canal no resuelve (409 'release_channel.*'). "
+            "Exige 'apply_migrations=true'. Con 'target_version' a la vez: 422 "
+            "'release_channel.target_conflict'. Un canal 'latest' sobre una punta sin revisar "
+            "lo frenan los mismos guards de siempre."
         ),
     )
     environment_id: int | None = Field(
@@ -205,6 +219,9 @@ class ManagedDatabaseOut(BaseModel):
             "migrar; ok=false significa que la BD SÍ se creó y la migración falló — la fila "
             "queda en cuarentena y el 'error_code' dice a qué endpoint volver."
         ),
+    )
+    resolved_channel: ResolvedChannelOut | None = Field(
+        None, description="Solo en el alta con 'channel': la versión que el canal resolvió."
     )
 
 

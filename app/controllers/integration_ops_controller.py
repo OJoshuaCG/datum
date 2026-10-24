@@ -21,6 +21,10 @@ answer a password prompt.
 import secrets
 from typing import Any
 
+from app.controllers.blueprint_channel_controller import (
+    reject_channel_with_target_version,
+    resolve_channel_version,
+)
 from app.controllers.common import engine_value
 from app.controllers.database_model_controller import DatabaseModelController
 from app.controllers.grant_controller import GrantController
@@ -35,6 +39,7 @@ from app.core.scope_targets import points_for_databases
 from app.core.scope_targets import server as server_target
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
+from app.models.database_model import DatabaseModel
 from app.models.enums import MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
@@ -280,10 +285,17 @@ class IntegrationOpsController:
         database_id: int,
         *,
         target_version: str | None,
+        channel: str | None = None,
         dry_run: bool,
     ) -> dict[str, Any]:
         """
-        Applies the pending migrations up to ``target_version`` (or the latest).
+        Applies the pending migrations up to ``target_version``, up to the version ``channel``
+        resolves to, or up to the latest when neither is given.
+
+        A channel is resolved here, against the blueprint ASSIGNED to this database, and the
+        resolved version then goes through the same forward-only check as an explicit one. The
+        gate already fenced the database (and so its blueprint) by the token allowlists, so a
+        channel never reaches a blueprint the token could not touch.
 
         What this adds to the human endpoint it delegates to:
 
@@ -298,6 +310,12 @@ class IntegrationOpsController:
         No step-up is asked here: the issuer confirmed their password when the token was issued
         (D6) and a machine cannot answer a prompt.
         """
+        reject_channel_with_target_version(target_version, channel)
+        resolved_channel: dict[str, Any] | None = None
+        if channel is not None:
+            resolved_channel = self._resolve_channel_for_database(database_id, channel)
+            target_version = resolved_channel["version"]
+
         if target_version is not None:
             current_version = ManagedMigrationController().status(database_id)["current_version"]
             target_is_older_than_current = current_version is not None and version_sort_key(
@@ -311,9 +329,13 @@ class IntegrationOpsController:
                     ),
                     status_code=422,
                     public_context={"code": CODE_INTEGRATION_MIGRATION_TARGET_NOT_FORWARD},
-                    context={"target_version": target_version, "current_version": current_version},
+                    context={
+                        "target_version": target_version,
+                        "current_version": current_version,
+                        "channel": channel,
+                    },
                 )
-        return ManagedMigrationController().apply(
+        applied = ManagedMigrationController().apply(
             database_id,
             up_to_version=target_version,
             force=False,
@@ -321,6 +343,32 @@ class IntegrationOpsController:
             on_failure=FIXED_ON_FAILURE_MODE,
             admin=call.actor,
         )
+        if resolved_channel is not None:
+            applied["resolved_channel"] = resolved_channel
+        return applied
+
+    def _resolve_channel_for_database(self, database_id: int, channel: str) -> dict[str, Any]:
+        """
+        Strict resolution of ``channel`` against the database's assigned blueprint.
+
+        A database with no blueprint has nothing a channel could point into: 404 with the same
+        stable code as the blueprint read, instead of guessing a blueprint.
+        """
+        blueprint_id = ManagedDatabaseController().get_database(database_id)["model_id"]
+        if blueprint_id is None:
+            raise AppHttpException(
+                message="La base de datos no tiene un blueprint asignado.",
+                status_code=404,
+                public_context={"code": CODE_INTEGRATION_BLUEPRINT_NOT_ASSIGNED},
+                context={"managed_database_id": database_id, "channel": channel},
+            )
+        session = self._session()
+        try:
+            blueprint = session.get(DatabaseModel, blueprint_id)
+            resolution = resolve_channel_version(session, blueprint, channel)
+        finally:
+            session.close()
+        return resolution.as_summary()
 
     # ------------------------------------------------------------------ #
     # Destructive tier: rollback and stamp                                 #

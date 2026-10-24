@@ -20,6 +20,10 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import or_ as sa_or
 
+from app.controllers.blueprint_channel_controller import (
+    reject_channel_with_target_version,
+    resolve_channel_version,
+)
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.core.database import Database
 from app.core.environments import (
@@ -566,17 +570,7 @@ class ManagedMigrationController:
 
         # Versión objetivo inexistente: evita aplicar silenciosamente "todo lo ≤ X"
         # cuando X no es una versión real del blueprint. Comparación NUMÉRICA.
-        if up_to_version is not None and version_sort_key(up_to_version) not in {
-            version_sort_key(s.version) for s in specs
-        }:
-            raise AppHttpException(
-                message=(
-                    f"La versión objetivo {up_to_version} no existe en el blueprint. "
-                    f"Versiones disponibles: {', '.join(s.version for s in specs)}."
-                ),
-                status_code=422,
-                context={"target_version": up_to_version, "model_id": model.id},
-            )
+        self._assert_target_version_exists(specs, up_to_version, model.id)
 
         # ROB1 — cuarentena: una migración fallida previa pudo dejar la BD en estado
         # parcial (DDL no transaccional en MySQL). Se exige inspección + force=true.
@@ -892,6 +886,29 @@ class ManagedMigrationController:
                 status_code=409,
                 context={"managed_database_id": db_id, "required": "force=true"},
             )
+
+    @staticmethod
+    def _assert_target_version_exists(
+        specs: list, target_version: str | None, model_id: int
+    ) -> None:
+        """
+        422 si la versión objetivo no es una versión real del blueprint. Evita aplicar en
+        silencio "todo lo ≤ X" cuando X no existe. Comparación NUMÉRICA. Lo comparten ``apply``
+        y ``apply_all`` para que los dos caminos no puedan divergir en qué versión aceptan.
+        """
+        if target_version is None:
+            return
+        known_versions = {version_sort_key(spec.version) for spec in specs}
+        if version_sort_key(target_version) in known_versions:
+            return
+        raise AppHttpException(
+            message=(
+                f"La versión objetivo {target_version} no existe en el blueprint. "
+                f"Versiones disponibles: {', '.join(spec.version for spec in specs)}."
+            ),
+            status_code=422,
+            context={"target_version": target_version, "model_id": model_id},
+        )
 
     def _dry_run_plan(
         self, db_id, db_name, server_id, target, slug, specs, up_to_version,
@@ -2128,11 +2145,18 @@ class ManagedMigrationController:
         force: bool = False,
         dry_run: bool = False,
         on_failure: str = "auto",
+        target_version: str | None = None,
+        channel: str | None = None,
         admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Aplica las pendientes a TODAS las BDs del blueprint (síncrono, acotado).
         Continúa con las demás BDs aunque una falle. El job asíncrono es del Plan 06.
+
+        ``target_version`` o ``channel`` (excluyentes) acotan el lote: ninguna BD avanza más
+        allá de esa versión. Una BD que YA la superó no se toca ni se revierte: reporta cero
+        pendientes, porque este endpoint solo avanza (retroceder es ``rollback``, con sus
+        propias confirmaciones). Sin ninguno de los dos aplica hasta la última, como siempre.
 
         Optimización (evita trabajo N+1): carga y verifica ``specs`` UNA sola vez y
         cachea el ``ServerTarget`` por servidor (la credencial se descifra una vez por
@@ -2149,6 +2173,10 @@ class ManagedMigrationController:
                 context={"on_failure": on_failure, "allowed": list(self._ON_FAILURE_MODES)},
             )
 
+        # Antes de abrir sesión o tocar nada: un destino ambiguo no debe costar ni una lectura.
+        reject_channel_with_target_version(target_version, channel)
+
+        resolved_channel: dict | None = None
         session = self._session()
         try:
             model = session.get(DatabaseModel, model_id)
@@ -2273,6 +2301,13 @@ class ManagedMigrationController:
             for _target, eng in {(None, e) for _t, e in targets.values()}:
                 self._guard_cross_engine(session, model_id, eng)
                 self._guard_untranslatable_sql(specs, eng)
+            if channel is not None:
+                # Resolución ESTRICTA y única para todo el lote: todas las BDs reciben el mismo
+                # tope aunque el puntero se mueva mientras el lote corre. Si no hay una versión
+                # inequívoca (409) no se aplica nada: no se cae a "hasta la última".
+                resolution = resolve_channel_version(session, model, channel)
+                target_version = resolution.version
+                resolved_channel = resolution.as_summary()
         finally:
             session.close()
 
@@ -2282,6 +2317,7 @@ class ManagedMigrationController:
                 status_code=422,
                 context={"model_id": model_id},
             )
+        self._assert_target_version_exists(specs, target_version, model_id)
         self._verify_integrity(specs)  # una sola vez para todo el lote
 
         items: list[dict] = []
@@ -2309,7 +2345,7 @@ class ManagedMigrationController:
                 self._guard_quarantine(db_id, quarantined, force, dry_run)
                 if dry_run:
                     plan = self._dry_run_plan(
-                        db_id, name, server_id, target, slug, specs, None,
+                        db_id, name, server_id, target, slug, specs, target_version,
                         env_policy=policy,
                         destructive=destructive_by_engine(engine) if policy else None,
                     )
@@ -2321,7 +2357,7 @@ class ManagedMigrationController:
                     out = self._run_apply(
                         db_id, db_name=name, server_id=server_id, target=target,
                         engine=engine, slug=slug, specs=specs, model_id=model_id,
-                        up_to_version=None,
+                        up_to_version=target_version,
                         was_quarantined=quarantined, admin=admin,
                         on_failure=on_failure,
                         env_blocks_destructive=bool(policy and policy[0]),
@@ -2403,6 +2439,8 @@ class ManagedMigrationController:
             target_id=model_id, touched_engine=True,
             detail=f"{len(dbs)}/{total} BDs procesadas"
             + (f" (entorno {environment_id})" if environment_id is not None else "")
+            + (f" hasta {target_version}" if target_version is not None else "")
+            + (f" canal={resolved_channel['slug']}" if resolved_channel is not None else "")
             + (f" — {len(denied)} denegadas por entorno" if denied else "")
             + (f" — {len(omitted)} omitidas por scope" if omitted else "")
             + (" (dry-run)" if dry_run else ""),
@@ -2412,6 +2450,8 @@ class ManagedMigrationController:
             "total_databases": total,
             "matched_databases": matched,
             "processed": len(dbs),
+            "target_version": target_version,
+            "resolved_channel": resolved_channel,
             "results": items,
         }
 

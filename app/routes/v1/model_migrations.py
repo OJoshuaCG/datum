@@ -149,6 +149,25 @@ def apply_all(
             "alguna BD. Se valida en el controlador contra la misma lista que el apply por BD."
         ),
     ),
+    target_version: str | None = Query(
+        None,
+        pattern=r"^\d{4,10}$",
+        description=(
+            "Tope (inclusive) para TODO el lote. Omitirlo aplica hasta la última. Una BD que "
+            "ya está por encima NO se revierte: reporta 'pending_versions=[]'. Excluyente con "
+            "'channel' (422 'release_channel.target_conflict')."
+        ),
+    ),
+    channel: str | None = Query(
+        None,
+        min_length=1,
+        max_length=60,
+        description=(
+            "Slug de un canal de liberación: su versión resuelta (en vivo, estricta) es el "
+            "tope del lote. Si el canal no resuelve responde 409 'release_channel.*' y no se "
+            "aplica nada; no cae a 'hasta la última'. Excluyente con 'target_version'."
+        ),
+    ),
 ):
     """
     Aplica las pendientes del blueprint a TODAS sus BDs (síncrono, acotado) 🔌.
@@ -163,7 +182,7 @@ def apply_all(
         model_id, max_databases=max_databases, database_ids=database_ids,
         environment_id=environment_id,
         force=force, dry_run=dry_run,
-        on_failure=on_failure, admin=actor,
+        on_failure=on_failure, target_version=target_version, channel=channel, admin=actor,
     )
     msg = "Plan masivo (dry-run)." if dry_run else "Aplicación masiva ejecutada."
     return success(data=result, message=msg)

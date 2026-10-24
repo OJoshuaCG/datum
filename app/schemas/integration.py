@@ -176,6 +176,17 @@ class IntegrationApplyMigrationsRequest(_ClosedRequest):
         pattern=MIGRATION_VERSION_PATTERN,
         description="Target version (inclusive). Omitted: apply up to the latest.",
     )
+    channel: str | None = Field(
+        None,
+        min_length=1,
+        max_length=60,
+        description=(
+            "Slug of a release channel: the version it serves for the database's blueprint "
+            "becomes the target. Exclusive with 'version' (422 'release_channel.target_conflict'). "
+            "An unknown channel is 404 and one that does not resolve is 409 'release_channel.*'; "
+            "neither falls back to the latest version."
+        ),
+    )
     dry_run: bool = Field(False, description="Return the plan without applying anything.")
 
 

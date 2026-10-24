@@ -25,6 +25,10 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError
 
+from app.controllers.blueprint_channel_controller import (
+    reject_channel_with_target_version,
+    resolve_channel_version,
+)
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.environment_controller import EnvironmentController
 from app.controllers.server_controller import _release_provision, _try_acquire_provision
@@ -1217,6 +1221,8 @@ class ManagedDatabaseController:
             # camino que el operador no pidió.
             apply_migrations = bool(data.get("apply_migrations"))
             target_version = data.get("target_version")
+            channel_slug = data.get("channel")
+            reject_channel_with_target_version(target_version, channel_slug)
             if apply_migrations and (not provision or data.get("model_id") is None):
                 raise AppHttpException(
                     message=(
@@ -1234,6 +1240,13 @@ class ManagedDatabaseController:
                     status_code=422,
                     public_context={"code": pcodes.CODE_APPLY_REQUIRES_PROVISION},
                     context={"target_version": target_version},
+                )
+            if channel_slug is not None and not apply_migrations:
+                raise AppHttpException(
+                    message="'channel' solo tiene sentido con 'apply_migrations=true'.",
+                    status_code=422,
+                    public_context={"code": pcodes.CODE_APPLY_REQUIRES_PROVISION},
+                    context={"channel": channel_slug},
                 )
             if target_version is not None and (
                 session.query(ModelMigration.id)
@@ -1261,6 +1274,18 @@ class ManagedDatabaseController:
                 session, data.get("environment_id")
             )
             _assert_scope_at_env(admin, env_id, server.id)
+
+            # El canal se resuelve DESPUÉS del chequeo de alcance (una resolución ``derived``
+            # lee en vivo las bases de otro entorno) y ANTES de insertar la fila: si no hay una
+            # versión inequívoca, no queda ni inventario ni BD en el motor. El resolver falla
+            # cerrado (409) y acá no se cae a la punta del blueprint: un canal sin versión no
+            # es un "aplicá todo".
+            resolved_channel: dict | None = None
+            if channel_slug is not None:
+                channel_model = session.get(DatabaseModel, data["model_id"])
+                resolution = resolve_channel_version(session, channel_model, channel_slug)
+                target_version = resolution.version
+                resolved_channel = resolution.as_summary()
 
             md = ManagedDatabase(
                 name=data["name"],
@@ -1290,6 +1315,8 @@ class ManagedDatabaseController:
             charset, collation = md.charset, md.collation
             server_id = md.server_id
             result = self._serialize(md)
+            if resolved_channel is not None:
+                result["resolved_channel"] = resolved_channel
         finally:
             session.close()
 
@@ -1363,6 +1390,11 @@ class ManagedDatabaseController:
             target_id=db_id,
             server_id=server_id,
             touched_engine=provision,
+            detail=(
+                f"canal={resolved_channel['slug']} versión={resolved_channel['version']}"
+                if resolved_channel is not None
+                else None
+            ),
         )
         return result
 

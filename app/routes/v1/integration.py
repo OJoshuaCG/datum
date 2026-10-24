@@ -256,9 +256,17 @@ def apply_migrations_forward(
     gateway fixes them. A ``version`` older than the current one is 422
     ``integration.migration_target_not_forward``; the current one is a successful no-op. The
     destructive-migration guard of protected environments applies as for a person.
+
+    ``channel`` is an alternative to ``version`` (both: 422 ``release_channel.target_conflict``):
+    the channel is resolved strictly against the database's blueprint and the result is then
+    checked like an explicit ``version``, so the forward-only rule applies to it too.
     """
     result = IntegrationOpsController().apply_migrations_forward(
-        call, db_id, target_version=payload.version, dry_run=payload.dry_run
+        call,
+        db_id,
+        target_version=payload.version,
+        channel=payload.channel,
+        dry_run=payload.dry_run,
     )
     return success(data=result, message=_apply_message(result, dry_run=payload.dry_run))
 
