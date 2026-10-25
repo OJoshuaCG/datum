@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Path, Query
 from app.controllers.destructive_approval_controller import DestructiveApprovalController
 from app.core.actor import Actor
 from app.core.authz import BlueprintsRead, require_at
+from app.core.scope import ScopeTarget
 from app.core.scope_targets import database, destructive_approval, model
 from app.schemas.destructive_approval import (
     DestructiveApprovalCreate,
@@ -40,13 +41,22 @@ ApproveDestructiveOnModel = Annotated[
 ApproveDestructiveOnDatabase = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_APPROVE_DESTRUCTIVE, target=database))
 ]
-#: ``step_up=False``: revocar es una cancelación. Las capas 1 y 2 siguen intactas.
+
+
+def _is_approver_of_record(actor: Actor, target: ScopeTarget) -> bool:
+    (approval_id,) = target.params
+    return DestructiveApprovalController.is_approver_of_record(actor, approval_id)
+
+
+#: ``step_up=False``: revocar es una cancelación. Las capas 1 y 2 valen para todos MENOS para quien
+#: firmó la aprobación (enmienda A-2): ese puede revocarla aunque ya no tenga la capacidad.
 RevokeDestructiveApproval = Annotated[
     Actor,
     Depends(
         require_at(
             Capability.BLUEPRINTS_APPROVE_DESTRUCTIVE,
             target=destructive_approval,
+            holder_of_record=_is_approver_of_record,
             step_up=False,
         )
     ),

@@ -8,8 +8,9 @@ Lo que decide el negocio y se mide acá:
 - La aprobación queda atada al hash del SQL revisado: si cambió, 409 ``sql_changed``; aprobar
   de nuevo tras editar reemplaza la anterior (``superseded``) y repetir el mismo hash es 409.
 - Aprobar para todo el blueprint exige la capacidad en CADA entorno bloqueante.
-- Revocar no pide step-up, es idempotente y solo lo hace quien tiene ``approve_destructive``
-  en el alcance (no hay camino por ``access.admin``).
+- Revocar no pide step-up, es idempotente y lo hace quien aprobó (aunque haya perdido la
+  capacidad) o quien tiene ``approve_destructive`` en el alcance (no hay camino por
+  ``access.admin``).
 
 Verificar con
 ``.venv/bin/python scripts/run_tests_direct.py tests.test_destructive_approval_api``.
@@ -23,6 +24,7 @@ import pytest
 from app.controllers.destructive_approval_controller import DestructiveApprovalController
 from app.exceptions import AppHttpException
 from tests.access_request_helpers import client_as, create_user
+from tests.csrf_helpers import attach_csrf
 from tests.test_api_gateway_users import _code
 from tests.test_capability_grant_crud import _audits
 from tests.test_environment_guard import (
@@ -38,6 +40,7 @@ from tests.test_environment_guard import (
 REASON = "Revisado el SQL con el equipo de datos"
 CODE_SELF_APPROVAL = "access.self_approval_forbidden"
 CODE_FORBIDDEN = "access.forbidden"
+APPROVER_PASSWORD = "ContraseñaDelAprobador123"
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +361,38 @@ def test_an_actor_without_the_capability_cannot_revoke(admin_client, drop_bluepr
     assert r.status_code == 403, r.text
     assert _code(r) == CODE_FORBIDDEN
     assert _version_row(admin_client, drop_blueprint, "0001")["approval_status"] == "approved"
+
+
+def test_the_approver_still_revokes_after_losing_the_capability(admin_client, drop_blueprint):
+    """Enmienda A-2: quien aprobó puede frenar su propio error aunque ya no sea owner."""
+    approver_data = create_user(admin_client, "aprobador", gateway_role="owner")
+    approver = client_as(approver_data, "aprobador", password=APPROVER_PASSWORD)
+    approval_id = _approve_blueprint(approver, drop_blueprint).json()["data"]["id"]
+
+    demoted = admin_client.patch(
+        f"/api/v1/gateway-users/{approver_data['id']}", json={"gateway_role": "viewer"}
+    )
+    assert demoted.status_code == 200, demoted.text
+    assert demoted.json()["data"]["gateway_role"] == "viewer"
+
+    # Cambiar el rol invalida la sesión: en la práctica, quien aprobó vuelve a entrar como viewer.
+    assert _revoke(approver, approval_id).status_code == 401
+    login = approver.post(
+        "/api/v1/auth/login", json={"username": "aprobador", "password": APPROVER_PASSWORD}
+    )
+    assert login.status_code == 200, login.text
+    attach_csrf(approver)
+
+    r = _revoke(approver, approval_id)
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["revoked_by"]["username"] == "aprobador"
+    assert _version_row(admin_client, drop_blueprint, "0001")["approval_status"] == "revoked"
+
+
+def test_a_machine_actor_is_never_the_approver_of_record():
+    """Un actor de integración lleva el ``id`` de su emisor: no hereda el permiso de revocar."""
+    machine = SimpleNamespace(is_machine=True, id=1, username="integracion")
+    assert DestructiveApprovalController.is_approver_of_record(machine, 1) is False
 
 
 def test_revoking_is_idempotent_and_keeps_the_first_revoker(admin_client, drop_blueprint):

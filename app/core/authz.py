@@ -322,6 +322,7 @@ def require_at(
     *,
     target: Callable[..., ScopeTarget],
     capability_for: Callable[[ScopeTarget], Capability] | None = None,
+    holder_of_record: Callable[[Actor, ScopeTarget], bool] | None = None,
     step_up: bool = True,
 ) -> Callable[..., Actor]:
     """
@@ -345,20 +346,29 @@ def require_at(
     ``environments.write`` y cualquier otro campo es ``databases.write``.
 
     ``step_up=False``: igual que en ``require``, solo para cancelaciones (capas 1 y 2 intactas).
+
+    ``holder_of_record``: predicado ``(actor, destino) -> bool`` que autoriza al actor YA
+    autenticado (y con CSRF) sin las capas 1 y 2, porque la fila del destino lo nombra a él. Lo
+    usa revocar una aprobación destructiva: quien aprobó puede frenar su propia aprobación aunque
+    después haya perdido la capacidad. Se consulta después de autenticar, así que puede leer la
+    fila sin ser un oráculo. El step-up, si la ruta lo pide, se sigue exigiendo igual.
     """
     from app.core.scope_targets import TARGET_KINDS
 
     kind = TARGET_KINDS[target]
 
     def _dependency(request: Request, t: ScopeTarget = Depends(target)) -> Actor:
-        if capability_for is None:
+        if capability_for is None and holder_of_record is None:
             exigida = capability
             actor = _authenticate(request, exigida)
+            assert_layer2(actor, exigida, t)
         else:
             actor = _identify(request)
-            exigida = capability_for(t)
-            assert_capability(actor, exigida, step_up=False)
-        assert_layer2(actor, exigida, t)
+            exigida = capability if capability_for is None else capability_for(t)
+            is_holder_of_record = holder_of_record is not None and holder_of_record(actor, t)
+            if not is_holder_of_record:
+                assert_capability(actor, exigida, step_up=False)
+                assert_layer2(actor, exigida, t)
         if step_up:
             assert_step_up(actor, exigida, method=request.method)
         return actor

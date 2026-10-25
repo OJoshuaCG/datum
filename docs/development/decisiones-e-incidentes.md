@@ -2926,8 +2926,11 @@ con las filas viejas; una fila con otra base se trata como `stale_hash`, nunca c
 
 La regla pedida era «el aprobador, o un access admin / owner». `access.admin` no es una capacidad operativa por
 invariante del catálogo: no puede hacer nada sobre blueprints. Darle una excepción solo para revocar rompía esa
-invariante. Pueden revocar: quien aprobó (mientras conserve `approve_destructive`), quien tenga esa capacidad en el
-alcance de la aprobación, o un owner. Revocar tampoco pide step-up (como las cancelaciones): frenar una operación
+invariante. Pueden revocar: quien aprobó (aunque ya no tenga `approve_destructive`), quien tenga esa capacidad en el
+alcance de la aprobación, o un owner. El aprobador conserva el derecho a revocar porque revocar solo bloquea: si le
+quitan el rol y después descubre que se equivocó, tiene que poder frenar su propia aprobación sin depender de otra
+persona. Lo resuelve `holder_of_record` en `require_at`, y una credencial de máquina nunca cuenta como aprobador (el
+actor de integración lleva el `id` de su emisor). Revocar tampoco pide step-up (como las cancelaciones): frenar una operación
 destructiva no puede costar más que lanzarla. Y es idempotente (200 con la fila intacta), así que no hay
 `already_revoked`.
 

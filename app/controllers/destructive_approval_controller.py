@@ -173,6 +173,32 @@ class DestructiveApprovalController:
                 public_context={"code": CODE_MACHINE_ACTOR},
             )
 
+    @classmethod
+    def is_approver_of_record(cls, actor, approval_id: int) -> bool:
+        """
+        ¿El actor es la persona que firmó esta aprobación? Autoriza a REVOCARLA sin la capacidad
+        (enmienda A-2): quien aprobó tiene que poder frenar su propio error aunque después le hayan
+        quitado ``approve_destructive``. Revocar solo bloquea, nunca habilita una ejecución.
+
+        Una máquina nunca es aprobadora de registro: un actor de integración lleva el ``id`` de su
+        emisor, y sin este corte un token heredaría el permiso de revocar de la persona.
+        """
+        if getattr(actor, "is_machine", False):
+            return False
+        actor_id, _ = identity_of(actor)
+        if actor_id is None:
+            return False
+        session = cls._session()
+        try:
+            approver_id = (
+                session.query(MigrationDestructiveApproval.approved_by_admin_id)
+                .filter(MigrationDestructiveApproval.id == approval_id)
+                .scalar()
+            )
+        finally:
+            session.close()
+        return approver_id is not None and approver_id == actor_id
+
     @staticmethod
     def _assert_authority_over_every_protected_environment(session, actor) -> None:
         """
@@ -490,8 +516,8 @@ class DestructiveApprovalController:
         Revoca una aprobación. Idempotente: revocar una ya revocada (o reemplazada) devuelve la
         fila TAL CUAL —mismo revocador, misma fecha— y no es un error.
 
-        La autorización (``approve_destructive`` en el alcance de la aprobación) ya la resolvió el
-        guard de la ruta; acá solo se escribe. El ``UPDATE`` condicional (``revoked_at IS NULL``)
+        La autorización (quien aprobó, o ``approve_destructive`` en el alcance de la aprobación) ya
+        la resolvió el guard de la ruta; acá solo se escribe. El ``UPDATE`` condicional (``revoked_at IS NULL``)
         hace que dos revocaciones simultáneas tengan UN ganador sin leer-y-escribir.
         """
         session = self._session()
