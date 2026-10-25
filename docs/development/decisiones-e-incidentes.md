@@ -2904,3 +2904,85 @@ revisar lo rechazan las guardas de revisión existentes. No se agregó una segun
 Un puntero manual cuya versión pierde después la marca de revisada **sigue resolviendo**: se confía en las guardas
 de cada consumidor. Es una decisión abierta, no un descuido.
 
+
+## Aprobación de versiones destructivas para producción
+
+Guía de uso en [`environments.md`](../features/environments.md#aprobación-de-versiones-destructivas); contrato en
+`api-reference-v47.md`. Reemplaza el bloqueo absoluto de `environment.destructive_blocked` por una aprobación de una
+segunda persona, sin abrir ningún camino a las máquinas.
+
+### El hash es del texto fuente, no del SQL resuelto por motor
+
+La aprobación guarda `sha256` de `up_sql` más sus overrides por motor (o de `down_sql`), con `hash_basis='raw_source_v1'`.
+El diseño original hablaba del SQL «resuelto por motor». Se descartó porque la traducción depende de sqlglot: una
+actualización de la librería cambiaría el SQL resuelto de una versión sin que nadie la toque y dejaría huérfanas todas
+las aprobaciones, o peor, aprobadas con un SQL que nadie revisó. El aprobador revisa lo que escribió el autor. Costo
+aceptado: editar **cualquier** override invalida la aprobación para todos los motores (es la dirección conservadora).
+El hash resuelto por motor se guarda en la auditoría del consumo solo como dato forense: si la traducción derivó entre
+la aprobación y la ejecución, se ve, pero no gobierna. `hash_basis` permite que una canonicalización futura conviva
+con las filas viejas; una fila con otra base se trata como `stale_hash`, nunca como aprobada.
+
+### Revocar no tiene camino por `access.admin`
+
+La regla pedida era «el aprobador, o un access admin / owner». `access.admin` no es una capacidad operativa por
+invariante del catálogo: no puede hacer nada sobre blueprints. Darle una excepción solo para revocar rompía esa
+invariante. Pueden revocar: quien aprobó (mientras conserve `approve_destructive`), quien tenga esa capacidad en el
+alcance de la aprobación, o un owner. Revocar tampoco pide step-up (como las cancelaciones): frenar una operación
+destructiva no puede costar más que lanzarla. Y es idempotente (200 con la fila intacta), así que no hay
+`already_revoked`.
+
+### Sin vencimiento
+
+La aprobación no caduca por tiempo. Un vencimiento forzaría a re-aprobar versiones ya revisadas y empujaría a
+aprobaciones apuradas por la mañana de un despliegue. La frescura la da el `confirm_token` (300 s) en cada ejecución,
+y la salida de emergencia es revocar. Una edición del SQL ya invalida sola.
+
+### Autores anteriores a la función: `author_unknown`
+
+Ninguna versión existente tiene «último editor» (la columna es nueva y sin backfill). Fallar cerrado habría hecho
+imposible aprobar cualquier versión vieja. Se permite y se marca `author_unknown` en la aprobación y en la auditoría,
+para que se vea que la regla de cuatro ojos no pudo verificarse del todo. Cuenta como desconocido también un creador
+registrado como `api_token`: la persona real es quien emitió el token.
+
+### Cuatro ojos excluye también al último editor
+
+Los owners tienen las dos capacidades, así que la separación no puede salir del rol. Se excluye al creador **y** al
+último editor del SQL; si no, A crea, B reescribe a `DROP TABLE` y B aprueba. Un tercero es quien aprueba.
+
+### Las máquinas conservan el bloqueo duro
+
+Integración y MCP nunca consumen aprobaciones ni tienen las capacidades. Una aprobación vigente no cambia su respuesta
+(`409 environment.destructive_blocked`). El alta de base (`create_database`) y `adopt` tampoco las consumen: llaman al
+`apply` sin token y reciben `confirmation_required`, de modo que hay un único camino a producción y siempre con
+intención humana (el diálogo por base). Consecuencia: «cubre bases futuras» significa que la aprobación de blueprint
+queda lista para el primer `apply`, no que el alta ejecute sola.
+
+### `apply-all` es todo o nada
+
+Antes, una base con versión destructiva sin aprobar fallaba en su ítem y las demás avanzaban (`200`). Con aprobaciones
+eso deja bases protegidas del mismo blueprint en versiones distintas, y revertirlo es otro incidente. El preflight
+corre antes de ejecutar la primera base, con un token de lote cuyo subject es **estático** (sin lecturas al motor, para
+que sea idéntico en el dry-run y en la ejecución) y el slug del entorno como re-tipeo. Cualquier falla rechaza la
+petición completa. El re-chequeo por base dentro de `_run_apply` se conserva para la carrera de una revocación a
+mitad del lote. Un lote con más de un entorno protegido se rechaza (`batch_multi_environment`): no hay un único slug
+que re-tipear.
+
+### El TTL del token es 300 s
+
+Cubre leer el plan, re-escribir el nombre y pasar por el prompt de step-up. No amplía lo que autoriza: el subject ata
+el conjunto exacto de aprobaciones. Una revocación posterior la atrapa el re-chequeo con sesión nueva.
+
+### Bug: una aprobación revocada contaba como aprobada
+
+`resolve()` decidía «aprobada» con `satisfying_row is not None`. `classify_approval` devuelve también la fila en el
+estado `revoked`, para que el plan y la pantalla muestren cuál se revocó. Resultado: el dry-run daba `all_approved`, el
+apply consumía la aprobación revocada y revocar no bloqueaba nada. Lo detectaron
+`test_revoking_after_the_plan_blocks_the_execution` y el test de revocación del lote. Corrección: aprobada **solo**
+si `status == APPROVAL_STATUS_APPROVED`. Regla: cuando un clasificador devuelve `(estado, fila)` y la fila existe para
+estados no aprobados, se decide por el estado, nunca por la fila. No «simplificar» ese guard.
+
+### Lo que NO se cierra
+
+`reconcile-partial`, el clon con `clean_mode='drop_database'`, la consola SQL, la conversión de collation y el export
+siguen sin mirar el entorno (ver `TODO.md`, `T-260822-lz-entornos-otros-caminos`). No se verificó contra motores
+reales: los tests usan un runner simulado.

@@ -76,8 +76,8 @@ DELETE /api/v1/database-models/{id}/migrations/{version}  # solo la ÚLTIMA vers
 
 ```http
 GET    /api/v1/managed-databases/{id}/migrations/status     # versión actual vs. pendientes
-POST   /api/v1/managed-databases/{id}/migrations/apply      # ?version= ?force= ?dry_run= — UNA llamada, secuencial (10/min)
-POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIG.) ?target_version= — secuencial (10/min)
+POST   /api/v1/managed-databases/{id}/migrations/apply      # ?version= ?force= ?dry_run= ?confirm_token= ?confirm_name= — UNA llamada, secuencial (10/min)
+POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIG. salvo dry_run) ?target_version= ?dry_run= ?confirm_token= ?confirm_name= — secuencial (10/min)
 POST   /api/v1/managed-databases/{id}/migrations/stamp      # ?version=  (marca sin ejecutar) (10/min)
 GET    /api/v1/managed-databases/{id}/migrations/history    # historial paginado
 GET    /api/v1/managed-databases/{id}/migrations/{version}/select-results     # resultados capturados (AUDITADO) (20/min)
@@ -93,11 +93,40 @@ del camino (pendientes hacia adelante, o versiones a revertir hacia atrás) tien
 ### Aplicación masiva
 
 ```http
-POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1..100) ?force= ?dry_run= (3/min)
+POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1..100) ?force= ?dry_run= ?confirm_token= ?confirm_phrase= (3/min)
 ```
 
 `apply-all` es **síncrono y acotado** (`max_databases` ≤100); continúa con las demás BDs
 aunque una falle. El fan-out asíncrono real es del Plan 06.
+
+### Versiones destructivas en un entorno protegido
+
+Si la base vive en un entorno con `blocks_destructive_migrations`, `apply`, `rollback` y `apply-all` no ejecutan
+una versión destructiva sin la **aprobación de otra persona**. Las rutas para listar, aprobar y revocar:
+
+```http
+GET    /api/v1/database-models/{id}/destructive-versions                              # estado de aprobación por versión y dirección (?managed_database_id=)
+POST   /api/v1/database-models/{id}/migrations/{version}/destructive-approvals        # aprueba para TODO el blueprint (también bases futuras)
+POST   /api/v1/managed-databases/{id}/migrations/{version}/destructive-approvals      # aprueba para UNA base
+POST   /api/v1/destructive-approvals/{approval_id}/revoke                             # revoca (sin step-up, idempotente)
+```
+
+- **Flujo.** Ver el estado en `destructive-versions` → aprobar con el `sql_hash` que se revisó
+  (`expected_sql_hash`) → dry-run para obtener el `confirm_token` → ejecutar con el token y el re-tipeo
+  (`confirm_name` = nombre de la base; en `apply-all`, `confirm_phrase` = slug del entorno).
+- **Cuatro ojos.** Aprueba alguien distinto del creador y del último editor del SQL. Por eso `update_migration`
+  y todo camino que escriba `up_sql*` o `down_sql` registra al último editor.
+- **Editar una versión aprobada.** La aprobación pasa a `stale_hash`: no vale, queda como evidencia y se
+  re-aprueba (reemplaza a la anterior).
+- **Rollback.** Un `down_sql` destructivo necesita su propia aprobación `down`. Con `dry_run=true`, el rollback
+  devuelve el camino y el plan sin tocar el motor, y `confirm_version` es opcional.
+- **`apply-all` es todo o nada** con versiones destructivas en bases protegidas: una sin aprobar rechaza la
+  petición completa (`409`) y no se ejecuta ninguna base. Un lote con más de un entorno protegido responde `422`
+  `destructive_approval.batch_multi_environment`; se filtra con `environment_id`.
+- **No consumen aprobaciones:** integración, MCP, alta de base (`create_database`) y `adopt`.
+
+Contrato completo y códigos de error: [api-reference-v47.md](../api-reference-v47.md). Reglas del entorno:
+[environments.md](environments.md#aprobación-de-versiones-destructivas).
 
 ### Búsqueda en el SQL de las versiones
 

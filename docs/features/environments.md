@@ -51,13 +51,49 @@ criterio. Si solo cubriera el lote, el incentivo sería perverso: `apply_all` va
 así que una versión destructiva trabaría producción de forma permanente mientras el `apply` por
 base la aplicaría con `?version=` sin ningún control.
 
+`POST /managed-databases/{id}/migrations/rollback` también lo respeta: si el `down_sql` de alguna versión
+del camino es destructivo, rige la misma regla de aprobación, en dirección `down`.
+
+### Aprobación de versiones destructivas
+
+El bloqueo ya no es absoluto para personas: una versión destructiva se ejecuta en un entorno protegido
+solo si **otra persona la aprobó** antes. Contrato completo en [api-reference-v47.md](../api-reference-v47.md).
+
+- **Dos capacidades, ambas solo de `owner`, sensibles y con step-up:** `blueprints.approve_destructive`
+  (aprobar y revocar) y `blueprints.apply_destructive` (ejecutar lo aprobado). Aprobar solo escribe metadatos
+  del gateway; ejecutar es el `apply` / `rollback` de siempre.
+- **Cuatro ojos.** El aprobador no puede ser el creador de la versión **ni el último que editó su SQL**.
+  Como los owners tienen las dos capacidades, la separación sale de los datos, no del rol. Cualquier edición
+  de `up_sql`, de sus overrides por motor o de `down_sql` cambia al «último editor». Las versiones anteriores a
+  esta función no tienen último editor: se pueden aprobar y quedan marcadas `author_unknown`.
+- **Alcance.** Por **base** (solo esa) o por **blueprint** (todas las bases protegidas del blueprint, incluidas
+  las que se creen después). El de blueprint exige la capacidad en cada entorno que bloquea lo destructivo. Si
+  hay una de cada una, gana la de la base.
+- **Por dirección.** Aprobar `up` no cubre el rollback; el `down_sql` es otro SQL con otro hash.
+- **Atada al SQL.** La aprobación guarda el hash del texto fuente. Editar el SQL la deja como evidencia con
+  estado `stale_hash` y hay que re-aprobar, lo que reemplaza a la anterior. No vence por tiempo.
+- **Revocación.** La puede hacer quien aprobó, quien tenga `approve_destructive` en el alcance, o un owner.
+  `access.admin` no tiene camino. No pide step-up y es idempotente. Afecta solo ejecuciones futuras.
+- **Ejecutar.** Aprobación vigente para cada versión pendiente, `apply_destructive` en la base, `confirm_token`
+  del dry-run (300 s) y re-tipeo validado por el servidor (nombre de la base; en `apply-all`, el slug del
+  entorno). `force` no interviene.
+- **`apply-all` es todo o nada** para las bases protegidas: una versión sin aprobar, o falta de token,
+  capacidad o re-tipeo, rechaza la petición completa y no se ejecuta ninguna base.
+- **Quién nunca consume aprobaciones:** los tokens de integración, el MCP y el alta de base
+  (`create_database` con `apply_migrations`). Siguen con el bloqueo, o el alta reporta
+  `confirmation_required` en `migration.error_code` (la base se crea igual), y se termina con el `apply` de la
+  base por una persona. `adopt` solo hace `stamp`, sin ejecutar SQL, así que el guard no aplica.
+
+> **Riesgo de despliegue:** los rollbacks de producción cuyo `down_sql` es destructivo (por ejemplo `DROP TABLE`
+> para deshacer un `CREATE`) pasan a necesitar una aprobación `down`. Conviene aprobarlas antes de que haga falta
+> revertir con urgencia.
+
 ### Lo que NO restringe (todavía)
 
 **Ninguno de estos caminos mira el entorno.** Marcar una base como productiva no los frena:
 
 | Camino | Qué puede hacer igual |
 | --- | --- |
-| `POST /{id}/migrations/rollback` | Ejecuta `down_sql`, que es destructivo por definición |
 | `POST /{id}/migrations/reconcile-partial` | Ejecuta reversos |
 | `DELETE /managed-databases/{id}?drop_remote=true` | `DROP DATABASE` |
 | `POST /servers/{id}/databases/{db}/drop` | `DROP DATABASE` |
@@ -224,9 +260,14 @@ Vocabulario cerrado en `app/services/environment_catalog.py`.
 | `environment.filter_conflict` | 422 |
 | `environment.confirmation_required` (+ `expected_slug`, `weakened`) | 422 |
 | `environment.databases_outside_environment` (+ `database_ids_outside`) | 422 |
-| `environment.destructive_blocked` (+ `environment_slug`, `blocked_versions`) | 409, o `error_code` del ítem |
+| `environment.destructive_blocked` (+ `environment_slug`, `blocked_versions`, `direction`, `approved_versions`, `approval_status`) — `blocked_versions` son las que **no tienen aprobación vigente** | 409. En `apply-all` de una persona, 409 de **toda la petición**; el `error_code` del ítem queda para máquinas y carreras |
 
-### El rechazo en `apply-all` va en el ítem, no en el `public_context`
+Los códigos de la aprobación (`destructive_approval.*`) están en [api-reference-v47.md](../api-reference-v47.md).
+
+### El rechazo en `apply-all` va en el ítem, no en el `public_context` (salvo versiones destructivas sin aprobar)
+
+Para las versiones destructivas de una persona el preflight rechaza la petición completa antes de ejecutar
+(ver arriba). Lo que sigue describe los demás rechazos por base y el de las máquinas.
 
 `apply_all` captura la excepción por base y **se queda solo con `exc.message`**, descartando el
 `status_code` y el `public_context`; la ruta responde **200** con los ítems adentro. Por eso el
@@ -241,7 +282,8 @@ contador agregado en el `detail` del lote no responde "qué base y por qué".
 ## Dry-run: informa, no bloquea
 
 El `dry_run` **no falla** por el entorno: devuelve el plan con `blocked_by` (las versiones que el
-apply real rechazaría) y `environment_slug`. Bloquear el dry-run le quitaría al operador
+apply real rechazaría), `environment_slug` y `destructive_plan` (estado de aprobación por versión y, si
+corresponde, el `confirm_token`). Bloquear el dry-run le quitaría al operador
 justamente la llamada con la que descubre qué lo frena. Precedente del criterio:
 `_guard_quarantine` también recibe `dry_run` y se saltea.
 

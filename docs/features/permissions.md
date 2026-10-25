@@ -24,6 +24,25 @@ motor). Con destino, se exige además en ese servidor (capa 2). Ver
 
 ---
 
+## Capacidades del gateway que aprueban y ejecutan SQL destructivo
+
+Este documento trata de los **privilegios del motor**. No confundir con las **capacidades del gateway**
+(quién puede hacer qué en el gateway, ver [authorization.md](authorization.md)). Dos capacidades nuevas gobiernan
+las versiones destructivas de blueprints en entornos protegidos:
+
+| Capacidad | Qué permite | Por defecto |
+|---|---|---|
+| `blueprints.approve_destructive` | Aprobar y revocar una versión destructiva, por base o por blueprint | Solo `owner`; sensible; step-up (revocar no lo pide) |
+| `blueprints.apply_destructive` | Ejecutar una versión destructiva ya aprobada en un entorno protegido | Solo `owner`; sensible; step-up |
+
+- Ninguna es operativa para tokens de integración ni para el MCP (`agent_allowed=false`).
+- Con ellas el conjunto de capacidades sensibles pasa de 17 a 19.
+- Tener las dos no alcanza para aprobarse a sí mismo: el aprobador debe ser distinto del creador y del último
+  editor del SQL. Detalle del flujo en [environments.md](environments.md#aprobación-de-versiones-destructivas).
+- `access.admin` no puede revocar aprobaciones: esa capacidad no es operativa por diseño del catálogo.
+
+---
+
 ## Niveles de permiso (`GrantLevel`)
 
 Cada operación de grant/revoke actúa sobre un **nivel** concreto. Los niveles soportados varían por motor:
