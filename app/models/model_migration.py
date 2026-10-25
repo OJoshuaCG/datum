@@ -179,6 +179,27 @@ class ModelMigration(Base, TimestampMixin):
         comment="'admin' | 'api_token' (vocabulario de audit_log.actor_type). NULL = desconocido",
     )
 
+    # ---- Último editor del SQL ------------------------------------------------------- #
+    # La regla de cuatro ojos de ``migration_destructive_approvals`` exige que quien aprueba un
+    # SQL destructivo no sea quien lo escribió NI quien lo editó por última vez: sin esta columna
+    # bastaría con que A cree la versión y B la edite para que B la apruebe habiendo escrito el
+    # SQL que aprueba. Misma forma que ``created_by_*`` (sin FK: el rastro sobrevive al usuario).
+    # NULL = desconocido: toda versión anterior a esta columna lo tiene y NO se rellena, porque
+    # atribuir una edición que no se registró sería inventar un editor.
+    last_sql_editor_admin_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment=(
+            "Persona que editó por última vez el SQL de subida o de bajada (sin FK). "
+            "NULL = desconocido (versión anterior a esta columna)"
+        ),
+    )
+    last_sql_editor_username: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="Nombre del último editor del SQL. NULL = desconocido (versión anterior)",
+    )
+
     def __repr__(self) -> str:
         return (
             f"<ModelMigration(id={self.id}, model_id={self.model_id}, "

@@ -169,6 +169,8 @@ class Capability(StrEnum):
     BLUEPRINTS_APPLY = "blueprints.apply"
     BLUEPRINTS_PROMOTE = "blueprints.promote"
     BLUEPRINTS_CAPTURES = "blueprints.captures"
+    BLUEPRINTS_APPROVE_DESTRUCTIVE = "blueprints.approve_destructive"
+    BLUEPRINTS_APPLY_DESTRUCTIVE = "blueprints.apply_destructive"
 
     # -- CÓDIGO de los objetos de esquema ----------------------------------- #
     #: El CUERPO de vistas, vistas materializadas, rutinas, triggers y eventos en el snapshot de una
@@ -445,6 +447,27 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         mutates=True,
         step_up=True,
     ),
+    # Aprobar y ejecutar una migración destructiva en un entorno protegido son dos capacidades
+    # separadas a propósito: el aprobador revisa el SQL y el ejecutor lo corre, y que un owner
+    # tenga las dos NO elimina el doble control (lo da el dato: el aprobador no puede ser el
+    # autor ni el último editor del SQL, ver ``destructive_approval_policy``).
+    # ``approve_destructive`` NO es ``destructive``: solo escribe metadatos del gateway (una fila
+    # de aprobación), no toca ninguna BD del tercero; la que ejecuta contra el tercero es
+    # ``apply_destructive``. Las dos exigen step-up, son solo de owner y quedan fuera del techo
+    # de agente: una máquina nunca consume una aprobación (la sigue bloqueando el guard).
+    _spec(
+        Capability.BLUEPRINTS_APPROVE_DESTRUCTIVE,
+        "Aprobar una migración destructiva para entornos protegidos",
+        mutates=True,
+        step_up=True,
+    ),
+    _spec(
+        Capability.BLUEPRINTS_APPLY_DESTRUCTIVE,
+        "Ejecutar una migración destructiva ya aprobada en un entorno protegido",
+        mutates=True,
+        step_up=True,
+        destructive=True,
+    ),
     # Las capturas son DATOS DE NEGOCIO de la base del tercero: divulgación, no lectura.
     _spec(
         Capability.BLUEPRINTS_CAPTURES,
@@ -695,6 +718,8 @@ _OWNER: frozenset[Capability] = _OPERATOR | {
     Capability.DATABASES_DROP,
     Capability.BLUEPRINTS_APPLY,
     Capability.BLUEPRINTS_PROMOTE,
+    Capability.BLUEPRINTS_APPROVE_DESTRUCTIVE,
+    Capability.BLUEPRINTS_APPLY_DESTRUCTIVE,
     Capability.BLUEPRINTS_CAPTURES,
     Capability.SCHEMA_DIFF_EXECUTE,
     Capability.EXPORTS_DOWNLOAD,
@@ -894,9 +919,10 @@ def is_sensitive(capability: Capability | str) -> bool:
     Antes eran las que divulgan o son de nivel ``drop`` (8). Al retirar el techo por tenencia
     (C3), ``blueprints.apply``, ``schema_diff.execute`` y ``collation.execute`` —destructivas y
     solo de ``owner``— quedaban otorgables por UN solo administrador, porque lo único que las
-    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (17: las 11
+    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (19: las 11
     de siempre más ``data.read``, ``data.query``, ``data.definitions``, ``data.blueprint_sql``,
-    ``engine_users.grant_admin`` y ``blueprints.promote``) y exige que siga conteniendo todo lo que divulga o es ``drop``.
+    ``engine_users.grant_admin``, ``blueprints.promote``, ``blueprints.approve_destructive`` y
+    ``blueprints.apply_destructive``) y exige que siga conteniendo todo lo que divulga o es ``drop``.
     """
     try:
         cap = Capability(capability)
@@ -1163,6 +1189,10 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
         "collation.execute",
         # Mover el puntero de un canal decide qué versión consumen las integraciones.
         "blueprints.promote",
+        # Aprobar y ejecutar SQL destructivo sobre un entorno protegido: separar al aprobador
+        # del ejecutor solo sirve si ninguna de las dos se otorga suelta por una sola persona.
+        "blueprints.approve_destructive",
+        "blueprints.apply_destructive",
     }
 )
 
@@ -1248,7 +1278,7 @@ def _assert_invariants() -> None:
             if s.id in ROLE_CAPABILITIES[role]:
                 raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
-    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 17 (owner
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 19 (owner
     #    menos operator, otorgables): si el catálogo crece, esto obliga a decidirlo a propósito.
     #    Y el criterio viejo (divulga o es `drop`) sigue contenido: ninguna otorgable que divulgue
     #    o borre puede quedar sin segundo aprobador.

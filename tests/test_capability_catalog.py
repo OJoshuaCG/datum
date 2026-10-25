@@ -160,6 +160,7 @@ def test_the_destructive_capabilities_are_the_expected_ones():
         Capability.DATABASES_DROP,
         Capability.ENGINE_USERS_DROP,
         Capability.BLUEPRINTS_APPLY,
+        Capability.BLUEPRINTS_APPLY_DESTRUCTIVE,
         Capability.SCHEMA_DIFF_EXECUTE,
         Capability.CLONES_EXECUTE,
         Capability.SQL_CONSOLE_EXECUTE,

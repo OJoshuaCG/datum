@@ -37,7 +37,7 @@ from tests.step_up_helpers import OPEN_WINDOW
 SCOPE = Capability.DATA_BLUEPRINT_SQL
 SCOPE_VALUE = "data.blueprint_sql"
 EXPECTED_EXCEPTION_SIZE = 4
-EXPECTED_SENSITIVE_POLICY_SIZE = 17
+EXPECTED_SENSITIVE_POLICY_SIZE = 19
 
 
 def _emisor(*, role: GatewayRole = GatewayRole.OWNER, fresco: bool):

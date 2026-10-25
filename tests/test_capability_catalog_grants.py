@@ -31,10 +31,13 @@ SENSITIVE = {
     "engine_users.grant_admin",
     # Mover el puntero de un canal de liberación decide qué versión consumen las integraciones.
     "blueprints.promote",
+    # Separar al aprobador del ejecutor de SQL destructivo en entornos protegidos.
+    "blueprints.approve_destructive",
+    "blueprints.apply_destructive",
 }
 
 
-def test_sensitive_set_is_exactly_the_seventeen_policy_capabilities():
+def test_sensitive_set_is_exactly_the_nineteen_policy_capabilities():
     assert {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)} == SENSITIVE
 
 

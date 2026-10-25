@@ -52,6 +52,7 @@ from app.models.managed_database_data_credential import ManagedDatabaseDataCrede
 from app.models.migration_select_result import MigrationSelectResult
 from app.models.migration_statement_progress import MigrationStatementProgress
 from app.models.model_migration import ModelMigration
+from app.models.migration_destructive_approval import MigrationDestructiveApproval
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.privilege import Privilege
@@ -97,6 +98,7 @@ __all__ = [
     "DatabaseMigrationHistory",
     "MigrationStatementProgress",
     "MigrationSelectResult",
+    "MigrationDestructiveApproval",
     "ModelMigrationStatement",
     "AuditLog",
     "CryptoKey",

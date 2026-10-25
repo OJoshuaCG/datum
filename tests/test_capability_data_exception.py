@@ -172,9 +172,9 @@ def test_the_data_capabilities_are_grantable_sensitive_and_need_a_second_approve
         assert rows[cap.value]["discloses"] and not rows[cap.value]["mutates"]
 
 
-def test_the_sensitive_set_is_the_old_eleven_plus_data_grant_admin_and_promote():
+def test_the_sensitive_set_is_the_old_eleven_plus_data_grant_admin_promote_and_destructive_approval():
     sensibles = {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)}
-    assert len(sensibles) == 17
+    assert len(sensibles) == 19
     assert {
         "data.read",
         "data.query",
@@ -182,6 +182,8 @@ def test_the_sensitive_set_is_the_old_eleven_plus_data_grant_admin_and_promote()
         "data.blueprint_sql",
         "engine_users.grant_admin",
         "blueprints.promote",
+        "blueprints.approve_destructive",
+        "blueprints.apply_destructive",
     } <= sensibles
     assert sensibles == cc._SENSITIVE_POLICY
 

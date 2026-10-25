@@ -441,6 +441,12 @@ BlueprintsRead = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_READ))]
 BlueprintsWrite = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_WRITE))]
 BlueprintsApply = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_APPLY))]
 BlueprintsPromote = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_PROMOTE))]
+BlueprintsApproveDestructive = Annotated[
+    Actor, Depends(require(Capability.BLUEPRINTS_APPROVE_DESTRUCTIVE))
+]
+BlueprintsApplyDestructive = Annotated[
+    Actor, Depends(require(Capability.BLUEPRINTS_APPLY_DESTRUCTIVE))
+]
 BlueprintsCaptures = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_CAPTURES))]
 
 #: Código de vistas, rutinas, triggers y eventos. Ninguna ruta lo usa como guard (el guard de esas
