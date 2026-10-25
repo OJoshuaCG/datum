@@ -143,6 +143,9 @@ AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 #: ``schema.definitions`` no es el guard de ninguna ruta: el snapshot y las comparaciones se guardan
 #: con ``databases.read`` / ``schema_diff.read`` y la capacidad decide si la respuesta lleva el CÓDIGO
 #: de los objetos (``definition_visibility``) o lo trae redactado.
+#: ``blueprints.apply_destructive`` tampoco: la exige el controller (``assert_at_with_code``) solo
+#: cuando hay versiones destructivas aprobadas por ejecutar, y eso depende de las versiones
+#: pendientes de CADA base, no de la ruta (que ya declara ``blueprints.apply``).
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset(
     {
         Capability.DATA_QUERY,
@@ -150,6 +153,7 @@ NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset(
         Capability.DATA_BLUEPRINT_SQL,
         Capability.ENGINE_USERS_GRANT_ADMIN,
         Capability.SCHEMA_DEFINITIONS,
+        Capability.BLUEPRINTS_APPLY_DESTRUCTIVE,
     }
 )
 
@@ -163,8 +167,11 @@ MIN_MIGRATED_ROUTES = 208
 #: Rutas cuya capacidad exige step-up y que se EXIMEN de él (``step_up=False`` en
 #: ``require``/``require_at``), con el motivo. Chequeo 7: toda ruta marcada tiene que estar acá y
 #: toda entrada tiene que ser una ruta marcada, cuya capacidad pida step-up y que sea un
-#: ``POST .../cancel``. Solo cancelaciones: frenar una operación destructiva nunca puede costar
-#: más que lanzarla. Agregar algo que no sea cancelar es reabrir el step-up.
+#: ``POST .../cancel`` o ``POST .../revoke``. Solo cancelaciones y revocaciones: frenar una operación
+#: destructiva (o retirar la aprobación que la habilita) nunca puede costar más que lanzarla.
+#: Agregar algo que no sea frenar es reabrir el step-up.
+STEP_UP_EXEMPT_SUFFIXES: tuple[str, ...] = ("/cancel", "/revoke")
+
 STEP_UP_EXEMPT: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/database-clones/{job_id}/cancel"): (
         "cancelar un clonado: frenarlo no puede costar más que lanzarlo"
@@ -181,6 +188,10 @@ STEP_UP_EXEMPT: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/access-requests/{request_id}/cancel"): (
         "retirar una elevación propia pendiente: nunca da acceso, y frenarla no puede costar "
         "más que pedirla"
+    ),
+    ("POST", "/api/v1/destructive-approvals/{approval_id}/revoke"): (
+        "revocar la aprobación de una migración destructiva: quitar la habilitación no puede "
+        "costar más que darla"
     ),
 }
 
@@ -216,9 +227,10 @@ def step_up_errors(app, *, exempt: dict[tuple[str, str], str]) -> list[str]:
                     f"{method} {path} se exime del step-up (step_up=False) y no está en "
                     "STEP_UP_EXEMPT."
                 )
-            if method != "POST" or not path.endswith("/cancel"):
+            if method != "POST" or not path.endswith(STEP_UP_EXEMPT_SUFFIXES):
                 errores.append(
-                    f"{method} {path} se exime del step-up y no es un POST .../cancel."
+                    f"{method} {path} se exime del step-up y no es un POST .../cancel "
+                    "ni .../revoke."
                 )
             if cap is None or not spec(Capability(cap)).requires_step_up:
                 errores.append(

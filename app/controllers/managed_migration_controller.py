@@ -14,11 +14,15 @@ Integridad: antes de tocar el motor se re-valida el ``checksum`` de cada migraci
 (detecta alteración directa en la BD del gateway).
 """
 
+import hashlib
+import json
 import re
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import or_ as sa_or
+from sqlalchemy import update as sa_update
 
 from app.controllers.blueprint_channel_controller import (
     reject_channel_with_target_version,
@@ -36,7 +40,8 @@ from app.core.environments import (
 )
 from app.core.logger import get_logger
 from app.core.remote_engine import UNKNOWN_DATABASE_CODES
-from app.core.scope import partition_for_batch
+from app.core.scope import assert_at_with_code, can_at, partition_for_batch
+from app.core.scope_targets import database as database_target
 from app.core.scope_targets import points_for_databases
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
@@ -44,9 +49,10 @@ from app.models.database_model import DatabaseModel
 from app.models.environment import Environment
 from app.models.enums import EngineType, MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
+from app.models.migration_destructive_approval import MigrationDestructiveApproval
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
-from app.core.actor import actor_type_of, identity_of
+from app.core.actor import Actor, actor_type_of, identity_of
 from app.core.context import current_http_identifier
 from app.services import audit
 from app.services import engine_error_catalog
@@ -65,12 +71,49 @@ from app.services.db_admin.migrations import (
 )
 from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.sql_dialect import SqlTranslator, split_sql_statements
-
-if TYPE_CHECKING:
-    from app.core.actor import Actor
+from app.services.confirm_token import issue as issue_confirm_token
+from app.services.destructive_approval_catalog import (
+    AUDIT_ACTION_CONSUME,
+    CODE_BATCH_MULTI_ENVIRONMENT,
+    CODE_CONFIRM_PHRASE_MISMATCH,
+    CODE_CONFIRMATION_REQUIRED,
+    CODE_EXECUTOR_FORBIDDEN,
+    DESTRUCTIVE_CONFIRM_TTL_SECONDS,
+    DIRECTION_DOWN,
+    DIRECTION_UP,
+    OPERATION_APPLY_ALL_DESTRUCTIVE,
+    OPERATION_APPLY_DESTRUCTIVE,
+    OPERATION_ROLLBACK_DESTRUCTIVE,
+)
+from app.services.destructive_approval_policy import (
+    TARGET_LABEL_BASE,
+    TARGET_LABEL_HEAD,
+    Resolution,
+    batch_subject,
+    db_subject,
+    destructive_down_versions,
+    destructive_reasons,
+    load_approvals_by_id,
+    resolve,
+    wrap_verify,
+)
 
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class _BatchPreflight:
+    """
+    Resultado del preflight destructivo de ``apply_all``.
+
+    ``confirmed`` son las entradas ``(db_id, migration_id, sql_hash, approval_id)`` que respaldaron
+    el token verificado (``None`` = el lote no exige confirmación, o el actor es una máquina y cada
+    ítem fallará por su cuenta). ``confirmation`` es lo que se informa al cliente.
+    """
+
+    confirmed: frozenset | None = None
+    confirmation: dict | None = None
 
 
 class ManagedMigrationController:
@@ -200,12 +243,18 @@ class ManagedMigrationController:
         )
 
     @staticmethod
-    def _load_specs(session, model_id: int) -> list[MigrationSpec]:
-        rows = (
-            session.query(ModelMigration)
-            .filter(ModelMigration.model_id == model_id)
-            .all()
-        )
+    def _load_specs(
+        session, model_id: int, *, only_version: str | None = None
+    ) -> list[MigrationSpec]:
+        """
+        Las versiones del blueprint como datos planos. ``only_version`` carga UNA sola: lo usa
+        el controller de aprobaciones destructivas, que no necesita (ni debe pagar el SQL de)
+        todas las versiones de un blueprint para aprobar una.
+        """
+        rows_query = session.query(ModelMigration).filter(ModelMigration.model_id == model_id)
+        if only_version is not None:
+            rows_query = rows_query.filter(ModelMigration.version == only_version)
+        rows = rows_query.all()
         # MANIFIESTO de sentencias por migración (una sola consulta para todas). Es
         # OPCIONAL: las migraciones escritas a mano no lo tienen y siguen funcionando por
         # el camino del splitter.
@@ -458,72 +507,388 @@ class ManagedMigrationController:
         out: dict[str, tuple[str, ...]] = {}
         for spec in specs:
             sql = self.runner.select_up_sql(spec, engine)
-            reasons: list[str] = []
             facts = migration_facts.analyze(sql, spec.kind, spec.has_non_portable)
-            if facts.destructive_statements:
-                reasons.append(
-                    "sentencias "
-                    + ",".join(str(i) for i in facts.destructive_statements)
-                )
-            if facts.charset_conversion_statements:
-                reasons.append(
-                    "conversión de charset/collation en sentencias "
-                    + ",".join(str(i) for i in facts.charset_conversion_statements)
-                )
+            reasons = destructive_reasons(facts)
             if any(st.destructive for st in spec.manifest):
                 reasons.append("manifiesto")
             if reasons:
                 out[spec.version] = tuple(reasons)
         return out
 
+    # ------------------------------------------------------------------ #
+    # Guard de entorno + aprobaciones de migraciones destructivas          #
+    # ------------------------------------------------------------------ #
     @staticmethod
-    def _guard_environment_destructive(
+    def _is_human_actor(actor) -> bool:
+        """
+        Solo una PERSONA con sesión consume aprobaciones. Un token de agente, uno de integración,
+        un ``dict`` legado o ``None`` conservan el bloqueo duro de siempre: la aprobación es el
+        visto bueno de una segunda persona para que OTRA persona ejecute, y una máquina que la
+        consumiera dejaría el control en manos de quien tenga el token.
+        """
+        return isinstance(actor, Actor) and not actor.is_machine
+
+    @staticmethod
+    def _destructive_blocked(
         db_id: int,
-        pending: list[MigrationSpec],
-        destructive: dict[str, tuple[str, ...]],
+        *,
+        direction: str,
         env_slug: str,
-    ) -> None:
+        hits: list[MigrationSpec],
+        destructive: dict[str, tuple[str, ...]],
+        resolution: Resolution | None = None,
+    ) -> AppHttpException:
         """
-        Rechaza aplicar versiones destructivas a una BD de un entorno que las bloquea.
+        El 409 ``environment.destructive_blocked``. ``blocked_versions`` son las que NO se pueden
+        ejecutar: sin aprobación vigente (sin aprobar, revocada o con el SQL cambiado). Sin
+        ``resolution`` (actor máquina) son todas las destructivas, como antes de las aprobaciones.
 
-        Va dentro de ``_run_apply``, justo después de calcular ``pending``, y eso NO es un
-        detalle de ubicación: es lo que hace que el guard cubra los DOS entrypoints (el
-        ``apply`` por BD y ``apply_all``) con una sola inserción, sin una lectura extra al
-        motor y sin abrir una ventana TOCTOU nueva. Los dos guards vecinos
-        (``_guard_reviewed_capture`` y ``_guard_capture_consent``) están acá por el mismo
-        motivo, y el comentario de arriba lo dice explícito.
-
-        Si estuviera solo en el bucle de ``apply_all``, el incentivo sería perverso: ``apply_all``
-        va siempre al head, así que una versión destructiva bloquearía producción de forma
-        permanente en el lote, mientras el ``apply`` por BD la aplicaría con ``?version=`` sin
-        ningún gate. El guard empujaría al camino no cubierto.
-
-        NO se ejecuta en dry-run, y tampoco hace falta pedirlo: ni ``apply`` ni ``apply_all``
-        llaman a ``_run_apply`` cuando ``dry_run=True`` (usan ``_dry_run_plan``). El plan sí
-        informa qué versiones bloquearían, en ``blocked_by``: bloquear el dry-run le quitaría al
-        operador justo la llamada con la que descubre qué lo frena.
-
-        ``force`` NO lo saltea. ``force`` es override de CUARENTENA y nada más; si algún día
-        hace falta un override de política, va un parámetro propio con su propio nombre.
+        ``approval_status`` por versión le dice a la pantalla si falta aprobar, si se revocó o si
+        hay que re-aprobar porque se editó el SQL, sin que tenga que pedir el listado aparte.
         """
-        hits = [s.version for s in pending if s.version in destructive]
-        if not hits:
-            return
-        raise AppHttpException(
+        all_versions = [spec.version for spec in hits]
+        blocked_versions = list(resolution.unapproved) if resolution is not None else all_versions
+        approved_versions = (
+            [entry.version for entry in resolution.approved] if resolution is not None else []
+        )
+        approval_status_by_version = (
+            {version: status.status for version, status in resolution.statuses.items()}
+            if resolution is not None
+            else {}
+        )
+        action = "revertir" if direction == DIRECTION_DOWN else "aplicar"
+        return AppHttpException(
             message=(
                 f"El entorno '{env_slug}' bloquea las migraciones destructivas y las versiones "
-                f"{', '.join(hits)} contienen sentencias que pueden perder datos "
+                f"{', '.join(blocked_versions)} contienen sentencias que pueden perder datos "
                 "(DROP / TRUNCATE / DELETE sin WHERE / ALTER DROP COLUMN). "
+                f"Para {action} hace falta una aprobación vigente de otra persona. "
                 "'force' no habilita esta operación."
             ),
             status_code=409,
             public_context={
                 "code": ecodes.CODE_DESTRUCTIVE_BLOCKED,
                 "environment_slug": env_slug,
-                "blocked_versions": hits,
+                "blocked_versions": blocked_versions,
+                "direction": direction,
+                "approved_versions": approved_versions,
+                "approval_status": approval_status_by_version,
             },
-            context={"managed_database_id": db_id, "reasons": {v: destructive[v] for v in hits}},
+            context={
+                "managed_database_id": db_id,
+                "reasons": {v: destructive.get(v, ()) for v in blocked_versions},
+            },
         )
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        """UTC naive: así guarda sus fechas todo el esquema de metadatos del gateway."""
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def _resolved_sql_hash(
+        self, spec: MigrationSpec, engine: EngineType, direction: str
+    ) -> str:
+        """
+        Hash del SQL YA resuelto para el motor. NO gobierna nada (el gate es el hash del texto
+        fuente): se guarda en la auditoría para que un cambio de traducción entre la aprobación y
+        la ejecución (p. ej. una actualización de sqlglot) quede visible como forense.
+        """
+        if direction == DIRECTION_UP:
+            resolved_sql = self.runner.select_up_sql(spec, engine)
+        else:
+            resolved_sql = self.runner.select_down_sql(spec, engine)
+        return hashlib.sha256((resolved_sql or "").encode("utf-8")).hexdigest()
+
+    def _consume_audit_detail(
+        self,
+        session,
+        db_id: int,
+        *,
+        direction: str,
+        hits: list[MigrationSpec],
+        resolution: Resolution,
+        actor,
+        engine: EngineType,
+        env_slug: str,
+        batch: bool,
+    ) -> str:
+        """
+        Detalle de la auditoría del consumo (A-10): versiones, aprobaciones y su alcance, dirección,
+        ejecutor, aprobador, autor, ``author_unknown`` y hashes. Sin SQL ni el motivo libre.
+        """
+        approvals_by_id = load_approvals_by_id(
+            session, [entry.approval_id for entry in resolution.approved]
+        )
+        spec_by_version = {spec.version: spec for spec in hits}
+        executor_id, _ = identity_of(actor)
+        versions_detail = []
+        for entry in resolution.approved:
+            approval = approvals_by_id.get(entry.approval_id)
+            versions_detail.append(
+                {
+                    "version": entry.version,
+                    "migration_id": entry.migration_id,
+                    "approval_id": entry.approval_id,
+                    "scope": entry.scope,
+                    "sql_hash": entry.sql_hash,
+                    "engine_resolved_hash": self._resolved_sql_hash(
+                        spec_by_version[entry.version], engine, direction
+                    ),
+                    "approver": approval.approved_by_admin_id if approval else None,
+                    "author": approval.author_admin_id if approval else None,
+                    "last_sql_editor": approval.editor_admin_id if approval else None,
+                    "author_unknown": bool(approval.author_unknown) if approval else None,
+                }
+            )
+        detail = {
+            "direction": direction,
+            "environment": env_slug,
+            "managed_database_id": db_id,
+            "batch": batch,
+            "executor": executor_id,
+            "versions": versions_detail,
+        }
+        return json.dumps(detail, sort_keys=True, ensure_ascii=False)
+
+    def _consume_check(
+        self,
+        db_id: int,
+        *,
+        direction: str,
+        hits: list[MigrationSpec],
+        destructive: dict[str, tuple[str, ...]],
+        env_slug: str,
+        actor,
+        engine: EngineType,
+        operation: str,
+        server_id: int,
+        db_name: str,
+        target_label: str,
+        from_version: str | None,
+        confirm_token: str | None,
+        confirm_name: str | None,
+        batch_confirmed: frozenset | None,
+    ) -> Resolution | None:
+        """
+        Decide si las versiones destructivas ``hits`` de una base protegida pueden ejecutarse, y
+        consume sus aprobaciones. Reemplaza al bloqueo duro: ahora se ejecutan SOLO si se cumplen
+        TODAS estas condiciones, en este orden:
+
+        1. el actor es una persona (una máquina conserva el bloqueo duro);
+        2. cada versión tiene una aprobación vigente cuyo hash coincide, leída en una sesión
+           FRESCA: es el re-chequeo de revocación que cierra el TOCTOU entre el plan y la
+           ejecución, así que no se reutiliza ninguna sesión ni resolución anterior;
+        3. el actor tiene ``blueprints.apply_destructive`` en la base (y step-up fresco);
+        4. un ``confirm_token`` válido para este conjunto exacto de aprobaciones, o, dentro de
+           ``apply_all``, que el lote ya lo verificó (``batch_confirmed``) y que ESTAS
+           aprobaciones sean las mismas que respaldaron el token;
+        5. la re-escritura del nombre de la base (``confirm_name``): el token da frescura, no
+           intención, así que el servidor valida el re-tipeo (A-6).
+
+        ``force`` no interviene en ninguna de las cinco. La auditoría del consumo es fail-closed:
+        si no se puede persistir, no se ejecuta nada.
+        """
+        if not hits:
+            return None
+
+        if not self._is_human_actor(actor):
+            raise self._destructive_blocked(
+                db_id, direction=direction, env_slug=env_slug, hits=hits, destructive=destructive
+            )
+
+        session = self._session()
+        try:
+            resolution = resolve(session, db_id, direction, hits)
+            if not resolution.is_fully_approved:
+                raise self._destructive_blocked(
+                    db_id,
+                    direction=direction,
+                    env_slug=env_slug,
+                    hits=hits,
+                    destructive=destructive,
+                    resolution=resolution,
+                )
+
+            assert_at_with_code(
+                actor,
+                Capability.BLUEPRINTS_APPLY_DESTRUCTIVE,
+                database_target(db_id),
+                code=CODE_EXECUTOR_FORBIDDEN,
+                message=(
+                    "Ejecutar migraciones destructivas en un entorno protegido exige la "
+                    "capacidad blueprints.apply_destructive sobre esta base."
+                ),
+            )
+
+            if batch_confirmed is not None:
+                needed_entries = {
+                    (db_id, entry.migration_id, entry.sql_hash, entry.approval_id)
+                    for entry in resolution.approved
+                }
+                if not needed_entries <= batch_confirmed:
+                    raise self._confirmation_required(
+                        "Las aprobaciones de esta base cambiaron desde que se confirmó el lote. "
+                        "Solicite de nuevo el plan (dry-run)."
+                    )
+            else:
+                if not confirm_token:
+                    raise self._confirmation_required(
+                        "Ejecutar migraciones destructivas en un entorno protegido exige el "
+                        "'confirm_token' del plan (dry-run) y re-escribir el nombre de la base."
+                    )
+                subject = db_subject(
+                    db_id, direction, target_label, from_version, resolution.approved
+                )
+                wrap_verify(confirm_token, operation, server_id, db_name, subject=subject)
+                if confirm_name != db_name:
+                    raise AppHttpException(
+                        message="Para confirmar hay que re-escribir el nombre exacto de la base.",
+                        status_code=422,
+                        public_context={"code": CODE_CONFIRM_PHRASE_MISMATCH},
+                    )
+
+            audit.record_intent(
+                AUDIT_ACTION_CONSUME,
+                admin=actor,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                detail=self._consume_audit_detail(
+                    session,
+                    db_id,
+                    direction=direction,
+                    hits=hits,
+                    resolution=resolution,
+                    actor=actor,
+                    engine=engine,
+                    env_slug=env_slug,
+                    batch=batch_confirmed is not None,
+                ),
+            )
+            return resolution
+        finally:
+            session.close()
+
+    @staticmethod
+    def _confirmation_required(message: str) -> AppHttpException:
+        return AppHttpException(
+            message=message,
+            status_code=409,
+            public_context={"code": CODE_CONFIRMATION_REQUIRED},
+        )
+
+    def _register_consumption(self, resolution: Resolution | None, actor) -> None:
+        """
+        Anota en cada aprobación usada quién la ejecutó y cuándo, DESPUÉS de que el motor devolvió.
+
+        Se cuenta como consumida aunque la migración haya fallado a mitad: el SQL destructivo
+        pudo haber corrido en parte y la aprobación se usó. Es un dato de seguimiento, no una
+        barrera, así que si falla se registra en el log y NO se levanta: ya se ejecutó SQL sobre la
+        base de un tercero y un 500 acá taparía el resultado real.
+        """
+        if resolution is None or not resolution.approved:
+            return
+        executor_id, executor_username = identity_of(actor)
+        approval_ids = [entry.approval_id for entry in resolution.approved]
+        session = self._session()
+        try:
+            session.execute(
+                sa_update(MigrationDestructiveApproval)
+                .where(MigrationDestructiveApproval.id.in_(approval_ids))
+                .values(
+                    last_executed_at=self._utcnow(),
+                    last_executed_by_admin_id=executor_id,
+                    last_executed_by_username=executor_username,
+                    execution_count=MigrationDestructiveApproval.execution_count + 1,
+                )
+            )
+            session.commit()
+        except Exception:  # noqa: BLE001 - dato de seguimiento posterior a la ejecución
+            session.rollback()
+            logger.exception(
+                "No se pudo registrar el consumo de las aprobaciones %s.", approval_ids
+            )
+        finally:
+            session.close()
+
+    def _build_destructive_plan(
+        self,
+        db_id: int,
+        *,
+        db_name: str,
+        server_id: int,
+        direction: str,
+        hits: list[MigrationSpec],
+        destructive: dict[str, tuple[str, ...]],
+        actor,
+        operation: str,
+        target_label: str,
+        from_version: str | None,
+        issue_token: bool,
+    ) -> tuple[dict | None, list[str]]:
+        """
+        ``(destructive_plan, blocked_by)`` de UNA base para el dry-run.
+
+        El estado de aprobación por versión se informa a cualquier actor (es lectura). El token se
+        emite solo si TODAS están aprobadas Y quien consulta es una persona que puede ejecutarlas
+        (A-8): un token que su dueño no puede usar es una promesa falsa. ``blocked_by`` son las
+        versiones sin aprobación vigente; para una máquina, todas (no consume aprobaciones).
+        """
+        if not hits:
+            return None, []
+        session = self._session()
+        try:
+            resolution = resolve(session, db_id, direction, hits)
+        finally:
+            session.close()
+
+        is_human = self._is_human_actor(actor)
+        executor_allowed = is_human and can_at(
+            actor, Capability.BLUEPRINTS_APPLY_DESTRUCTIVE, database_target(db_id)
+        )
+        all_approved = resolution.is_fully_approved
+
+        versions = []
+        for spec in hits:
+            version_status = resolution.statuses[spec.version]
+            versions.append(
+                {
+                    "version": spec.version,
+                    "migration_id": spec.id,
+                    "sql_hash": version_status.current_hash,
+                    "reasons": list(destructive.get(spec.version, ())),
+                    "approval_status": version_status.status,
+                    "approval_id": version_status.approval_id,
+                    "approval_scope": version_status.scope,
+                }
+            )
+
+        token: str | None = None
+        expires_at: datetime | None = None
+        if issue_token and is_human and executor_allowed and all_approved:
+            subject = db_subject(db_id, direction, target_label, from_version, resolution.approved)
+            token, expires_at = issue_confirm_token(
+                operation,
+                server_id,
+                db_name,
+                DESTRUCTIVE_CONFIRM_TTL_SECONDS,
+                subject=subject,
+            )
+
+        plan = {
+            "direction": direction,
+            "requires_confirmation": True,
+            "executor_allowed": executor_allowed,
+            "all_approved": all_approved,
+            "versions": versions,
+            "confirm_token": token,
+            "expires_at": expires_at,
+            "confirm_name_expected": db_name,
+        }
+        blocked_by = (
+            list(resolution.unapproved) if is_human else [spec.version for spec in hits]
+        )
+        return plan, blocked_by
 
     # ------------------------------------------------------------------ #
     # Aplicación                                                          #
@@ -537,7 +902,15 @@ class ManagedMigrationController:
         dry_run: bool = False,
         on_failure: str = "auto",
         admin: "dict | Actor | None" = None,
+        confirm_token: str | None = None,
+        confirm_name: str | None = None,
     ) -> dict:
+        """
+        Aplica las pendientes a UNA BD. ``confirm_token`` y ``confirm_name`` solo cuentan cuando
+        hay versiones destructivas en un entorno protegido (ver ``_consume_check``); los demás
+        llamadores internos (alta de BD, adopción, API de integración) no los mandan, así que
+        nunca consumen aprobaciones.
+        """
         session = self._session()
         try:
             md, server, model = self._load_context(session, db_id)
@@ -581,6 +954,7 @@ class ManagedMigrationController:
                 db_id, db_name, server_id, target, slug, specs, up_to_version,
                 env_policy=env_policy,
                 destructive=self._destructive_versions(specs, engine) if env_policy else None,
+                admin=admin,
             )
 
         if on_failure not in self._ON_FAILURE_MODES:
@@ -597,6 +971,8 @@ class ManagedMigrationController:
             on_failure=on_failure,
             env_blocks_destructive=bool(env_policy and env_policy[0]),
             env_slug=env_policy[1] if env_policy else None,
+            confirm_token=confirm_token,
+            confirm_name=confirm_name,
         )
 
     @staticmethod
@@ -915,9 +1291,15 @@ class ManagedMigrationController:
         *,
         env_policy: tuple[bool, str] | None = None,
         destructive: dict[str, tuple[str, ...]] | None = None,
+        admin: "dict | Actor | None" = None,
+        issue_token: bool = True,
     ) -> dict:
         """
         Calcula el plan (pendientes) SIN tocar el motor más que para leer la versión.
+
+        ``destructive_plan`` informa el estado de aprobación de cada versión destructiva pendiente y
+        emite el ``confirm_token`` (ver ``_build_destructive_plan``). ``apply_all`` pasa
+        ``issue_token=False``: en el lote hay UN token para todas las bases, no uno por base.
 
         El dry-run **informa** el bloqueo por entorno en ``blocked_by`` pero NO lo aplica: es
         la llamada con la que el operador descubre qué lo frena, así que hacerla fallar le
@@ -944,8 +1326,25 @@ class ManagedMigrationController:
         pending = self.runner.compute_pending(current, specs, up_to_version)
         pending_versions = [s.version for s in pending]
         blocked_by: list[str] = []
+        destructive_plan: dict | None = None
         if env_policy and env_policy[0] and destructive:
-            blocked_by = [v for v in pending_versions if v in destructive]
+            hits = [spec for spec in pending if spec.version in destructive]
+            if database_exists:
+                destructive_plan, blocked_by = self._build_destructive_plan(
+                    db_id,
+                    db_name=db_name,
+                    server_id=server_id,
+                    direction=DIRECTION_UP,
+                    hits=hits,
+                    destructive=destructive,
+                    actor=admin,
+                    operation=OPERATION_APPLY_DESTRUCTIVE,
+                    target_label=up_to_version or TARGET_LABEL_HEAD,
+                    from_version=current,
+                    issue_token=issue_token,
+                )
+            else:
+                blocked_by = [spec.version for spec in hits]
         return {
             "will_capture_versions": self._capture_versions(pending),
             "managed_database_id": db_id,
@@ -963,6 +1362,7 @@ class ManagedMigrationController:
             "pending_count": len(pending),
             "environment_slug": env_policy[1] if env_policy else None,
             "blocked_by": blocked_by,
+            "destructive_plan": destructive_plan,
         }
 
     # Política ante un fallo a mitad de una migración (solo aplica cuando el motor NO es
@@ -1101,8 +1501,17 @@ class ManagedMigrationController:
         env_blocks_destructive: bool = False,
         env_slug: str | None = None,
         destructive_versions: dict[str, tuple[str, ...]] | None = None,
+        confirm_token: str | None = None,
+        confirm_name: str | None = None,
+        batch_confirmed: frozenset | None = None,
     ) -> dict:
-        """Ejecuta el apply real sobre UNA BD ya cargada/validada (reutilizable por apply_all)."""
+        """
+        Ejecuta el apply real sobre UNA BD ya cargada/validada (reutilizable por apply_all).
+
+        ``confirm_token``/``confirm_name`` son los de un apply por BD. ``batch_confirmed`` lo manda
+        ``apply_all`` cuando YA verificó el token del lote y el re-tipeo del entorno: acá solo se
+        re-chequea, por BD, que las aprobaciones vigentes sigan siendo las confirmadas (TOCTOU).
+        """
         # Simétrico de ROB2: con un rollback a medio ejecutar, aplicar encima opera a
         # ciegas. Va acá (no en apply()) para cubrir también apply_all, que captura la
         # excepción por BD sin abortar el lote.
@@ -1136,14 +1545,35 @@ class ManagedMigrationController:
         # Guard de entorno, sobre las pendientes REALES de ESTA BD. Va acá por el mismo
         # criterio que los dos guards de captura de arriba, y con el mismo beneficio: cubre el
         # ``apply`` por BD y ``apply_all`` de una sola vez, sin releer el motor.
+        #
+        # Ya no es un bloqueo duro: una versión destructiva se ejecuta solo con aprobación vigente,
+        # ``apply_destructive``, token y re-tipeo (``_consume_check``). ``force`` sigue sin
+        # intervenir, y los llamadores internos (alta de BD, adopción, integración) nunca traen
+        # token, así que nunca consumen aprobaciones.
+        consumed_approvals: Resolution | None = None
         if env_blocks_destructive:
-            self._guard_environment_destructive(
-                db_id,
-                pending,
+            destructive = (
                 destructive_versions
                 if destructive_versions is not None
-                else self._destructive_versions(specs, engine),
-                env_slug or "?",
+                else self._destructive_versions(specs, engine)
+            )
+            destructive_hits = [spec for spec in pending if spec.version in destructive]
+            consumed_approvals = self._consume_check(
+                db_id,
+                direction=DIRECTION_UP,
+                hits=destructive_hits,
+                destructive=destructive,
+                env_slug=env_slug or "?",
+                actor=admin,
+                engine=engine,
+                operation=OPERATION_APPLY_DESTRUCTIVE,
+                server_id=server_id,
+                db_name=db_name,
+                target_label=up_to_version or TARGET_LABEL_HEAD,
+                from_version=from_version,
+                confirm_token=confirm_token,
+                confirm_name=confirm_name,
+                batch_confirmed=batch_confirmed,
             )
         # La auditoría de INTENCIÓN nombra las versiones que van a extraer datos. Es la
         # contrapartida de haber retirado el consentimiento por corrida: ese flag no dejaba
@@ -1174,6 +1604,7 @@ class ManagedMigrationController:
             )
             raise
 
+        self._register_consumption(consumed_approvals, admin)
         self._record_history(db_id, results, direction="up", specs=specs, admin=admin)
         self._mirror_history(
             target, db_name, engine, model_id=model_id, slug=slug, results=results,
@@ -1416,6 +1847,9 @@ class ManagedMigrationController:
         confirm_version: str | None = None,
         target_version: str | None = None,
         admin: "dict | Actor | None" = None,
+        dry_run: bool = False,
+        confirm_token: str | None = None,
+        confirm_name: str | None = None,
     ) -> dict:
         """
         Revierte una BD a ``target_version`` de forma SECUENCIAL en una sola llamada
@@ -1431,7 +1865,22 @@ class ManagedMigrationController:
         igual que para las del ``up_sql``, así que un rollback extrae y persiste datos de negocio
         exactamente como un apply — antes del fix B1 no llamaba a ningún guard y bastaba un
         ``confirm_version`` para exfiltrar filas.
+
+        **Guard de entorno.** En una BD de un entorno que bloquea lo destructivo, un ``down_sql``
+        destructivo (el ``DROP TABLE`` que deshace un ``CREATE``) exige su PROPIA aprobación de
+        dirección ``down``: la de ``up`` no la cubre porque es otro SQL con otro hash. Además
+        ``apply_destructive``, ``confirm_token`` y re-escribir el nombre de la base, igual que el
+        apply. Con ``dry_run=true`` devuelve el plan (y el token si corresponde) sin tocar el motor
+        y ``confirm_version`` pasa a ser opcional.
         """
+        # Antes de abrir sesión o leer el motor: sin plan, la doble intención es obligatoria, igual
+        # que cuando el parámetro era requerido en la ruta (422 antes de costar una lectura).
+        if not dry_run and confirm_version is None:
+            raise AppHttpException(
+                message="Confirmación requerida: falta 'confirm_version' (la versión actual de la BD).",
+                status_code=422,
+                context={"managed_database_id": db_id, "required": "confirm_version == current"},
+            )
         session = self._session()
         try:
             md, server, model = self._load_context(session, db_id)
@@ -1443,6 +1892,7 @@ class ManagedMigrationController:
             slug, engine, model_id = model.slug, EngineType(engine_value(server)), model.id
             db_name, server_id = md.name, md.server_id
             target = build_target(server)
+            env_policy = self._env_policy_for(session, [db_id]).get(db_id)
         finally:
             session.close()
 
@@ -1463,8 +1913,9 @@ class ManagedMigrationController:
                 status_code=409,
                 context={"managed_database_id": db_id},
             )
-        # Doble intención: el cliente repite la versión ACTUAL (de la que parte).
-        if confirm_version != current:
+        # Doble intención: el cliente repite la versión ACTUAL (de la que parte). El plan
+        # (dry-run) no ejecuta nada, así que no la exige.
+        if not dry_run and confirm_version != current:
             raise AppHttpException(
                 message=(
                     "Confirmación requerida: 'confirm_version' debe coincidir con la "
@@ -1533,6 +1984,48 @@ class ManagedMigrationController:
                 public_context={"missing_down_sql": missing},
             )
 
+        # Guard de entorno sobre el ``down_sql`` del camino. Se calcula ANTES del dry-run para que
+        # el plan informe lo mismo que el rollback real exigiría.
+        env_blocks_destructive = bool(env_policy and env_policy[0])
+        env_slug = env_policy[1] if env_policy else None
+        down_destructive: dict[str, tuple[str, ...]] = {}
+        down_hits: list[MigrationSpec] = []
+        if env_blocks_destructive:
+            down_destructive = destructive_down_versions(self.runner, path, engine)
+            down_hits = [spec for spec in path if spec.version in down_destructive]
+        target_label = dest or TARGET_LABEL_BASE
+
+        if dry_run:
+            destructive_plan, blocked_by = self._build_destructive_plan(
+                db_id,
+                db_name=db_name,
+                server_id=server_id,
+                direction=DIRECTION_DOWN,
+                hits=down_hits,
+                destructive=down_destructive,
+                actor=admin,
+                operation=OPERATION_ROLLBACK_DESTRUCTIVE,
+                target_label=target_label,
+                from_version=current,
+                issue_token=True,
+            )
+            return {
+                "managed_database_id": db_id,
+                "database_name": db_name,
+                "server_id": server_id,
+                "from_version": current,
+                "to_version": dest,
+                "target_version": dest,
+                "dry_run": True,
+                "no_op": len(path) == 0,
+                "reverted_count": 0,
+                "reverted_versions": [],
+                "rollback_path_versions": [spec.version for spec in path],
+                "environment_slug": env_slug,
+                "blocked_by": blocked_by,
+                "destructive_plan": destructive_plan,
+            }
+
         # Captura de resultados: el MISMO gate que exige ``apply``, sobre el camino que
         # REALMENTE se va a ejecutar (no sobre todo el blueprint — ver el docstring de
         # ``_guard_reviewed_capture``). Va acá, después de calcular ``path`` y antes de la
@@ -1546,6 +2039,24 @@ class ManagedMigrationController:
                 )
             finally:
                 session.close()
+
+        consumed_approvals = self._consume_check(
+            db_id,
+            direction=DIRECTION_DOWN,
+            hits=down_hits,
+            destructive=down_destructive,
+            env_slug=env_slug or "?",
+            actor=admin,
+            engine=engine,
+            operation=OPERATION_ROLLBACK_DESTRUCTIVE,
+            server_id=server_id,
+            db_name=db_name,
+            target_label=target_label,
+            from_version=current,
+            confirm_token=confirm_token,
+            confirm_name=confirm_name,
+            batch_confirmed=None,
+        )
 
         # Mismo criterio que en ``_run_apply``: la intención queda auditada nombrando qué
         # versiones extraen datos. El ``down_sql`` captura igual que el ``up_sql``.
@@ -1562,6 +2073,7 @@ class ManagedMigrationController:
             target, db_name=db_name, slug=slug, engine=engine,
             managed_db_id=db_id, specs=specs, to_version=dest,
         )
+        self._register_consumption(consumed_approvals, admin)
         self._record_history(db_id, results, direction="down", specs=path, admin=admin)
         self._mirror_history(
             target, db_name, engine, model_id=model_id, slug=slug, results=results,
@@ -2135,6 +2647,220 @@ class ManagedMigrationController:
             ],
         }
 
+    def _static_batch_entries(
+        self,
+        protected: list[tuple[int, str, int, object]],
+        specs: list[MigrationSpec],
+        target_version: str | None,
+        destructive_by_engine,
+        targets: dict[int, tuple],
+    ) -> list[tuple[int, int, str, int]]:
+        """
+        Entradas del subject del token del lote: por cada base protegida, las versiones destructivas
+        HASTA el destino que tienen una aprobación vigente. No lee ninguna base destino, así que el
+        subject es el mismo en el dry-run y en la ejecución mientras no cambie ninguna aprobación.
+        """
+        up_to_target = self.runner.compute_pending(None, specs, target_version)
+        entries: list[tuple[int, int, str, int]] = []
+        session = self._session()
+        try:
+            for db_id, _name, server_id, _status in protected:
+                _target, engine = targets[server_id]
+                destructive = destructive_by_engine(engine)
+                hits = [spec for spec in up_to_target if spec.version in destructive]
+                if not hits:
+                    continue
+                resolution = resolve(session, db_id, DIRECTION_UP, hits)
+                entries.extend(
+                    (db_id, entry.migration_id, entry.sql_hash, entry.approval_id)
+                    for entry in resolution.approved
+                )
+        finally:
+            session.close()
+        return entries
+
+    def _preflight_destructive_batch(
+        self,
+        model_id: int,
+        *,
+        slug: str,
+        dbs: list[tuple[int, str, int, object]],
+        targets: dict[int, tuple],
+        env_policies: dict[int, tuple[bool, str]],
+        specs: list[MigrationSpec],
+        target_version: str | None,
+        destructive_by_engine,
+        admin,
+        dry_run: bool,
+        force: bool,
+        confirm_token: str | None,
+        confirm_phrase: str | None,
+    ) -> _BatchPreflight:
+        """
+        Preflight TODO-O-NADA de ``apply_all`` sobre las bases protegidas (A-1).
+
+        Si una sola versión destructiva pendiente de cualquier base no tiene aprobación vigente, o
+        falta el token, la capacidad o el re-tipeo, no se ejecuta NADA en el lote: aplicar la mitad
+        dejaría bases protegidas en versiones distintas, y revertir eso es otro incidente. Los
+        rechazos por ítem de más abajo quedan solo como defensa ante carreras (re-chequeo TOCTOU).
+
+        Lee la versión actual de cada base protegida para saber qué está pendiente: es una lectura
+        al motor que el resto del lote hace igual en ``_run_apply``. Si esa lectura falla se asume
+        pendiente todo hasta el destino (conservador: nunca se subestima lo destructivo).
+
+        Una máquina no pasa por acá: no consume aprobaciones, así que cada ítem se rechaza solo con
+        ``environment.destructive_blocked``.
+        """
+        protected = [
+            row for row in dbs if env_policies.get(row[0]) and env_policies[row[0]][0]
+        ]
+        if not protected:
+            return _BatchPreflight()
+        is_human = self._is_human_actor(admin)
+
+        pending_hits_by_db: dict[int, list[MigrationSpec]] = {}
+        for db_id, name, server_id, status in protected:
+            target, engine = targets[server_id]
+            destructive = destructive_by_engine(engine)
+            if not destructive:
+                continue
+            if status == ProvisionStatus.error and not force and not dry_run:
+                continue
+            try:
+                current, database_exists = self._read_current_version_tolerant(
+                    target, name, slug
+                )
+            except Exception:  # noqa: BLE001 - se asume lo peor, no se aborta el preflight
+                current, database_exists = None, True
+            if not database_exists:
+                continue
+            pending = self.runner.compute_pending(current, specs, target_version)
+            hits = [spec for spec in pending if spec.version in destructive]
+            if hits:
+                pending_hits_by_db[db_id] = hits
+
+        if not pending_hits_by_db:
+            return _BatchPreflight()
+
+        slugs = sorted({env_policies[db_id][1] for db_id in pending_hits_by_db})
+        multi_environment = len(slugs) > 1
+        if multi_environment and not dry_run and is_human:
+            raise AppHttpException(
+                message=(
+                    "El lote abarca más de un entorno protegido con migraciones destructivas. "
+                    "Filtre por entorno (environment_id) y confirme de a uno."
+                ),
+                status_code=422,
+                public_context={
+                    "code": CODE_BATCH_MULTI_ENVIRONMENT,
+                    "environment_slugs": slugs,
+                },
+            )
+        if not is_human and not dry_run:
+            return _BatchPreflight()
+
+        unapproved_databases: list[dict] = []
+        executor_allowed = is_human
+        session = self._session()
+        try:
+            for db_id, hits in pending_hits_by_db.items():
+                resolution = resolve(session, db_id, DIRECTION_UP, hits)
+                if not resolution.is_fully_approved:
+                    unapproved_databases.append(
+                        {"managed_database_id": db_id, "versions": list(resolution.unapproved)}
+                    )
+                if is_human and not can_at(
+                    admin,
+                    Capability.BLUEPRINTS_APPLY_DESTRUCTIVE,
+                    database_target(db_id),
+                ):
+                    executor_allowed = False
+        finally:
+            session.close()
+        all_approved = not unapproved_databases
+
+        target_label = target_version or TARGET_LABEL_HEAD
+        entries = self._static_batch_entries(
+            protected, specs, target_version, destructive_by_engine, targets
+        )
+        subject = batch_subject(model_id, target_label, entries)
+        batch_name = f"model:{model_id}"
+        batch_slug = slugs[0] if len(slugs) == 1 else None
+
+        if dry_run:
+            token: str | None = None
+            expires_at: datetime | None = None
+            if is_human and executor_allowed and all_approved and not multi_environment:
+                token, expires_at = issue_confirm_token(
+                    OPERATION_APPLY_ALL_DESTRUCTIVE,
+                    model_id,
+                    batch_name,
+                    DESTRUCTIVE_CONFIRM_TTL_SECONDS,
+                    subject=subject,
+                )
+            return _BatchPreflight(
+                confirmation={
+                    "required": True,
+                    "confirm_token": token,
+                    "expires_at": expires_at,
+                    "environment_slug": batch_slug,
+                    "environment_slugs": slugs,
+                    "entry_count": len(entries),
+                    "executor_allowed": executor_allowed,
+                    "all_approved": all_approved,
+                    "unapproved_databases": unapproved_databases,
+                }
+            )
+
+        if unapproved_databases:
+            blocked_versions = sorted(
+                {v for item in unapproved_databases for v in item["versions"]}
+            )
+            raise AppHttpException(
+                message=(
+                    f"El entorno '{batch_slug}' bloquea las migraciones destructivas y hay "
+                    "versiones sin aprobación vigente en el lote. No se ejecutó nada."
+                ),
+                status_code=409,
+                public_context={
+                    "code": ecodes.CODE_DESTRUCTIVE_BLOCKED,
+                    "environment_slug": batch_slug,
+                    "blocked_databases": unapproved_databases,
+                    "blocked_versions": blocked_versions,
+                    "direction": DIRECTION_UP,
+                },
+            )
+        for db_id in pending_hits_by_db:
+            assert_at_with_code(
+                admin,
+                Capability.BLUEPRINTS_APPLY_DESTRUCTIVE,
+                database_target(db_id),
+                code=CODE_EXECUTOR_FORBIDDEN,
+                message=(
+                    "Ejecutar migraciones destructivas en un entorno protegido exige la "
+                    "capacidad blueprints.apply_destructive sobre cada base del lote."
+                ),
+            )
+        if not confirm_token:
+            raise self._confirmation_required(
+                "Ejecutar un lote destructivo exige el 'confirm_token' del dry-run y re-escribir "
+                "el slug del entorno."
+            )
+        wrap_verify(
+            confirm_token,
+            OPERATION_APPLY_ALL_DESTRUCTIVE,
+            model_id,
+            batch_name,
+            subject=subject,
+        )
+        if confirm_phrase != batch_slug:
+            raise AppHttpException(
+                message="Para confirmar hay que re-escribir el slug exacto del entorno.",
+                status_code=422,
+                public_context={"code": CODE_CONFIRM_PHRASE_MISMATCH},
+            )
+        return _BatchPreflight(confirmed=frozenset(entries))
+
     def apply_all(
         self,
         model_id: int,
@@ -2148,6 +2874,8 @@ class ManagedMigrationController:
         target_version: str | None = None,
         channel: str | None = None,
         admin: "dict | Actor | None" = None,
+        confirm_token: str | None = None,
+        confirm_phrase: str | None = None,
     ) -> dict:
         """
         Aplica las pendientes a TODAS las BDs del blueprint (síncrono, acotado).
@@ -2161,6 +2889,11 @@ class ManagedMigrationController:
         Optimización (evita trabajo N+1): carga y verifica ``specs`` UNA sola vez y
         cachea el ``ServerTarget`` por servidor (la credencial se descifra una vez por
         servidor, no por BD).
+
+        **Lote destructivo.** Si alguna base de un entorno protegido tiene versiones destructivas
+        pendientes, ``_preflight_destructive_batch`` decide ANTES de tocar la primera base: todo o
+        nada, con un único ``confirm_token`` del dry-run y el slug del entorno como re-tipeo
+        (``confirm_phrase``). Un lote que abarca más de un entorno protegido se rechaza (422).
         """
         # Mismo guard que ``apply``: el parámetro llega ahora desde la ruta (antes se
         # aceptaba en la firma pero la ruta no lo exponía, así que siempre valía "auto" y el
@@ -2332,6 +3065,23 @@ class ManagedMigrationController:
                 _destructive_cache[eng] = self._destructive_versions(specs, eng)
             return _destructive_cache[eng]
 
+        # Todo-o-nada ANTES de la primera base: si falla, no se ejecutó nada.
+        preflight = self._preflight_destructive_batch(
+            model_id,
+            slug=slug,
+            dbs=dbs,
+            targets=targets,
+            env_policies=env_policies,
+            specs=specs,
+            target_version=target_version,
+            destructive_by_engine=destructive_by_engine,
+            admin=admin,
+            dry_run=dry_run,
+            force=force,
+            confirm_token=confirm_token,
+            confirm_phrase=confirm_phrase,
+        )
+
         for db_id, name, server_id, status in dbs:
             target, engine = targets[server_id]
             item = {
@@ -2348,11 +3098,14 @@ class ManagedMigrationController:
                         db_id, name, server_id, target, slug, specs, target_version,
                         env_policy=policy,
                         destructive=destructive_by_engine(engine) if policy else None,
+                        admin=admin,
+                        issue_token=False,
                     )
                     item["ok"] = True
                     item["pending_versions"] = plan["pending_versions"]
                     item["dry_run"] = True
                     item["blocked_by"] = plan["blocked_by"]
+                    item["destructive_plan"] = plan["destructive_plan"]
                 else:
                     out = self._run_apply(
                         db_id, db_name=name, server_id=server_id, target=target,
@@ -2365,6 +3118,7 @@ class ManagedMigrationController:
                         destructive_versions=(
                             destructive_by_engine(engine) if policy and policy[0] else None
                         ),
+                        batch_confirmed=preflight.confirmed,
                     )
                     item["ok"] = not out["failed"]
                     item["applied"] = out["results"]
@@ -2399,6 +3153,23 @@ class ManagedMigrationController:
                         detail=(
                             f"guard=destructive environment={item['environment_slug']} "
                             f"versions={','.join(item['blocked_by'])}"
+                        ),
+                    )
+                elif item["error_code"] in (CODE_CONFIRMATION_REQUIRED, CODE_EXECUTOR_FORBIDDEN):
+                    # Defensa ante carreras: el preflight ya validó el lote, así que llegar acá
+                    # significa que las aprobaciones o la capacidad cambiaron durante la corrida.
+                    denied.append(db_id)
+                    audit.record(
+                        "migration.environment_denied",
+                        status="denied",
+                        admin=admin,
+                        target_type="managed_database",
+                        target_id=db_id,
+                        server_id=server_id,
+                        touched_engine=False,
+                        detail=(
+                            f"guard=destructive_confirmation code={item['error_code']} "
+                            f"environment={item['environment_slug']}"
                         ),
                     )
                 elif item["error_code"] == ccodes.CODE_UNREVIEWED_CAPTURE:
@@ -2452,6 +3223,7 @@ class ManagedMigrationController:
             "processed": len(dbs),
             "target_version": target_version,
             "resolved_channel": resolved_channel,
+            "destructive_confirmation": preflight.confirmation,
             "results": items,
         }
 

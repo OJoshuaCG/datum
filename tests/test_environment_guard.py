@@ -120,17 +120,15 @@ def test_hand_written_drop_is_blocked_without_manifest(
         session.close()
 
     _fresh_engine(monkeypatch)
+    # Con aprobaciones de por medio el lote es TODO O NADA: una persona sin aprobación vigente
+    # recibe un 409 de la petición entera (preflight), no un ítem fallido dentro de un 200.
     r = admin_client.post(f"/api/v1/database-models/{model_id}/migrations/apply-all")
-    assert r.status_code == 200, r.text
-    item = r.json()["data"]["results"][0]
-    assert item["ok"] is False
-    assert item["error_code"] == "environment.destructive_blocked"
-    assert item["blocked_by"] == ["0001"]
-    assert item["environment_slug"] == "production"
-    # El ítem lleva los dos campos que el zod del cliente exige no-nulos: si faltan, el
-    # safeParse descarta la respuesta ENTERA y se pierde el resultado de las demás BDs.
-    assert item["database_name"] == "proddb"
-    assert item["server_id"] == sid
+    assert r.status_code == 409, r.text
+    public_context = r.json()["detail"]["public_context"]
+    assert public_context["code"] == "environment.destructive_blocked"
+    assert public_context["blocked_versions"] == ["0001"]
+    assert public_context["environment_slug"] == "production"
+    assert [d["versions"] for d in public_context["blocked_databases"]] == [["0001"]]
 
 
 def test_engine_override_drop_is_blocked(admin_client, server_payload, monkeypatch):
@@ -158,11 +156,10 @@ def test_engine_override_drop_is_blocked(admin_client, server_payload, monkeypat
     )
     _fresh_engine(monkeypatch)
     r = admin_client.post(f"/api/v1/database-models/{model_id}/migrations/apply-all")
-    assert r.status_code == 200, r.text
-    item = r.json()["data"]["results"][0]
-    assert item["ok"] is False, item
-    assert item["error_code"] == "environment.destructive_blocked"
-    assert item["blocked_by"] == ["0001"]
+    assert r.status_code == 409, r.text
+    public_context = r.json()["detail"]["public_context"]
+    assert public_context["code"] == "environment.destructive_blocked"
+    assert public_context["blocked_versions"] == ["0001"]
 
 
 def test_safe_sql_on_same_blueprint_is_not_blocked(
@@ -233,23 +230,30 @@ def test_blocked_db_does_not_abort_the_batch(admin_client, server_payload, monke
     )
     sid = _server(admin_client, server_payload)
     oid = _owner(admin_client, sid)
-    prod_id = _db(
+    _db(
         admin_client, server_id=sid, owner_id=oid, model_id=model_id,
         name="db_prod", environment_id=envs["production"],
     )
-    dev_id = _db(
+    _db(
         admin_client, server_id=sid, owner_id=oid, model_id=model_id,
         name="db_dev", environment_id=envs["development"],
     )
-    _fresh_engine(monkeypatch)
+    applied_on: list[str] = []
+    monkeypatch.setattr(
+        MigrationRunner, "get_current_version", lambda self, *a, **k: None
+    )
+    monkeypatch.setattr(
+        MigrationRunner,
+        "apply",
+        lambda self, target, *, db_name, **k: applied_on.append(db_name) or [],
+    )
     r = admin_client.post(f"/api/v1/database-models/{model_id}/migrations/apply-all")
-    assert r.status_code == 200, r.text
-    by_id = {i["managed_database_id"]: i for i in r.json()["data"]["results"]}
-    assert by_id[prod_id]["ok"] is False
-    assert by_id[prod_id]["error_code"] == "environment.destructive_blocked"
-    # La de desarrollo se aplicó: el lote NO se abortó.
-    assert by_id[dev_id]["ok"] is True, by_id[dev_id]
-    assert by_id[dev_id].get("error_code") is None
+    # Contrato del lote destructivo: TODO O NADA. La base protegida sin aprobación frena la
+    # petición entera ANTES de ejecutar, incluida la de desarrollo (que por sí sola no estaba
+    # bloqueada): aplicar la mitad dejaría el lote en versiones distintas.
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "environment.destructive_blocked"
+    assert applied_on == [], f"el preflight debía impedir toda ejecución: {applied_on}"
 
 
 def test_per_database_apply_is_also_blocked(admin_client, server_payload, monkeypatch):
@@ -496,8 +500,7 @@ def test_charset_conversion_blocked_in_protected_environment(
 
     _fresh_engine(monkeypatch)
     r = admin_client.post(f"/api/v1/database-models/{model_id}/migrations/apply-all")
-    assert r.status_code == 200, r.text
-    item = r.json()["data"]["results"][0]
-    assert item["ok"] is False
-    assert item["error_code"] == "environment.destructive_blocked"
-    assert item["blocked_by"] == ["0001"]
+    assert r.status_code == 409, r.text
+    public_context = r.json()["detail"]["public_context"]
+    assert public_context["code"] == "environment.destructive_blocked"
+    assert public_context["blocked_versions"] == ["0001"]

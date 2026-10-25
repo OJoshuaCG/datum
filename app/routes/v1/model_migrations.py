@@ -136,11 +136,27 @@ def apply_all(
         False,
         description=(
             "Override de cuarentena en cada BD. **NO** saltea el bloqueo de migraciones "
-            "destructivas por entorno: ese guard no tiene override."
+            "destructivas por entorno: solo aprobaciones vigentes, 'confirm_token' y "
+            "'confirm_phrase' lo habilitan."
         ),
     ),
     dry_run: bool = Query(
-        False, description="No aplica: devuelve el plan por BD (pendientes)."
+        False,
+        description=(
+            "No aplica: devuelve el plan por BD (pendientes) y, si el lote toca versiones "
+            "destructivas de un entorno protegido, 'destructive_confirmation' con el "
+            "'confirm_token' del lote."
+        ),
+    ),
+    confirm_token: str | None = Query(
+        None,
+        max_length=200,
+        description="Token de 'destructive_confirmation' del dry-run del lote.",
+    ),
+    confirm_phrase: str | None = Query(
+        None,
+        max_length=128,
+        description="Slug del entorno protegido, re-escrito a mano. Se exige con 'confirm_token'.",
     ),
     on_failure: str = Query(
         "auto",
@@ -177,12 +193,18 @@ def apply_all(
     'error_code=migration.capture_unreviewed' y las versiones en 'unreviewed_capture'. No hay
     consentimiento por corrida: se retiró (entre otras razones, porque un único query param
     autorizaba N bases de entornos distintos, que es lo contrario de lo que decía proteger).
+
+    **Versiones destructivas en un entorno protegido**: el lote es TODO O NADA. Si alguna no tiene
+    aprobación vigente, o falta el token, la capacidad o el re-tipeo, responde 409/403/422 y no se
+    ejecuta ninguna base. Un lote que abarca más de un entorno protegido responde 422
+    'destructive_approval.batch_multi_environment': filtre por 'environment_id'.
     """
     result = ManagedMigrationController().apply_all(
         model_id, max_databases=max_databases, database_ids=database_ids,
         environment_id=environment_id,
         force=force, dry_run=dry_run,
         on_failure=on_failure, target_version=target_version, channel=channel, admin=actor,
+        confirm_token=confirm_token, confirm_phrase=confirm_phrase,
     )
     msg = "Plan masivo (dry-run)." if dry_run else "Aplicación masiva ejecutada."
     return success(data=result, message=msg)

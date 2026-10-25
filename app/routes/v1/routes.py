@@ -19,6 +19,7 @@ from app.routes.v1 import (
     database_clones,
     database_exports,
     database_models,
+    destructive_approvals,
     environments,
     managed_databases,
     model_migrations,
@@ -46,6 +47,7 @@ router.include_router(server_users.router)
 router.include_router(database_models.router)
 router.include_router(model_migrations.router)
 router.include_router(blueprint_channels.router)
+router.include_router(destructive_approvals.router)
 router.include_router(managed_databases.router)
 router.include_router(schema_comparisons.router)
 router.include_router(database_clones.router)

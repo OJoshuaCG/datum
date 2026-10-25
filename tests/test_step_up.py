@@ -271,12 +271,17 @@ def test_every_step_up_route_is_enforced(admin_client, expire_step_up, method, p
 
 def test_the_exempt_list_is_exactly_the_step_up_cancels():
     """
-    STEP_UP_EXEMPT == todo ``POST .../cancel`` cuya capacidad exige step-up. Ni una
-    cancelación prompteada ni una exención que no sea cancelar.
+    STEP_UP_EXEMPT == todo ``POST .../cancel`` y ``POST .../revoke`` cuya capacidad exige
+    step-up. Ni una cancelación prompteada ni una exención que no sea frenar.
     """
-    cancels = {(m, p) for m, p, _ in _ROUTES if m == "POST" and p.endswith("/cancel")}
+    cancels = {
+        (m, p)
+        for m, p, _ in _ROUTES
+        if m == "POST"
+        and (p.endswith("/cancel") or p.endswith("/destructive-approvals/{approval_id}/revoke"))
+    }
     assert cancels == set(_EXEMPT)
-    assert len(_EXEMPT) == 5
+    assert len(_EXEMPT) == 6
     assert all(motivo for motivo in _EXEMPT.values())
 
 

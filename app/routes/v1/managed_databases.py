@@ -508,14 +508,32 @@ def apply_migrations(
         False,
         description=(
             "Override de cuarentena tras un fallo previo (inspeccionado). **NO** saltea el "
-            "bloqueo de migraciones destructivas del entorno: ese guard no tiene override."
+            "bloqueo de migraciones destructivas del entorno: solo una aprobación vigente de otra "
+            "persona, más 'confirm_token' y 'confirm_name', lo habilita."
         ),
     ),
     dry_run: bool = Query(
         False,
         description=(
             "No aplica: devuelve el plan (versión actual + pendientes). Informa en "
-            "'blocked_by' qué versiones bloquearía el entorno, sin fallar."
+            "'blocked_by' qué versiones bloquearía el entorno, sin fallar, y en "
+            "'destructive_plan' el estado de aprobación de cada versión destructiva y el "
+            "'confirm_token' (solo si todas están aprobadas y quien consulta puede ejecutarlas)."
+        ),
+    ),
+    confirm_token: str | None = Query(
+        None,
+        max_length=200,
+        description=(
+            "Token del 'destructive_plan' del dry-run. Solo se exige cuando hay versiones "
+            "destructivas pendientes en un entorno protegido."
+        ),
+    ),
+    confirm_name: str | None = Query(
+        None,
+        max_length=128,
+        description=(
+            "Nombre exacto de la base, re-escrito a mano. Se exige junto con 'confirm_token'."
         ),
     ),
     on_failure: str = Query(
@@ -546,6 +564,7 @@ def apply_migrations(
     result = ManagedMigrationController().apply(
         db_id, up_to_version=version, force=force, dry_run=dry_run,
         on_failure=on_failure, admin=actor,
+        confirm_token=confirm_token, confirm_name=confirm_name,
     )
     msg = _apply_message(result, dry_run=dry_run)
     return success(data=result, message=msg)
@@ -595,12 +614,13 @@ def rollback_migration(
     request: Request,
     actor: BlueprintsApplyAtDb,
     db_id: int,
-    confirm_version: str = Query(
-        ...,
+    confirm_version: str | None = Query(
+        None,
         pattern=r"^\d{4,10}$",
         description=(
             "Confirmación obligatoria (operación DESTRUCTIVA): repetir la versión "
-            "ACTUAL de la BD desde la que se parte."
+            "ACTUAL de la BD desde la que se parte. Solo es opcional con 'dry_run=true'; "
+            "sin ella y sin dry_run responde 422."
         ),
     ),
     target_version: str | None = Query(
@@ -614,6 +634,23 @@ def rollback_migration(
             "es anterior a la actual."
         ),
     ),
+    dry_run: bool = Query(
+        False,
+        description=(
+            "No revierte: devuelve el camino y, en un entorno protegido, el 'destructive_plan' "
+            "con el estado de las aprobaciones de dirección 'down' y el 'confirm_token'."
+        ),
+    ),
+    confirm_token: str | None = Query(
+        None,
+        max_length=200,
+        description="Token del dry-run. Solo se exige si el 'down_sql' es destructivo en un entorno protegido.",
+    ),
+    confirm_name: str | None = Query(
+        None,
+        max_length=128,
+        description="Nombre exacto de la base, re-escrito a mano. Se exige junto con 'confirm_token'.",
+    ),
 ):
     """
     Revierte esta BD secuencialmente hasta 'target_version' 🔌 (operación DESTRUCTIVA).
@@ -623,12 +660,18 @@ def rollback_migration(
     'migration.capture_unreviewed' si alguna versión del camino a revertir tiene
     'capture_selects=true' sin revisar, sin ejecutar ninguna sentencia de la migración (el
     gateway sí lee antes la versión actual del destino para saber qué camino hay que revertir).
+
+    **Entorno protegido**: un 'down_sql' destructivo exige una aprobación de dirección 'down'
+    (la de 'up' no la cubre), 'blueprints.apply_destructive', 'confirm_token' y 'confirm_name'.
     """
     result = ManagedMigrationController().rollback(
         db_id,
         confirm_version=confirm_version,
         target_version=target_version,
         admin=actor,
+        dry_run=dry_run,
+        confirm_token=confirm_token,
+        confirm_name=confirm_name,
     )
     return success(data=result, message=_rollback_message(result))
 
@@ -637,6 +680,11 @@ def _rollback_message(result: dict) -> str:
     """Mensaje legible del resultado de rollback."""
     frm, to = result.get("from_version"), result.get("to_version")
     n = result.get("reverted_count", 0)
+    if result.get("dry_run"):
+        path = result.get("rollback_path_versions") or []
+        if not path:
+            return f"Plan (dry-run): nada que revertir, la BD ya está en {frm or 'base'}."
+        return f"Plan (dry-run): {len(path)} versión(es) a revertir — {frm} → {to or 'base'}."
     if result.get("no_op"):
         return f"Nada que revertir: la BD ya está en {frm or 'base'}."
     if result.get("failed"):

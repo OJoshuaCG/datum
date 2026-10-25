@@ -5,6 +5,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.blueprint_channel import ResolvedChannelOut
+from app.schemas.destructive_approval import DestructiveConfirmationOut, DestructivePlanOut
 
 # Versión: solo dígitos (4–10). Se compara/ordena NUMÉRICAMENTE (no lexicográfico).
 _VERSION = r"^\d{4,10}$"
@@ -553,6 +554,15 @@ class MigrationApplyOut(BaseModel):
             "'environment.destructive_blocked'."
         ),
     )
+    destructive_plan: DestructivePlanOut | None = Field(
+        None,
+        description=(
+            "Solo en dry-run, en un entorno que bloquea lo destructivo y con versiones "
+            "destructivas pendientes: el estado de aprobación de cada una y, si todas están "
+            "aprobadas y quien consulta puede ejecutarlas, el 'confirm_token' (TTL 300 s) que "
+            "exige el apply real junto con 'confirm_name'."
+        ),
+    )
     results: list[MigrationResultOut] = Field(default_factory=list)
     captured_versions: list[str] = Field(
         default_factory=list,
@@ -617,6 +627,28 @@ class MigrationRollbackOut(BaseModel):
     quarantined: bool = False
     no_op: bool = False
     reverted_versions: list[str] = Field(default_factory=list)
+    dry_run: bool = Field(False, description="True si es el plan (nada se revirtió).")
+    rollback_path_versions: list[str] = Field(
+        default_factory=list,
+        description="Solo en dry-run: versiones que el rollback desharía, de la más reciente a la más antigua.",
+    )
+    environment_slug: str | None = Field(
+        None, description="Solo en dry-run: entorno de esta BD, o null si no está clasificada."
+    )
+    blocked_by: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Solo en dry-run: versiones cuyo down_sql destructivo no tiene aprobación vigente. "
+            "INFORMATIVO: el plan no falla."
+        ),
+    )
+    destructive_plan: DestructivePlanOut | None = Field(
+        None,
+        description=(
+            "Solo en dry-run, con down_sql destructivo en un entorno protegido: aprobaciones "
+            "'down' por versión y el 'confirm_token' si corresponde."
+        ),
+    )
     results: list[MigrationResultOut] = Field(default_factory=list)
     captured_select_count: int = Field(
         0,
@@ -819,6 +851,13 @@ class ApplyAllItemOut(BaseModel):
             "que se capturó."
         ),
     )
+    destructive_plan: DestructivePlanOut | None = Field(
+        None,
+        description=(
+            "Solo en dry-run: estado de aprobación de las versiones destructivas de esta BD. Sin "
+            "token: en el lote la confirmación es una sola, en 'destructive_confirmation'."
+        ),
+    )
     unreviewed_capture: list[str] = Field(
         default_factory=list,
         description=(
@@ -864,6 +903,14 @@ class ApplyAllOut(BaseModel):
             "Solo con 'channel': {slug, mode, version, source} tal como se resolvió al "
             "empezar el lote. El canal es un puntero que se mueve, así que esto es lo único "
             "que dice qué versión significaba al momento de la corrida."
+        ),
+    )
+    destructive_confirmation: DestructiveConfirmationOut | None = Field(
+        None,
+        description=(
+            "Solo si el lote toca bases de un entorno protegido con versiones destructivas "
+            "pendientes. En dry-run trae el 'confirm_token' único del lote; el apply real lo "
+            "exige junto con 'confirm_phrase' (el slug del entorno)."
         ),
     )
     results: list[ApplyAllItemOut]

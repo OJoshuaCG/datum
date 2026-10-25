@@ -305,7 +305,9 @@ class IntegrationOpsController:
         - A target OLDER than the current version is rejected. The controller would answer a 200
           no-op, which an automation would read as "migrated to the version I asked for".
         - The environment guard (destructive migrations on protected environments) is the
-          controller's own and has no override, so production is covered exactly as for a person.
+          controller's own and has no override. A machine never consumes a destructive approval
+          (it sends no ``confirm_token`` and the controller treats it as a non-human actor), so a
+          destructive version stays blocked for it even when a person already approved it.
 
         No step-up is asked here: the issuer confirmed their password when the token was issued
         (D6) and a machine cannot answer a prompt.

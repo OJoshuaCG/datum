@@ -33,9 +33,18 @@ def _managed_db(admin_client, server_payload, model_id, port=3500):
     r = admin_client.post("/api/v1/server-users", json={"server_id": sid, "username": "o"})
     assert r.status_code == 201, r.text
     owner = r.json()["data"]["id"]
+    # Entorno explícito NO bloqueante: omitido resuelve al más protegido (``production``), y ahí
+    # un ``down_sql`` con DROP exige aprobación. Estos tests cubren la mecánica del rollback; el
+    # guard de entornos sobre rollback está en ``test_destructive_approval_guard.py``.
+    r = admin_client.get("/api/v1/environments?size=50")
+    assert r.status_code == 200, r.text
+    development_id = {e["slug"]: e["id"] for e in r.json()["data"]}["development"]
     r = admin_client.post(
         "/api/v1/managed-databases",
-        json={"name": "appdb", "server_id": sid, "owner_id": owner, "model_id": model_id},
+        json={
+            "name": "appdb", "server_id": sid, "owner_id": owner, "model_id": model_id,
+            "environment_id": development_id,
+        },
     )
     assert r.status_code == 201, r.text
     return r.json()["data"]["id"]

@@ -35,6 +35,7 @@ from app.core.scope import (
     resolve_environment_id,
 )
 from app.services.capability_catalog import Capability
+from app.services.destructive_approval_catalog import SCOPE_BLUEPRINT, SCOPE_DATABASE
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +74,14 @@ def model(model_id: int) -> ScopeTarget:
 def server_user(user_id: int) -> ScopeTarget:
     """Un usuario del motor del inventario: el servidor de su fila (``ServerUser.server_id``)."""
     return ScopeTarget("server_user", (user_id,))
+
+
+def destructive_approval(approval_id: int) -> ScopeTarget:
+    """
+    Una aprobación destructiva persistida: la base de su fila si es de alcance base, o TODAS las
+    bases de su blueprint si es de alcance blueprint (revocarla las afecta a todas).
+    """
+    return ScopeTarget("destructive_approval", (approval_id,))
 
 
 async def _body(request: Request) -> dict[str, Any]:
@@ -377,6 +386,7 @@ TARGET_KINDS: dict[Callable[..., ScopeTarget], str] = {
     clone_batch_any: "clone_batch_any",
     clone_batch: "clone_batch",
     bulk_profile: "bulk_profile",
+    destructive_approval: "destructive_approval",
 }
 
 
@@ -865,6 +875,32 @@ def _points_bulk_profile(params: tuple) -> list[ScopePoint]:
     return puntos
 
 
+def _points_destructive_approval(params: tuple) -> list[ScopePoint]:
+    from app.models.migration_destructive_approval import MigrationDestructiveApproval as Approval
+
+    (approval_id,) = params
+    session = _session()
+    try:
+        fila = (
+            session.query(Approval.scope, Approval.managed_database_id, Approval.database_model_id)
+            .filter(Approval.id == approval_id)
+            .first()
+        )
+    finally:
+        session.close()
+    if fila is None:
+        # Sin fila: indistinguible de "no podés" (fail-closed). El 404 lo levanta el controller.
+        return _unresolvable()
+    scope, managed_database_id, database_model_id = fila
+    if scope == SCOPE_DATABASE and managed_database_id is not None:
+        return _points_database((managed_database_id,))
+    if scope == SCOPE_BLUEPRINT:
+        return _points_model((database_model_id,))
+    # Alcance desconocido o fila de base sin base: resolverla como blueprint AMPLIARÍA el alcance
+    # (todas las bases del modelo) en vez de restringirlo. Fail-closed.
+    return _unresolvable()
+
+
 #: tipo → función de puntos. Sus claves son el vocabulario cerrado de tipos de destino.
 _RESOLVERS: dict[str, Callable[[tuple], list[ScopePoint]]] = {
     "database": _points_database,
@@ -890,6 +926,7 @@ _RESOLVERS: dict[str, Callable[[tuple], list[ScopePoint]]] = {
     "clone_batch_any": _points_clone_batch_any,
     "clone_batch": _points_clone_batch,
     "bulk_profile": _points_bulk_profile,
+    "destructive_approval": _points_destructive_approval,
 }
 
 
