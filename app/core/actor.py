@@ -295,6 +295,24 @@ def identity_of(subject: "Actor | dict | None") -> tuple[int | None, str | None]
     return getattr(subject, "id", None), getattr(subject, "username", None)
 
 
+def person_of(subject: "Actor | dict | None") -> "Actor | dict | None":
+    """
+    La PERSONA detrás de una identidad: el propio sujeto, o el EMISOR si es una máquina.
+
+    El ``Actor.id`` de un token de agente es el PK del TOKEN, que puede coincidir con el id de un
+    usuario cualquiera: tomarlo por persona bloquearía a un inocente y dejaría pasar al verdadero
+    responsable. Una máquina sin emisor resuelve a ``None`` ("persona desconocida"), igual que la
+    ausencia de actor: no se inventa una. Es el único lugar de esta regla porque la regla de
+    cuatro ojos compara al aprobador contra el autor y el último editor del SQL, y si cada sitio
+    la reimplementara, dos personas podrían compararse con varas distintas.
+    """
+    if subject is None:
+        return None
+    if getattr(subject, "is_machine", False):
+        return getattr(subject, "issuer", None)
+    return subject
+
+
 def actor_type_of(subject: "Actor | dict | None") -> str:
     """
     La CLASE de actor (``"admin"`` | ``"api_token"`` | ``"integration"``) de una identidad, para persistirla.

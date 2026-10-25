@@ -21,7 +21,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
-from app.core.actor import actor_type_of, identity_of
+from app.core.actor import actor_type_of, identity_of, person_of
 from app.core.context import current_http_identifier
 from app.core.database import Database
 from app.core.environments import (
@@ -202,6 +202,25 @@ class ModelMigrationController:
             "created_by_admin_id": admin_id,
             "created_by_username": username,
             "created_by_actor_type": actor_type_of(admin),
+        }
+
+    @staticmethod
+    def _sql_editor_fields(admin: "dict | Actor | None") -> dict:
+        """
+        Columnas ``last_sql_editor_*`` para el actor que escribe (o reescribe) el SQL.
+
+        La regla de cuatro ojos de las aprobaciones destructivas compara al aprobador contra el
+        creador Y contra este último editor, y lo que compara es una PERSONA. Un token de agente
+        no es una persona: su ``Actor.id`` es el PK del token, que puede coincidir con el id de
+        un usuario cualquiera, así que guardarlo bloquearía a un inocente y dejaría pasar al
+        verdadero editor (el emisor del token). Por eso, para una máquina se guarda a su EMISOR;
+        una máquina sin emisor deja las dos columnas en NULL ("editor desconocido"), igual que
+        la ausencia de actor: no se inventa uno.
+        """
+        person_id, person_username = identity_of(person_of(admin))
+        return {
+            "last_sql_editor_admin_id": person_id,
+            "last_sql_editor_username": person_username,
         }
 
     @staticmethod
@@ -1226,6 +1245,10 @@ class ModelMigrationController:
                     has_non_portable=has_non_portable,
                     reviewed=reviewed,
                     capture_selects=capture_selects,
+                    # Quien crea el SQL es también su primer editor: sin esto, el creador
+                    # figuraría como "editor desconocido" y la regla de cuatro ojos no
+                    # distinguiría una versión nunca editada de una anterior a la columna.
+                    **self._sql_editor_fields(admin),
                     **authorship,
                 )
                 session.add(migration)
@@ -1617,6 +1640,7 @@ class ModelMigrationController:
                         is_baseline=True,
                         has_non_portable=vp.has_non_portable,
                         reviewed=False,
+                        **self._sql_editor_fields(admin),
                         **authorship,
                     )
                 )
@@ -1795,6 +1819,13 @@ class ModelMigrationController:
 
             if "name" in data and data["name"] is not None:
                 m.name = data["name"]
+            # Cualquier cambio de SQL (de subida, de bajada o de un override por motor) deja a
+            # este actor como último editor. Va junto a las asignaciones y NO dentro de
+            # ``if diverging``: el editor se registra siempre, también en una versión nunca
+            # aplicada, que es donde más se edita antes de pedir la aprobación.
+            if sql_fields_changing or down_sql_changing:
+                for editor_column, editor_value in self._sql_editor_fields(admin).items():
+                    setattr(m, editor_column, editor_value)
             if "up_sql" in data and data["up_sql"] is not None:
                 # Al cambiar el SQL base, un override por-motor que NO se re-envíe en este
                 # mismo PATCH quedaría obsoleto (gana en _translated sobre el nuevo up_sql).
