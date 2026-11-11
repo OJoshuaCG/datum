@@ -442,3 +442,194 @@ def test_approving_and_revoking_leave_an_audit_entry_without_the_free_text(
         assert REASON not in (entry.detail or "")
         assert DROP_SQL not in (entry.detail or "")
         json.loads(entry.detail)
+
+
+# --------------------------------------------------------------------------- #
+# Aprobación en lote                                                           #
+# --------------------------------------------------------------------------- #
+@pytest.fixture()
+def two_drop_blueprint(admin_client):
+    """Blueprint con dos versiones destructivas, escritas por el admin."""
+    return _blueprint(
+        admin_client,
+        "bp-lote",
+        [
+            {"version": "0001", "name": "drop uno", "up_sql": "DROP TABLE clientes"},
+            {"version": "0002", "name": "drop dos", "up_sql": "DROP TABLE pedidos"},
+        ],
+    )
+
+
+def _batch_items(client, model_id, versions=("0001", "0002"), direction="up"):
+    return [
+        {
+            "version": version,
+            "direction": direction,
+            "expected_sql_hash": _version_row(client, model_id, version, direction)["sql_hash"],
+        }
+        for version in versions
+    ]
+
+
+def _approve_batch_blueprint(client, model_id, items, reason=REASON):
+    return client.post(
+        f"/api/v1/database-models/{model_id}/destructive-approvals/batch",
+        json={"reason": reason, "items": items},
+    )
+
+
+def test_a_batch_approves_every_version_and_reports_each_one(admin_client, two_drop_blueprint):
+    approver = _second_owner(admin_client, "aprobador")
+    items = _batch_items(approver, two_drop_blueprint)
+
+    r = _approve_batch_blueprint(approver, two_drop_blueprint, items)
+
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert (data["total"], data["approved_count"], data["failed_count"]) == (2, 2, 0)
+    assert [(x["version"], x["status"]) for x in data["results"]] == [
+        ("0001", "approved"),
+        ("0002", "approved"),
+    ]
+    for result in data["results"]:
+        assert result["error"] is None
+        assert result["approval"]["scope"] == "blueprint"
+        assert result["approval"]["reason"] == REASON
+        assert result["approval"]["approved_by"]["username"] == "aprobador"
+    for version in ("0001", "0002"):
+        row = _version_row(admin_client, two_drop_blueprint, version)
+        assert row["approval_status"] == "approved"
+    assert len(_audits("migration.destructive_approval.grant")) == 2
+
+
+def test_a_failing_item_does_not_stop_the_others(admin_client, two_drop_blueprint):
+    approver = _second_owner(admin_client, "aprobador")
+    items = _batch_items(approver, two_drop_blueprint)
+    items[0]["expected_sql_hash"] = "a" * 64
+
+    r = _approve_batch_blueprint(approver, two_drop_blueprint, items)
+
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert (data["approved_count"], data["failed_count"]) == (1, 1)
+    failed, approved = data["results"]
+    assert failed["status"] == "failed"
+    assert failed["approval"] is None
+    assert failed["error"]["code"] == "destructive_approval.sql_changed"
+    assert failed["error"]["status_code"] == 409
+    assert approved["status"] == "approved"
+    assert _version_row(admin_client, two_drop_blueprint, "0001")["approval_status"] == "unapproved"
+    assert _version_row(admin_client, two_drop_blueprint, "0002")["approval_status"] == "approved"
+
+
+def test_the_batch_keeps_the_four_eyes_rule_per_item(admin_client, two_drop_blueprint):
+    r = _approve_batch_blueprint(
+        admin_client, two_drop_blueprint, _batch_items(admin_client, two_drop_blueprint)
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["approved_count"] == 0
+    for result in data["results"]:
+        assert result["error"]["code"] == CODE_SELF_APPROVAL
+        assert result["error"]["rule"] == "creator"
+    assert _version_row(admin_client, two_drop_blueprint, "0001")["approval_status"] == "unapproved"
+
+
+def test_a_batch_reports_missing_down_sql_unknown_version_and_duplicate(
+    admin_client, two_drop_blueprint
+):
+    approver = _second_owner(admin_client, "aprobador")
+    already_approved = _batch_items(approver, two_drop_blueprint, versions=("0001",))
+    assert _approve_batch_blueprint(approver, two_drop_blueprint, already_approved).status_code == 200
+
+    items = [
+        *already_approved,
+        {"version": "0002", "direction": "down", "expected_sql_hash": "a" * 64},
+        {"version": "0099", "direction": "up", "expected_sql_hash": "a" * 64},
+    ]
+    r = _approve_batch_blueprint(approver, two_drop_blueprint, items)
+
+    assert r.status_code == 200, r.text
+    codes = [x["error"]["code"] for x in r.json()["data"]["results"]]
+    assert codes == [
+        "destructive_approval.duplicate",
+        "destructive_approval.down_sql_missing",
+        "destructive_approval.not_found",
+    ]
+
+
+def test_a_batch_by_a_user_without_the_capability_is_refused_as_a_whole(
+    admin_client, two_drop_blueprint
+):
+    viewer = _viewer(admin_client)
+    r = _approve_batch_blueprint(
+        viewer, two_drop_blueprint, _batch_items(admin_client, two_drop_blueprint)
+    )
+    assert r.status_code == 403, r.text
+    assert _code(r) == CODE_FORBIDDEN
+
+
+def test_a_batch_without_a_fresh_step_up_is_refused(
+    admin_client, two_drop_blueprint, expire_step_up
+):
+    approver = _second_owner(admin_client, "aprobador")
+    items = _batch_items(approver, two_drop_blueprint)
+    expire_step_up(approver)
+    r = _approve_batch_blueprint(approver, two_drop_blueprint, items)
+    assert r.status_code == 403, r.text
+    assert _code(r) == "access.step_up_required"
+    assert _version_row(admin_client, two_drop_blueprint, "0001")["approval_status"] == "unapproved"
+
+
+def test_a_batch_rejects_empty_oversized_repeated_and_malformed_input(
+    admin_client, two_drop_blueprint
+):
+    approver = _second_owner(admin_client, "aprobador")
+    item = _batch_items(approver, two_drop_blueprint, versions=("0001",))[0]
+
+    assert _approve_batch_blueprint(approver, two_drop_blueprint, []).status_code == 422
+    assert _approve_batch_blueprint(approver, two_drop_blueprint, [item] * 2).status_code == 422
+    assert (
+        _approve_batch_blueprint(approver, two_drop_blueprint, [{**item, "direction": "sideways"}])
+        .status_code
+        == 422
+    )
+    assert (
+        _approve_batch_blueprint(approver, two_drop_blueprint, [{**item, "version": "1"}])
+        .status_code
+        == 422
+    )
+    assert _approve_batch_blueprint(approver, two_drop_blueprint, [item], reason="corto").status_code == 422
+    too_many = [{**item, "version": f"{n:04d}"} for n in range(1, 102)]
+    assert _approve_batch_blueprint(approver, two_drop_blueprint, too_many).status_code == 422
+    assert _version_row(admin_client, two_drop_blueprint, "0001")["approval_status"] == "unapproved"
+
+
+def test_a_batch_at_database_scope_only_covers_that_database(
+    admin_client, drop_blueprint, production_database
+):
+    approver = _second_owner(admin_client, "aprobador")
+    items = _batch_items(approver, drop_blueprint, versions=("0001",))
+
+    r = approver.post(
+        f"/api/v1/managed-databases/{production_database}/destructive-approvals/batch",
+        json={"reason": REASON, "items": items},
+    )
+
+    assert r.status_code == 200, r.text
+    (result,) = r.json()["data"]["results"]
+    assert result["approval"]["scope"] == "database"
+    assert result["approval"]["managed_database_id"] == production_database
+    for_that_database = _version_row(
+        admin_client, drop_blueprint, "0001", managed_database_id=production_database
+    )
+    assert for_that_database["approval_status"] == "approved"
+    assert _version_row(admin_client, drop_blueprint, "0001")["approval_status"] == "unapproved"
+
+
+def test_the_single_approval_still_returns_201_with_one_approval(admin_client, drop_blueprint):
+    approver = _second_owner(admin_client, "aprobador")
+    r = _approve_blueprint(approver, drop_blueprint)
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["version"] == "0001"

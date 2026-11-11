@@ -26,6 +26,8 @@ Aprobar y ejecutar son capacidades separadas: quien ejecuta puede ser el autor, 
 | `GET /database-models/{id}/destructive-versions` | `blueprints.read` | Versiones destructivas del blueprint, una fila por dirección. Query `managed_database_id` opcional |
 | `POST /database-models/{id}/migrations/{version}/destructive-approvals` | `approve_destructive` + step-up | Aprueba para **todo el blueprint** (alcance `blueprint`). `201` |
 | `POST /managed-databases/{db_id}/migrations/{version}/destructive-approvals` | `approve_destructive` + step-up | Aprueba para **una base** (alcance `database`). `201` |
+| `POST /database-models/{id}/destructive-approvals/batch` | `approve_destructive` + step-up | Aprueba **varias versiones** con alcance `blueprint`. `200`, resultado parcial por ítem |
+| `POST /managed-databases/{db_id}/destructive-approvals/batch` | `approve_destructive` + step-up | Lo mismo con alcance `database`. `200` |
 | `POST /destructive-approvals/{approval_id}/revoke` | `approve_destructive`, **sin step-up** | Revoca. Idempotente |
 
 `{version}` cumple `^\d{4,10}$`. Todas responden con `ApiResponse[T]`.
@@ -73,6 +75,25 @@ Respuesta `DestructiveApprovalOut`: `id`, `model_migration_id`, `database_model_
 `managed_database_id`, `sql_hash`, `hash_basis` (`raw_source_v1`), `destructive_summary`, `author`,
 `last_sql_editor`, `author_unknown`, `reason`, `approved_by`, `approved_at`, `is_live`, `revoked_at`, `revoked_by`,
 `revoke_reason`, `last_executed_at`, `last_executed_by`, `execution_count`.
+
+### Aprobar en lote
+
+Body (igual en las dos rutas): `{reason, items: [{version, direction, expected_sql_hash}]}`. El `reason` es único
+para todo el lote y queda registrado en cada aprobación. Entre 1 y 100 ítems; repetir `(version, direction)` es `422`.
+
+Cada ítem sigue **exactamente** las reglas de «Aprobar» (hash, cuatro ojos, alcance, reemplazo, duplicado): el lote no
+tiene ningún atajo. El resultado es **parcial**: responde `200` aunque algún ítem falle, y los ítems que pasan quedan
+aprobados (cada uno en su transacción, con su entrada de auditoría). Si el cliente necesita todo-o-nada, tiene que
+revocar lo aprobado.
+
+Respuesta: `{total, approved_count, failed_count, results[]}`. Cada resultado trae `version`, `direction`, `status`
+(`approved` | `failed`), `approval` (un `DestructiveApprovalOut`, solo si `approved`) y `error`
+(`{code, message, status_code, rule}`, solo si `failed`). Los `code` son los de la aprobación individual; un error
+inesperado de un ítem sale como `destructive_approval.batch_item_failed` (500) y el detalle va al log.
+
+Lo que no depende del ítem corta **toda la petición** antes de aprobar nada: `403 access.forbidden` (en el alcance
+`blueprint`, falta la capacidad en algún entorno protegido), `403 destructive_approval.machine_actor` y `403
+access.step_up_required`.
 
 ### Revocar
 
@@ -156,6 +177,7 @@ Todos viajan en `detail.public_context.code`.
 | `destructive_approval.confirmation_invalid` | 422 | Token alterado o de otro conjunto de versiones/aprobaciones |
 | `destructive_approval.confirmation_expired` | 410 | Token vencido: pedir un dry-run nuevo |
 | `destructive_approval.confirm_phrase_mismatch` | 422 | El re-tipeo no coincide (nombre de la base o slug del entorno) |
+| `destructive_approval.batch_item_failed` | 500 | Solo dentro de un ítem de la aprobación en lote: error inesperado, el detalle está en el log |
 | `destructive_approval.batch_multi_environment` | 422 | El lote toca más de un entorno protegido: filtrar por `environment_id` |
 
 ## Cosas que sorprenden

@@ -108,6 +108,8 @@ una versión destructiva sin la **aprobación de otra persona**. Las rutas para 
 GET    /api/v1/database-models/{id}/destructive-versions                              # estado de aprobación por versión y dirección (?managed_database_id=)
 POST   /api/v1/database-models/{id}/migrations/{version}/destructive-approvals        # aprueba para TODO el blueprint (también bases futuras)
 POST   /api/v1/managed-databases/{id}/migrations/{version}/destructive-approvals      # aprueba para UNA base
+POST   /api/v1/database-models/{id}/destructive-approvals/batch                          # aprueba VARIAS versiones (blueprint), resultado parcial por ítem
+POST   /api/v1/managed-databases/{id}/destructive-approvals/batch                        # ídem, para UNA base
 POST   /api/v1/destructive-approvals/{approval_id}/revoke                             # revoca (sin step-up, idempotente)
 ```
 

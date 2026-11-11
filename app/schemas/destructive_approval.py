@@ -13,6 +13,7 @@ from typing import Annotated
 from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 from app.services.destructive_approval_catalog import (
+    APPROVAL_BATCH_MAX_ITEMS,
     DESTRUCTIVE_APPROVAL_DIRECTIONS,
     REASON_MAX_LENGTH,
     REASON_MIN_LENGTH,
@@ -51,6 +52,57 @@ class DestructiveApprovalCreate(BaseModel):
         if value not in DESTRUCTIVE_APPROVAL_DIRECTIONS:
             raise ValueError(f"'direction' debe ser uno de {list(DESTRUCTIVE_APPROVAL_DIRECTIONS)}.")
         return value
+
+
+class DestructiveApprovalBatchItem(BaseModel):
+    """Una versión y dirección a aprobar dentro de un lote, ligada al hash que se revisó."""
+
+    version: str = Field(pattern=r"^\d{4,10}$", description="Versión de la migración: 0001, 0002…")
+    direction: str = Field(description="'up' (aplicar) o 'down' (rollback).")
+    expected_sql_hash: str = Field(
+        pattern=_SHA256_HEX_PATTERN,
+        description="Hash del SQL revisado, igual que en la aprobación individual.",
+    )
+
+    @field_validator("direction")
+    @classmethod
+    def _direction_is_known(cls, value: str) -> str:
+        if value not in DESTRUCTIVE_APPROVAL_DIRECTIONS:
+            raise ValueError(
+                f"'direction' debe ser uno de {list(DESTRUCTIVE_APPROVAL_DIRECTIONS)}."
+            )
+        return value
+
+
+class DestructiveApprovalBatchCreate(BaseModel):
+    reason: ReasonText = Field(
+        description=(
+            f"Motivo declarado, común a todo el lote ({REASON_MIN_LENGTH} a "
+            f"{REASON_MAX_LENGTH} caracteres). Queda registrado en cada aprobación."
+        )
+    )
+    items: list[DestructiveApprovalBatchItem] = Field(
+        min_length=1,
+        max_length=APPROVAL_BATCH_MAX_ITEMS,
+        description=f"Versiones a aprobar (hasta {APPROVAL_BATCH_MAX_ITEMS}).",
+    )
+
+    @field_validator("items")
+    @classmethod
+    def _no_repeated_version_and_direction(
+        cls, items: list[DestructiveApprovalBatchItem]
+    ) -> list[DestructiveApprovalBatchItem]:
+        # Una versión repetida en el mismo lote chocaría consigo misma como 'duplicate': es un
+        # error del cliente y conviene cortarlo antes de aprobar nada.
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            key = (item.version, item.direction)
+            if key in seen:
+                raise ValueError(
+                    f"La versión {item.version} ({item.direction}) está repetida en el lote."
+                )
+            seen.add(key)
+        return items
 
 
 class DestructiveApprovalRevoke(BaseModel):
@@ -186,3 +238,29 @@ class DestructiveConfirmationOut(BaseModel):
     executor_allowed: bool
     all_approved: bool
     unapproved_databases: list[DestructiveUnapprovedDatabaseOut] = Field(default_factory=list)
+
+
+class DestructiveApprovalBatchItemError(BaseModel):
+    code: str = Field(description="Código estable, el mismo que devuelve la aprobación individual.")
+    message: str
+    status_code: int = Field(description="El HTTP que habría devuelto la aprobación individual.")
+    rule: str | None = Field(
+        None, description="Solo con access.self_approval_forbidden: 'creator' o 'last_editor'."
+    )
+
+
+class DestructiveApprovalBatchItemResultOut(BaseModel):
+    version: str
+    direction: str
+    status: str = Field(description="'approved' o 'failed'.")
+    approval: DestructiveApprovalOut | None = Field(None, description="Solo si status = approved.")
+    error: DestructiveApprovalBatchItemError | None = Field(None, description="Solo si status = failed.")
+
+
+class DestructiveApprovalBatchOut(BaseModel):
+    total: int
+    approved_count: int
+    failed_count: int
+    results: list[DestructiveApprovalBatchItemResultOut] = Field(
+        description="Un resultado por ítem, en el orden en que llegaron."
+    )

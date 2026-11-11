@@ -23,6 +23,8 @@ from app.core.authz import BlueprintsRead, require_at
 from app.core.scope import ScopeTarget
 from app.core.scope_targets import database, destructive_approval, model
 from app.schemas.destructive_approval import (
+    DestructiveApprovalBatchCreate,
+    DestructiveApprovalBatchOut,
     DestructiveApprovalCreate,
     DestructiveApprovalOut,
     DestructiveApprovalRevoke,
@@ -155,6 +157,55 @@ def approve_destructive_for_database(
         managed_database_id=db_id,
     )
     return success(data=approval, message="Migración destructiva aprobada para la base.")
+
+
+@router.post(
+    "/database-models/{model_id}/destructive-approvals/batch",
+    response_model=ApiResponse[DestructiveApprovalBatchOut],
+)
+def approve_destructive_batch_for_blueprint(
+    actor: ApproveDestructiveOnModel,
+    model_id: int,
+    payload: DestructiveApprovalBatchCreate,
+):
+    """
+    Aprueba varias versiones del blueprint de una vez, con alcance blueprint. Resultado PARCIAL:
+    responde 200 con un resultado por ítem (``approved`` | ``failed``); lo que falla no frena lo
+    demás. Cada ítem sigue las reglas de la aprobación individual (cuatro ojos, hash, step-up).
+
+    Errores de la petición entera: 403 ``access.forbidden`` / ``destructive_approval.machine_actor``;
+    422 de validación (lote vacío, más de 100 ítems, versión repetida). Los errores por ítem llevan
+    los mismos códigos que la aprobación individual.
+    """
+    result = DestructiveApprovalController().approve_batch(
+        model_id,
+        [item.model_dump() for item in payload.items],
+        reason=payload.reason,
+        actor=actor,
+    )
+    return success(data=result, message="Lote de aprobaciones procesado para el blueprint.")
+
+
+@router.post(
+    "/managed-databases/{db_id}/destructive-approvals/batch",
+    response_model=ApiResponse[DestructiveApprovalBatchOut],
+)
+def approve_destructive_batch_for_database(
+    actor: ApproveDestructiveOnDatabase,
+    db_id: int,
+    payload: DestructiveApprovalBatchCreate,
+):
+    """Igual que el lote por blueprint, pero con alcance SOLO a esta base."""
+    controller = DestructiveApprovalController()
+    model_id = controller.model_id_of_database(db_id)
+    result = controller.approve_batch(
+        model_id,
+        [item.model_dump() for item in payload.items],
+        reason=payload.reason,
+        actor=actor,
+        managed_database_id=db_id,
+    )
+    return success(data=result, message="Lote de aprobaciones procesado para la base.")
 
 
 @router.post(

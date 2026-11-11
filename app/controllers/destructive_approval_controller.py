@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.core.actor import identity_of
 from app.core.database import Database
+from app.core.logger import get_logger
 from app.core.scope import ScopePoint, assert_at_point
 from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
@@ -37,6 +38,9 @@ from app.services.destructive_approval_catalog import (
     APPROVAL_STATUS_APPROVED,
     AUDIT_ACTION_GRANT,
     AUDIT_ACTION_REVOKE,
+    BATCH_ITEM_STATUS_APPROVED,
+    BATCH_ITEM_STATUS_FAILED,
+    CODE_BATCH_ITEM_FAILED,
     CODE_DOWN_SQL_MISSING,
     CODE_DUPLICATE,
     CODE_MACHINE_ACTOR,
@@ -65,6 +69,8 @@ from app.services.destructive_approval_policy import (
     person_id,
 )
 from app.services.db_admin.migration_integrity import version_sort_key
+
+logger = get_logger(__name__)
 
 #: Largo máximo de ``destructive_summary`` (columna ``String(500)``).
 _SUMMARY_MAX_LENGTH = 500
@@ -475,6 +481,116 @@ class DestructiveApprovalController:
             raise
         finally:
             session.close()
+
+    def approve_batch(
+        self,
+        model_id: int,
+        items: list[dict],
+        *,
+        reason: str,
+        actor,
+        managed_database_id: int | None = None,
+    ) -> dict:
+        """
+        Aprueba varias versiones de un mismo blueprint, con resultado PARCIAL por ítem.
+
+        Cada ítem pasa por ``approve`` (mismo hash, mismos cuatro ojos, misma auditoría) en su
+        propia transacción: una versión con el SQL cambiado o sin ``down_sql`` no frena las demás,
+        y cada una queda con su código de error. No existe atajo del lote: lo que ``approve``
+        rechaza, el lote lo rechaza igual.
+
+        Lo que no depende del ítem (máquina, autoridad sobre todos los entornos protegidos en el
+        alcance blueprint) se corta ANTES de aprobar nada, para no devolver N veces el mismo 403.
+        """
+        self._assert_not_machine(actor)
+        if managed_database_id is None:
+            session = self._session()
+            try:
+                self._assert_authority_over_every_protected_environment(session, actor)
+            finally:
+                session.close()
+
+        results: list[dict] = []
+        for item in items:
+            results.append(
+                self._approve_batch_item(
+                    model_id,
+                    item,
+                    reason=reason,
+                    actor=actor,
+                    managed_database_id=managed_database_id,
+                )
+            )
+
+        approved_count = sum(1 for r in results if r["status"] == BATCH_ITEM_STATUS_APPROVED)
+        return {
+            "total": len(results),
+            "approved_count": approved_count,
+            "failed_count": len(results) - approved_count,
+            "results": results,
+        }
+
+    def _approve_batch_item(
+        self,
+        model_id: int,
+        item: dict,
+        *,
+        reason: str,
+        actor,
+        managed_database_id: int | None,
+    ) -> dict:
+        version = item["version"]
+        direction = item["direction"]
+        try:
+            approval = self.approve(
+                model_id,
+                version,
+                direction=direction,
+                expected_sql_hash=item["expected_sql_hash"],
+                reason=reason,
+                actor=actor,
+                managed_database_id=managed_database_id,
+            )
+        except AppHttpException as exc:
+            public_context = exc.public_context or {}
+            return {
+                "version": version,
+                "direction": direction,
+                "status": BATCH_ITEM_STATUS_FAILED,
+                "approval": None,
+                "error": {
+                    "code": public_context.get("code", CODE_BATCH_ITEM_FAILED),
+                    "message": exc.message,
+                    "status_code": exc.status_code,
+                    "rule": public_context.get("rule"),
+                },
+            }
+        except Exception:
+            # El detalle del motor o de la BD del gateway va al log, no al cliente.
+            logger.exception(
+                "Aprobación destructiva en lote: error inesperado en la versión %s (%s)",
+                version,
+                direction,
+            )
+            return {
+                "version": version,
+                "direction": direction,
+                "status": BATCH_ITEM_STATUS_FAILED,
+                "approval": None,
+                "error": {
+                    "code": CODE_BATCH_ITEM_FAILED,
+                    "message": "Error inesperado al aprobar esta versión.",
+                    "status_code": 500,
+                    "rule": None,
+                },
+            }
+        return {
+            "version": version,
+            "direction": direction,
+            "status": BATCH_ITEM_STATUS_APPROVED,
+            "approval": approval,
+            "error": None,
+        }
 
     @staticmethod
     def _assert_four_eyes(

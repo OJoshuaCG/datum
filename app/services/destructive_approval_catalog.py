@@ -106,6 +106,18 @@ CODE_CONFIRMATION_EXPIRED = f"{_CODE_PREFIX}confirmation_expired"  # 410
 CODE_CONFIRM_PHRASE_MISMATCH = f"{_CODE_PREFIX}confirm_phrase_mismatch"  # 422
 CODE_BATCH_MULTI_ENVIRONMENT = f"{_CODE_PREFIX}batch_multi_environment"  # 422
 CODE_EXECUTOR_FORBIDDEN = f"{_CODE_PREFIX}executor_forbidden"  # 403: falta apply_destructive
+#: Solo viaja DENTRO del resultado de un ítem de la aprobación en lote: un error inesperado en un
+#: ítem no puede tumbar la respuesta (los ítems anteriores ya quedaron aprobados). El detalle va
+#: al log con el Request ID, nunca al cliente.
+CODE_BATCH_ITEM_FAILED = f"{_CODE_PREFIX}batch_item_failed"
+
+#: Tope de ítems por aprobación en lote. Cada ítem recalcula el hash del SQL de su versión y abre
+#: su propia transacción, así que el tope acota el tiempo de una sola petición.
+APPROVAL_BATCH_MAX_ITEMS = 100
+
+#: Resultado de un ítem de la aprobación en lote.
+BATCH_ITEM_STATUS_APPROVED = "approved"
+BATCH_ITEM_STATUS_FAILED = "failed"
 
 #: No existe ``already_revoked``: revocar algo ya revocado es idempotente (200 con la fila
 #: intacta), así que no hay error que nombrar.
@@ -124,6 +136,7 @@ ERROR_CODES: frozenset[str] = frozenset(
         CODE_CONFIRM_PHRASE_MISMATCH,
         CODE_BATCH_MULTI_ENVIRONMENT,
         CODE_EXECUTOR_FORBIDDEN,
+        CODE_BATCH_ITEM_FAILED,
     }
 )
 
