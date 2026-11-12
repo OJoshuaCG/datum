@@ -2989,3 +2989,24 @@ estados no aprobados, se decide por el estado, nunca por la fila. No «simplific
 `reconcile-partial`, el clon con `clean_mode='drop_database'`, la consola SQL, la conversión de collation y el export
 siguen sin mirar el entorno (ver `TODO.md`, `T-260822-lz-entornos-otros-caminos`). No se verificó contra motores
 reales: los tests usan un runner simulado.
+
+## El clon no respetaba la collation del origen
+
+**Síntoma.** Al clonar a otro servidor, la BD y sus vistas, rutinas y triggers quedaban con la collation de la
+conexión del gateway (`utf8mb4_0900_ai_ci` en MySQL 8) en vez de la del origen (`utf8mb4_unicode_ci`).
+
+**Causa, reproducida con MySQL 8.4 y MariaDB 11.4.** Tres cosas a la vez: (1) la conexión al motor remoto fija solo
+`charset`, así que `collation_connection` toma el default del servidor y el motor la **congela** en cada vista,
+función y trigger que se crea; (2) `CREATE DATABASE ... CHARACTER SET x` sin `COLLATE` cae al default del servidor; (3)
+el clon heredaba `db_collation` solo si origen y destino eran del mismo motor, y MariaDB→MySQL no lo es.
+
+**Corrección.** El snapshot trae `collation_connection` por objeto; el clon la repone con `SET collation_connection`
+antes de cada `CREATE` (`execute_adhoc(session_collations=...)`) y la BD hereda la del origen entre MySQL y MariaDB si
+el destino la ofrece. Es la misma idea que `MigrationRunner._align_session_collation`, que cubría apply/rollback pero no
+el clon. Si el destino no tiene la collation, se cae al default y no se falla.
+
+### Lo que NO se verificó
+
+La reposición de sesión durante un clon completo contra servidores reales: solo se leyó el snapshot en MariaDB 11.4
+(las cuatro clases de objeto devuelven su collation). Los tests de la ejecución usan runners simulados.
+

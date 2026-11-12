@@ -130,9 +130,14 @@ degrada a `INSERT` simple, así que reejecutar el job duplicaría filas: el prev
 { "target_charset": { "mode": "override", "charset": "utf8mb4", "collation": "utf8mb4_unicode_ci" } }
 ```
 
-- `keep` (default) = heredar del origen si es el mismo motor, o el default del motor destino si
-  es cross-engine. Con `keep` no se admiten `charset`/`collation` (antes se aceptaban y se
+- `keep` (default) = heredar la collation del origen. Entre el mismo motor siempre; entre MySQL y
+  MariaDB solo si el servidor destino la ofrece (`utf8mb4_unicode_ci` viaja, `utf8mb4_0900_ai_ci`
+  no); en cualquier otro caso, el default del motor destino. Con `keep` no se admiten `charset`/`collation` (antes se aceptaban y se
   ignoraban en silencio).
+- Las vistas, rutinas, triggers y eventos conservan además la **collation de sesión** con la que el
+  origen los creó (`collation_connection` del snapshot): el motor la congela en el objeto, así que
+  sin reponerla heredarían la de la conexión del gateway. Mismo criterio de portabilidad que arriba;
+  si el destino no la ofrece, el objeto queda con la de la conexión.
 - Solo aplica cuando el job **crea** la BD (`target_mode='new'` o `clean_mode='drop_database'`);
   en otro caso, 422. Convertir la collation de una BD existente es
   [otra operación](collation-conversion.md).
