@@ -264,10 +264,10 @@ def test_new_target_inherits_source_db_default_collation_same_engine(admin_clien
     assert call["collation"] == "utf8mb4_spanish_ci"
 
 
-def test_new_target_does_not_propagate_db_default_cross_engine(admin_client, monkeypatch):
-    # Cross-engine: los nombres de collation no son portables -> NO se propaga, se cae al default
-    # del motor destino (charset/collation None en el CREATE DATABASE).
+def _clone_new_target_from_mariadb_source(admin_client, monkeypatch, *, target_supports: bool):
+    """Clon MariaDB -> MySQL (dialecto del destino) hacia una BD nueva; devuelve el CREATE DATABASE."""
     fake = _install(monkeypatch, target_exists=False)
+    fake.charset_supported = target_supports
     fake.snaps["src_db"].source_engine = "mariadb"  # tgt_adapter.dialect == "mysql"
     fake.snaps["src_db"].db_charset = "utf8mb4"
     fake.snaps["src_db"].db_collation = "utf8mb4_uca1400_ai_ci"
@@ -282,9 +282,31 @@ def test_new_target_does_not_propagate_db_default_cross_engine(admin_client, mon
     job_id = r.json()["data"]["id"]
     _pr, ex = _preview_and_execute(admin_client, job_id)
     assert ex.status_code == 200, ex.text
-    call = next(c for c in fake.create_calls if c["db_name"] == "dst_db")
+    return next(c for c in fake.create_calls if c["db_name"] == "dst_db")
+
+
+def test_new_target_does_not_propagate_db_default_when_target_lacks_the_collation(
+    admin_client, monkeypatch
+):
+    # MySQL<->MariaDB: la collation se propaga solo si el destino la ofrece (las uca1400 de
+    # MariaDB no existen en MySQL). Si no, se cae al default del motor destino.
+    call = _clone_new_target_from_mariadb_source(
+        admin_client, monkeypatch, target_supports=False
+    )
     assert call["charset"] is None
     assert call["collation"] is None
+
+
+def test_new_target_propagates_db_default_cross_engine_when_target_has_the_collation(
+    admin_client, monkeypatch
+):
+    # Bug de clon: la BD destino tomaba la collation del servidor en vez de la del origen
+    # cuando el motor era MySQL en un lado y MariaDB en el otro.
+    call = _clone_new_target_from_mariadb_source(
+        admin_client, monkeypatch, target_supports=True
+    )
+    assert call["charset"] == "utf8mb4"
+    assert call["collation"] == "utf8mb4_uca1400_ai_ci"
 
 
 def test_full_clone_with_data_records_row_counts(admin_client, monkeypatch):

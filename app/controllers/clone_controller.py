@@ -107,6 +107,9 @@ class _StructStmt:
     object_type: str
     object_name: str
     sql: str
+    # Collation de sesión con la que el origen creó este objeto con cuerpo (MySQL/MariaDB). El
+    # runner la repone antes del CREATE; ``None`` = dejar la de la conexión del gateway.
+    session_collation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,10 @@ _ENGINE_SPECIFIC_TYPES = frozenset(
 # (MySQL/MariaDB NO desactivan triggers con FOREIGN_KEY_CHECKS=0; PostgreSQL sí con
 # session_replication_role='replica', pero diferirlos es la defensa portable para ambos).
 _POST_DATA_BODY_TYPES = frozenset({"trigger", "event"})
+# Motores cuyos nombres de collation son comparables entre sí: un clon entre ellos puede
+# conservar la collation del origen si el destino la soporta (``utf8mb4_unicode_ci`` existe
+# en ambos; ``utf8mb4_0900_ai_ci`` solo en MySQL 8).
+_MYSQL_FAMILY_DIALECTS = frozenset({"mysql", "mariadb"})
 # Intervalo mínimo entre persistencias del progreso de datos a la BD del gateway (throttle).
 _CLONE_PROGRESS_PERSIST_SECONDS = 3.0
 
@@ -814,6 +821,8 @@ class CloneController:
             struct_diff = diff_snapshots(filtered, empty_tgt)
             rendered = tgt_adapter.render_diff(struct_diff)
             skipped_names: set[str] = set()
+            frozen_collations = self._frozen_collation_by_object(filtered)
+            portable_cache: dict[str, bool] = {}
             for r in rendered:
                 portable, reason = self._portability(
                     r.object_type, source_snap.source_engine, tgt_engine
@@ -824,7 +833,17 @@ class CloneController:
                         sql = self._requalify_body(
                             sql, source_snap.database, job.target_database_name, tgt_engine
                         )
-                    structure.append(_StructStmt("structure", r.object_type, r.object_name, sql))
+                    session_collation = None
+                    if r.object_type in _BODY_TYPES:
+                        session_collation = self._portable_collation(
+                            source_snap.source_engine, tgt_adapter,
+                            frozen_collations.get((r.object_type, r.object_name)),
+                            portable_cache,
+                        )
+                    structure.append(_StructStmt(
+                        "structure", r.object_type, r.object_name, sql,
+                        session_collation=session_collation,
+                    ))
                 elif r.object_name not in skipped_names:
                     skipped_names.add(r.object_name)
                     skipped.append({
@@ -1089,6 +1108,91 @@ class CloneController:
             "severity": "warning",
             "detail": {"tables": {t: sorted(n) for t, n in affected.items()}},
         }]
+
+    @staticmethod
+    def _frozen_collation_by_object(snap: SchemaSnapshot) -> dict[tuple[str, str], str]:
+        """
+        ``{(object_type, object_name): collation_connection}`` con las MISMAS claves que emite
+        ``render_diff`` (``schema_diff``): las rutinas se nombran ``"KIND:nombre"``, así que una
+        función y un procedimiento homónimos no se pisan.
+        """
+        by_object: dict[tuple[str, str], str] = {}
+        for view in snap.views:
+            if view.collation_connection:
+                by_object[("view", view.name)] = view.collation_connection
+        for routine in snap.routines:
+            if routine.collation_connection:
+                by_object[("routine", f"{routine.kind}:{routine.name}")] = (
+                    routine.collation_connection
+                )
+        for trigger in snap.triggers:
+            if trigger.collation_connection:
+                by_object[("trigger", trigger.name)] = trigger.collation_connection
+        for event in snap.events:
+            if event.collation_connection:
+                by_object[("event", event.name)] = event.collation_connection
+        return by_object
+
+    @staticmethod
+    def _session_collation_kwargs(session_collations: list[str | None]) -> dict:
+        """
+        ``{"session_collations": [...]}`` solo si alguna sentencia pide una collation de sesión;
+        si ninguna la pide (PostgreSQL, tablas, orígenes sin dato) el runner se invoca igual que
+        antes de existir el parámetro.
+        """
+        if any(session_collations):
+            return {"session_collations": session_collations}
+        return {}
+
+    @staticmethod
+    def _portable_collation(
+        source_engine: str, tgt_adapter, collation: str | None, supported_cache: dict[str, bool]
+    ) -> str | None:
+        """
+        La collation del origen si el destino puede usarla; ``None`` si hay que dejar la
+        default del destino.
+
+        Mismo motor: siempre (comportamiento histórico). MySQL↔MariaDB: solo si el destino la
+        declara en ``information_schema.COLLATIONS`` — ``utf8mb4_unicode_ci`` viaja,
+        ``utf8mb4_0900_ai_ci`` no. Cualquier otro cruce (PostgreSQL) no es portable: sus
+        collations son locales del SO o del ICU, no nombres de MySQL.
+        """
+        if not collation:
+            return None
+        target_dialect = tgt_adapter.dialect
+        if source_engine == target_dialect:
+            return collation
+        if source_engine not in _MYSQL_FAMILY_DIALECTS or target_dialect not in _MYSQL_FAMILY_DIALECTS:
+            return None
+        if collation not in supported_cache:
+            charset = collation.split("_", 1)[0]
+            supported_cache[collation] = (
+                tgt_adapter.supports_charset_combination(charset, collation) is True
+            )
+        return collation if supported_cache[collation] else None
+
+    def _inherited_db_collation(
+        self, source_snap: SchemaSnapshot, tgt_adapter
+    ) -> tuple[str | None, str | None]:
+        """
+        ``(charset, collation)`` por defecto de la BD destino cuando el operador no eligió uno.
+
+        Antes solo se heredaban entre el MISMO motor, y un clon MariaDB→MySQL caía al default
+        del servidor (``utf8mb4_0900_ai_ci``) aunque el origen usara ``utf8mb4_unicode_ci``,
+        que MySQL 8 también tiene.
+        """
+        inherited = self._portable_collation(
+            source_snap.source_engine, tgt_adapter, source_snap.db_collation, {}
+        )
+        if inherited:
+            return source_snap.db_charset, inherited
+        if source_snap.db_collation:
+            logger.warning(
+                "La collation %s del origen no existe en el destino (%s): la BD se crea con el "
+                "default del servidor destino",
+                source_snap.db_collation, tgt_adapter.dialect,
+            )
+        return None, None
 
     @staticmethod
     def _charset_notices(job: CloneJob, source_snap: SchemaSnapshot) -> list[dict]:
@@ -2375,13 +2479,11 @@ class CloneController:
         #    la MISMA collation física se juzgara "explícita" en un lado y "heredada" en el
         #    otro). Solo mismo motor: los nombres de collation/locale no son portables
         #    cross-engine → ahí se cae al default del motor destino.
-        same_engine = source_snap.source_engine == tgt_adapter.dialect
-        db_charset = ctx.get("target_charset") or (
-            source_snap.db_charset if same_engine else None
+        inherited_charset, inherited_collation = self._inherited_db_collation(
+            source_snap, tgt_adapter
         )
-        db_collation = ctx.get("target_collation") or (
-            source_snap.db_collation if same_engine else None
-        )
+        db_charset = ctx.get("target_charset") or inherited_charset
+        db_collation = ctx.get("target_collation") or inherited_collation
         # ``owner`` solo tiene semántica en PostgreSQL; el adapter de MySQL lo ignora.
         db_owner = ctx.get("target_owner")
         if ctx["target_mode"] == CLONE_TARGET_NEW:
@@ -2600,6 +2702,7 @@ class CloneController:
         results = runner.execute_adhoc(
             tgt_target, db_name=db_name, engine=engine, lock_key=lock_key, statements=sqls,
             already_locked=True, disable_fk_checks=disable_fk_checks, bulk=True,
+            **self._session_collation_kwargs([s.session_collation for s in statements]),
         )
         by_index = {r.index: r for r in results}
         rows = []
@@ -2637,6 +2740,7 @@ class CloneController:
                 tgt_target, db_name=db_name, engine=engine, lock_key=lock_key,
                 statements=[st.sql for _, st in remaining],
                 already_locked=True, stop_on_error=False, bulk=True,
+                **self._session_collation_kwargs([st.session_collation for _, st in remaining]),
             )
             by_pos = {r.index: r for r in res}
             still: list = []
