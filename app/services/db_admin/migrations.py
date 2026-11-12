@@ -53,7 +53,11 @@ from app.exceptions import AppHttpException
 from app.models.enums import EngineType
 from app.services import engine_error_catalog
 from app.services.db_admin import migration_progress, migration_results
-from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES, quote_identifier
+from app.services.db_admin.identifiers import (
+    GATEWAY_TABLE_PREFIXES,
+    quote_identifier,
+    validate_identifier,
+)
 from app.services.db_admin.migration_integrity import validate_version, version_sort_key
 from app.services.db_admin.sql_dialect import (
     RollbackGenerator,
@@ -1536,6 +1540,7 @@ class MigrationRunner:
         stop_on_error: bool = True,
         disable_fk_checks: bool = False,
         bulk: bool = False,
+        session_collations: list[str | None] | None = None,
     ) -> list[StatementResult]:
         """
         Ejecuta ``statements`` DDL directamente sobre la BD destino, UNA por una,
@@ -1583,10 +1588,24 @@ class MigrationRunner:
         incorrecto. El resultado por sentencia lo persiste el controller en
         ``schema_comparison_items``.
 
+        ``session_collations``: lista PARALELA a ``statements`` (misma longitud) con la collation
+        de sesión que cada sentencia debe tener al ejecutarse, o ``None`` para dejar la de la
+        conexión. Solo MySQL/MariaDB. El motor CONGELA la ``collation_connection`` de la sesión
+        en cada vista/rutina/trigger/evento que se crea, y la conexión del gateway usa el
+        default del servidor (``utf8mb4_0900_ai_ci`` en MySQL 8): sin esto el clon deja todos
+        esos objetos en una collation distinta a la del origen. Cada objeto trae la suya, por
+        eso se fija por sentencia y solo cuando cambia. Al terminar se restaura la collation
+        original de la conexión: vuelve al pool y no debe arrastrar la de otro objeto.
+
         Usa ``exec_driver_sql`` (no ``text()``): el DDL renderizado puede contener
         ``::`` (casts de PostgreSQL) que ``text()`` interpretaría como bind params.
         """
         results: list[StatementResult] = []
+        if session_collations is not None and len(session_collations) != len(statements):
+            raise ValueError("session_collations debe tener una entrada por sentencia")
+        supports_session_collation = engine in (EngineType.mysql, EngineType.mariadb)
+        original_session_collation: str | None = None
+        current_session_collation: str | None = None
         try:
             with database_connection(target, db_name, bulk=bulk) as conn:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -1598,6 +1617,26 @@ class MigrationRunner:
                     for i, stmt in enumerate(statements):
                         t0 = time.monotonic()
                         try:
+                            wanted_collation = (
+                                session_collations[i]
+                                if session_collations is not None and supports_session_collation
+                                else None
+                            )
+                            if wanted_collation and wanted_collation != current_session_collation:
+                                if original_session_collation is None:
+                                    original_session_collation = str(
+                                        conn.exec_driver_sql("SELECT @@collation_connection").scalar()
+                                    )
+                                    current_session_collation = original_session_collation
+                                if wanted_collation != current_session_collation:
+                                    safe_collation = validate_identifier(
+                                        wanted_collation, engine.value, "collation",
+                                        allow_existing=True,
+                                    )
+                                    conn.exec_driver_sql(
+                                        f"SET collation_connection = {safe_collation}"
+                                    )
+                                    current_session_collation = wanted_collation
                             conn.exec_driver_sql(self._escape_percent(stmt))
                             ms = int((time.monotonic() - t0) * 1000)
                             results.append(
@@ -1638,6 +1677,17 @@ class MigrationRunner:
                             if stop_on_error:
                                 break  # no continuar tras un fallo (posible estado parcial)
                 finally:
+                    if (
+                        original_session_collation is not None
+                        and current_session_collation != original_session_collation
+                    ):
+                        # Best effort: si falla, la conexión se descarta al salir del ``with``.
+                        try:
+                            conn.exec_driver_sql(
+                                f"SET collation_connection = {original_session_collation}"
+                            )
+                        except SQLAlchemyError:
+                            logger.warning("No se pudo restaurar la collation de la sesión")
                     if disable_fk_checks:
                         self._toggle_fk_checks(conn, engine, enabled=True)
                     if not already_locked:

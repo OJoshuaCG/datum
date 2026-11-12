@@ -1703,11 +1703,15 @@ class ServerAdapter(ABC):
                 extensions = self._snapshot_extensions(conn, database, schema)
                 events = self._snapshot_events(conn, database, schema)
                 db_defaults = self._database_defaults(conn, database, schema)
+                frozen_collations = self._frozen_collations(conn, database)
         except SQLAlchemyError as exc:
             raise map_driver_error(
                 exc, op="structural_snapshot", target=self.target,
                 extra={"database": database},
             )
+        self._apply_frozen_collations(
+            frozen_collations, views=views, routines=routines, triggers=triggers, events=events
+        )
         t_fin = time.perf_counter()
         tablas_ms = int((t_tablas - t_inicio) * 1000)
         total_ms = int((t_fin - t_inicio) * 1000)
@@ -1783,6 +1787,27 @@ class ServerAdapter(ABC):
     ) -> dict[str, bool] | None:
         """``{tabla: tiene_pk}`` para todas las tablas. ``None`` = sin batch."""
         return None
+
+    def _frozen_collations(self, conn, database: str) -> dict[tuple[str, str], str]:
+        """
+        ``{(object_type, nombre): collation_connection}`` de los objetos con cuerpo.
+
+        Vacío por default: solo MySQL/MariaDB congelan la collation de la sesión en el objeto.
+        """
+        return {}
+
+    @staticmethod
+    def _apply_frozen_collations(frozen, *, views, routines, triggers, events) -> None:
+        """Copia la collation congelada a los DTOs; lo que el motor no informó queda en None."""
+        for view in views:
+            view.collation_connection = frozen.get(("view", view.name))
+        for routine in routines:
+            routine_type = "function" if str(routine.kind).upper() == "FUNCTION" else "procedure"
+            routine.collation_connection = frozen.get((routine_type, routine.name))
+        for trigger in triggers:
+            trigger.collation_connection = frozen.get(("trigger", trigger.name))
+        for event in events:
+            event.collation_connection = frozen.get(("event", event.name))
 
     def _database_defaults(self, conn, database: str, schema: str) -> dict[str, str | None]:
         """

@@ -238,6 +238,10 @@ class ViewInfo(BaseModel):
     columns: list[str] = Field(default_factory=list)  # nombres de columna (para CREATE OR REPLACE)
     check_option: str | None = None  # CASCADED | LOCAL (WITH CHECK OPTION)
     security_definer: bool = False
+    # Collation de la SESIÓN que creó el objeto (MySQL/MariaDB; ``None`` en PostgreSQL). El motor
+    # la congela en el objeto; el clon la repone antes del CREATE para no heredar la de la
+    # conexión del gateway. NO entra al diff: se compara por cuerpo normalizado.
+    collation_connection: str | None = None
 
 
 class RoutineParam(BaseModel):
@@ -256,6 +260,10 @@ class RoutineInfo(BaseModel):
     deterministic: bool | None = None  # MySQL
     security_definer: bool = False
     body: str  # DDL completo (CREATE ...), DEFINER saneado, normalizado para comparar
+    # Collation de la SESIÓN que creó el objeto (MySQL/MariaDB; ``None`` en PostgreSQL). El motor
+    # la congela en el objeto; el clon la repone antes del CREATE para no heredar la de la
+    # conexión del gateway. NO entra al diff: se compara por cuerpo normalizado.
+    collation_connection: str | None = None
 
 
 class TriggerInfo(BaseModel):
@@ -266,6 +274,10 @@ class TriggerInfo(BaseModel):
     level: str | None = None  # ROW | STATEMENT
     when_condition: str | None = None
     action: str  # DDL completo del trigger (DEFINER saneado, normalizado)
+    # Collation de la SESIÓN que creó el objeto (MySQL/MariaDB; ``None`` en PostgreSQL). El motor
+    # la congela en el objeto; el clon la repone antes del CREATE para no heredar la de la
+    # conexión del gateway. NO entra al diff: se compara por cuerpo normalizado.
+    collation_connection: str | None = None
 
 
 class SequenceInfo(BaseModel):
@@ -300,6 +312,10 @@ class EventInfo(BaseModel):
     name: str
     schedule: str | None = None
     body: str  # DDL completo (DEFINER saneado, normalizado)
+    # Collation de la SESIÓN que creó el objeto (MySQL/MariaDB; ``None`` en PostgreSQL). El motor
+    # la congela en el objeto; el clon la repone antes del CREATE para no heredar la de la
+    # conexión del gateway. NO entra al diff: se compara por cuerpo normalizado.
+    collation_connection: str | None = None
 
 
 class DefinitionRead(BaseModel):

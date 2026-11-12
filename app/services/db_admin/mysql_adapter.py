@@ -2251,6 +2251,18 @@ class MySQLAdapter(ServerAdapter):
             "db_collation": str(db_row[1]) if db_row[1] else None,
         }
 
+    def _frozen_collations(self, conn, database) -> dict[tuple[str, str], str]:
+        """
+        Collation de sesión congelada de vistas, rutinas, triggers y eventos, para que el clon
+        la reponga. Reusa ``_frozen_objects`` (lectura degradada por fuente: si una tabla de
+        ``information_schema`` falla, esos objetos quedan sin señal en vez de abortar el snapshot).
+        """
+        frozen: dict[tuple[str, str], str] = {}
+        for info in self._frozen_objects(conn, database, notes=[]):
+            if info.collation_connection:
+                frozen[(info.object_type, info.name)] = info.collation_connection
+        return frozen
+
     def _snapshot_views(self, conn, database, schema) -> list[ViewInfo]:
         # Se guarda el SELECT (VIEW_DEFINITION) — no el SHOW CREATE completo — para poder
         # re-emitir un CREATE OR REPLACE VIEW controlado (mismo formato que PostgreSQL).
