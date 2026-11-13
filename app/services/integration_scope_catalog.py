@@ -18,7 +18,7 @@ LOS INVARIANTES SE AFIRMAN AL IMPORTAR
 un scope mal mapeado rompe el arranque y no el primer request. Cada invariante tiene un test de
 mutación que lo hace fallar (``tests/test_integration_scope_catalog.py``).
 
-Son 12 scopes en tres tiers: ``read`` (no muta), ``write`` (muta de forma recuperable) y
+Son 13 scopes en tres tiers: ``read`` (no muta), ``write`` (muta de forma recuperable) y
 ``destructive`` (``migrations.rollback`` y ``migrations.stamp``: pueden perder datos o declarar un
 estado que el gateway no produjo). El tier destructivo no agrega ninguna ``Capability``: ambos scopes
 mapean a ``blueprints.apply``, la misma que ya usan las rutas humanas de rollback y stamp, y lo que
@@ -45,6 +45,7 @@ class IntegrationScope(StrEnum):
     SERVERS_LIST = "servers.list"
     DATABASES_LIST = "databases.list"
     BLUEPRINT_READ_ASSIGNED = "blueprint.read_assigned"
+    BLUEPRINT_READ_CHANNEL = "blueprint.read_channel"
     MIGRATIONS_READ_VERSION = "migrations.read_version"
     DATABASES_CREATE = "databases.create"
     ENGINE_USERS_CREATE = "engine_users.create"
@@ -101,6 +102,13 @@ INTEGRATION_SCOPE_SPECS: tuple[IntegrationScopeSpec, ...] = (
         capability=Capability.BLUEPRINTS_READ,
         tier=TIER_READ,
         label="Leer el blueprint asignado a una base",
+        mutates=False,
+    ),
+    IntegrationScopeSpec(
+        scope=IntegrationScope.BLUEPRINT_READ_CHANNEL,
+        capability=Capability.BLUEPRINTS_READ,
+        tier=TIER_READ,
+        label="Leer la versión que sirve un canal del blueprint de una base",
         mutates=False,
     ),
     IntegrationScopeSpec(
@@ -302,6 +310,7 @@ EXPECTED_SCOPE_VALUES: frozenset[str] = frozenset(
         "servers.list",
         "databases.list",
         "blueprint.read_assigned",
+        "blueprint.read_channel",
         "migrations.read_version",
         "databases.create",
         "engine_users.create",

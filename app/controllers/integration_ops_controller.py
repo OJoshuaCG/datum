@@ -197,6 +197,40 @@ class IntegrationOpsController:
             "model_version": database["model_version"],
         }
 
+    def read_channel(self, database_id: int, channel_slug: str) -> dict[str, Any]:
+        """
+        The version a release channel serves for the blueprint assigned to the database.
+
+        Uses the STRICT resolver, the same one ``apply`` uses with ``channel``: an unresolvable
+        channel answers 409 ``release_channel.*`` instead of a tolerant ``resolved=false``, so a
+        consumer never reads "no version" as a value. The blueprint comes from the database and
+        never from the caller, which is what keeps the token's blueprint allowlist enforceable
+        by the gate.
+        """
+        return self._resolve_channel_for_database(database_id, channel_slug)
+
+    def read_blueprint_channel(self, model_id: int, channel_slug: str) -> dict[str, Any]:
+        """
+        The version a release channel serves for a blueprint addressed directly.
+
+        Strict resolver, same as ``read_channel``. The gate has already checked the token's
+        blueprint allowlist against ``model_id``; a blueprint that does not exist answers 404.
+        """
+        session = self._session()
+        try:
+            blueprint = session.get(DatabaseModel, model_id)
+            if blueprint is None:
+                raise AppHttpException(
+                    message="El blueprint no existe.",
+                    status_code=404,
+                    public_context={"code": CODE_INTEGRATION_BLUEPRINT_NOT_ASSIGNED},
+                    context={"model_id": model_id, "channel": channel_slug},
+                )
+            resolution = resolve_channel_version(session, blueprint, channel_slug)
+        finally:
+            session.close()
+        return resolution.as_summary()
+
     def read_migration_version(self, database_id: int) -> dict[str, Any]:
         """Current, latest and pending versions: the projection an integration needs."""
         migration_status = ManagedMigrationController().status(database_id)

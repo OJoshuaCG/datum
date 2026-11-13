@@ -130,6 +130,9 @@ MIN_RETRY_AFTER_SECONDS = 1
 #: ``ScopeTarget.kind`` of a managed database (key of ``scope_targets.TARGET_KINDS``).
 DATABASE_TARGET_KIND = "database"
 
+#: ``ScopeTarget.kind`` of a whole blueprint (key of ``scope_targets.TARGET_KINDS``).
+BLUEPRINT_TARGET_KIND = "model"
+
 AUDIT_ACTION_AUTH = "integration.auth"
 AUDIT_ACTION_CALL = "integration.call"
 AUDIT_TARGET_TYPE = "integration_token"
@@ -406,6 +409,20 @@ def _assert_target_within_allowlists(token: _AuthenticatedToken, target: ScopeTa
     Fail-closed on purpose: no points (a blueprint without databases) or a point without server
     (a nonexistent target) is a 403, never "nothing to check".
     """
+    if target.kind == BLUEPRINT_TARGET_KIND and token.allowed_blueprint_ids:
+        # A blueprint-keyed read has no database to anchor the server check on, and a blueprint
+        # may have none yet. The token's blueprint allowlist is then the whole restriction:
+        # membership or 403. A token WITHOUT a blueprint allowlist falls through to the strict
+        # rule below (every database of the blueprint on an allowlisted server).
+        (blueprint_id,) = target.params
+        if blueprint_id not in token.allowed_blueprint_ids:
+            raise AppHttpException(
+                message="El token no puede operar con este blueprint.",
+                status_code=403,
+                public_context={"code": CODE_INTEGRATION_BLUEPRINT_NOT_ALLOWED},
+            )
+        return
+
     points = resolve_points(target)
     if not points:
         raise _server_not_allowed()

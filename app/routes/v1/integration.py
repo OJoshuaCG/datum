@@ -13,12 +13,13 @@ make every integration of one NAT share a quota. The per-token buckets of the ga
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 
 from app.controllers.integration_ops_controller import IntegrationOpsController
 from app.core.integration_auth import IntegrationCall, require_integration
 from app.core.limiter import limiter
 from app.core.scope_targets import database as database_target
+from app.core.scope_targets import model as blueprint_target
 from app.core.scope_targets import managed_create, payload_server, server_user
 from app.core.scope_targets import server as server_target
 from app.schemas.integration import (
@@ -36,6 +37,7 @@ from app.schemas.integration import (
     IntegrationServerOut,
     IntegrationStampRequest,
 )
+from app.schemas.blueprint_channel import ResolvedChannelOut
 from app.schemas.grant import ApplyProfileResult
 from app.schemas.model_migration import MigrationApplyOut, MigrationRollbackOut, MigrationStatusOut
 from app.services.integration_scope_catalog import IntegrationScope
@@ -56,6 +58,18 @@ BlueprintReadCall = Annotated[
     IntegrationCall,
     Depends(
         require_integration(IntegrationScope.BLUEPRINT_READ_ASSIGNED, target=database_target)
+    ),
+]
+ChannelReadCall = Annotated[
+    IntegrationCall,
+    Depends(
+        require_integration(IntegrationScope.BLUEPRINT_READ_CHANNEL, target=database_target)
+    ),
+]
+BlueprintChannelReadCall = Annotated[
+    IntegrationCall,
+    Depends(
+        require_integration(IntegrationScope.BLUEPRINT_READ_CHANNEL, target=blueprint_target)
     ),
 ]
 MigrationsReadCall = Annotated[
@@ -141,6 +155,44 @@ def list_databases(
 def read_assigned_blueprint(call: BlueprintReadCall, db_id: int):
     """The blueprint assigned to the database. 404 ``integration.blueprint_not_assigned`` if none."""
     return success(data=IntegrationOpsController().read_assigned_blueprint(db_id))
+
+
+@router.get(
+    "/databases/{db_id}/channels/{channel_slug}",
+    response_model=ApiResponse[ResolvedChannelOut],
+)
+@limiter.exempt
+def read_channel(
+    call: ChannelReadCall,
+    db_id: int,
+    channel_slug: str = Path(..., min_length=1, max_length=60, description="Channel slug."),
+):
+    """
+    The version a release channel (for example the production one) serves for the blueprint
+    assigned to the database. Strict: a channel that cannot resolve answers 409
+    ``release_channel.*``; a database without blueprint answers 404
+    ``integration.blueprint_not_assigned``.
+    """
+    return success(data=IntegrationOpsController().read_channel(db_id, channel_slug))
+
+
+@router.get(
+    "/blueprints/{model_id}/channels/{channel_slug}",
+    response_model=ApiResponse[ResolvedChannelOut],
+)
+@limiter.exempt
+def read_blueprint_channel(
+    call: BlueprintChannelReadCall,
+    model_id: int,
+    channel_slug: str = Path(..., min_length=1, max_length=60, description="Channel slug."),
+):
+    """
+    The version a release channel serves for a blueprint, without needing a database: what a
+    consumer reads BEFORE creating anything. Same strict resolution as the per-database route.
+    A token with a blueprint allowlist must include ``model_id``; one without it needs every
+    database of the blueprint on an allowlisted server.
+    """
+    return success(data=IntegrationOpsController().read_blueprint_channel(model_id, channel_slug))
 
 
 @router.get(

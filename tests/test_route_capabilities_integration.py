@@ -6,7 +6,7 @@ never a copy, so the rule cannot be relaxed in one place only. Every negative ca
 a synthetic app: the proof that the check detects something cannot depend on the real app being
 broken.
 
-Completeness is asserted over the twelve scopes of the catalog, rollback and stamp included.
+Completeness is asserted over the thirteen scopes of the catalog, rollback and stamp included.
 """
 
 import importlib.util

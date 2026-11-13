@@ -1182,7 +1182,7 @@ def test_the_ceiling_carries_the_tier_of_each_scope_and_the_destructive_ttl(
     assert tier_by_scope[STAMP_SCOPE] == "destructive"
     assert tier_by_scope[APPLY_SCOPE] == "write"
     assert tier_by_scope[READ_SCOPE] == "read"
-    assert len(tier_by_scope) == 12
+    assert len(tier_by_scope) == 13
     assert data["max_destructive_ttl_days"] == DESTRUCTIVE_MAX_TTL_DAYS
 
 

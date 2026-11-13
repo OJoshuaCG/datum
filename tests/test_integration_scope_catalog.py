@@ -9,7 +9,7 @@ mapeo a una ``Capability`` es lo que decide hasta dónde llega. El catálogo afi
 al IMPORTAR (``_assert_integration_invariants``); un invariante que ningún test rompe puede estar
 apagado sin que nadie lo note, así que cada uno tiene acá un caso de MUTACIÓN que lo hace fallar.
 
-Alcance: 12 scopes y los tres tiers ``read``/``write``/``destructive``. Los scopes
+Alcance: 13 scopes y los tres tiers ``read``/``write``/``destructive``. Los scopes
 ``migrations.rollback`` y ``migrations.stamp`` forman el tier destructivo (CR-1) y lo gobiernan los
 invariantes I10 e I11.
 
@@ -17,7 +17,7 @@ Numeración: I1 un spec por scope; I2 la capacidad está en ``owner``; I3 no es 
 (access_admin / security_officer); I4 no divulga; I5 ni módulo ``data`` ni nivel
 drop/credentials/grant_admin/secrets; I6 no es de tokens ni de acceso; I7 ``destructive`` solo
 para apply_forward, rollback y stamp; I8 ``mutates`` del scope == el de su capacidad; I9 el
-conjunto de scopes es un literal fijo (12); I10 el tier ``destructive`` si y solo si el scope es
+conjunto de scopes es un literal fijo (13); I10 el tier ``destructive`` si y solo si el scope es
 rollback o stamp; I11 el tier ``destructive`` exige que muten, pidan step-up y mapeen a una
 capacidad ``destructive``; I12 el tier ``read`` si y solo si no muta.
 """
@@ -41,6 +41,7 @@ EXPECTED_MAPPING: dict[str, tuple[Capability, str]] = {
     "servers.list": (Capability.SERVERS_READ, "read"),
     "databases.list": (Capability.DATABASES_READ, "read"),
     "blueprint.read_assigned": (Capability.BLUEPRINTS_READ, "read"),
+    "blueprint.read_channel": (Capability.BLUEPRINTS_READ, "read"),
     "migrations.read_version": (Capability.BLUEPRINTS_READ, "read"),
     "databases.create": (Capability.DATABASES_WRITE, "write"),
     "engine_users.create": (Capability.ENGINE_USERS_WRITE, "write"),
@@ -106,9 +107,9 @@ def test_the_real_catalog_satisfies_every_invariant():
     scope_catalog._assert_integration_invariants()
 
 
-def test_scope_vocabulary_is_the_twelve_literal_scopes():
+def test_scope_vocabulary_is_the_thirteen_literal_scopes():
     assert {scope.value for scope in IntegrationScope} == set(EXPECTED_MAPPING)
-    assert len(IntegrationScope) == 12
+    assert len(IntegrationScope) == 13
 
 
 @pytest.mark.parametrize("scope_value", sorted(EXPECTED_MAPPING))
@@ -122,11 +123,11 @@ def test_each_scope_maps_to_its_capability_and_tier(scope_value):
     assert INTEGRATION_ALLOWED[scope] == expected_capability
 
 
-def test_four_read_scopes_six_write_scopes_and_two_destructive_scopes():
+def test_five_read_scopes_six_write_scopes_and_two_destructive_scopes():
     read_scopes = [s for s in INTEGRATION_SCOPE_SPECS if s.tier == "read"]
     write_scopes = [s for s in INTEGRATION_SCOPE_SPECS if s.tier == "write"]
     destructive_scopes = [s for s in INTEGRATION_SCOPE_SPECS if s.tier == "destructive"]
-    assert len(read_scopes) == 4
+    assert len(read_scopes) == 5
     assert len(write_scopes) == 6
     assert {s.scope.value for s in destructive_scopes} == DESTRUCTIVE_SCOPE_VALUES
 
@@ -328,7 +329,7 @@ def test_i8_rejects_a_scope_whose_mutates_flag_disagrees_with_its_capability():
 
 
 def test_i9_rejects_a_scope_beyond_the_fixed_literal(monkeypatch):
-    # El enum tiene 12 miembros; si el literal fijo esperara uno menos, hay un scope de más.
+    # El enum tiene 13 miembros; si el literal fijo esperara uno menos, hay un scope de más.
     shrunk_literal = frozenset(scope_catalog.EXPECTED_SCOPE_VALUES) - {"servers.list"}
     monkeypatch.setattr(scope_catalog, "EXPECTED_SCOPE_VALUES", shrunk_literal)
     with pytest.raises(AssertionError, match="I9"):
@@ -347,9 +348,9 @@ def test_i12_rejects_a_non_read_tier_on_a_read_only_scope():
         scope_catalog._assert_integration_invariants(mutated)
 
 
-def test_i9_literal_has_exactly_the_twelve_scope_values():
+def test_i9_literal_has_exactly_the_thirteen_scope_values():
     assert set(scope_catalog.EXPECTED_SCOPE_VALUES) == set(EXPECTED_MAPPING)
-    assert len(scope_catalog.EXPECTED_SCOPE_VALUES) == 12
+    assert len(scope_catalog.EXPECTED_SCOPE_VALUES) == 13
 
 
 def test_i10_rejects_the_destructive_tier_on_a_scope_outside_rollback_and_stamp():

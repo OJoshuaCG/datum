@@ -61,6 +61,7 @@ scope.
 | `servers.list` | lectura | `servers.read` | `GET /integration/servers` |
 | `databases.list` | lectura | `databases.read` | `GET /integration/databases?server_id=` |
 | `blueprint.read_assigned` | lectura | `blueprints.read` | `GET /integration/databases/{db_id}/blueprint` |
+| `blueprint.read_channel` | lectura | `blueprints.read` | `GET /integration/databases/{db_id}/channels/{channel_slug}` · `GET /integration/blueprints/{model_id}/channels/{channel_slug}` |
 | `migrations.read_version` | lectura | `blueprints.read` | `GET /integration/databases/{db_id}/migrations/version` |
 | `databases.create` | escritura | `databases.write` | `POST /integration/databases` |
 | `engine_users.create` | escritura | `engine_users.write` | `POST /integration/engine-users` |
@@ -83,6 +84,7 @@ Todas las respuestas usan `ApiResponse[T]`. Los cuerpos rechazan campos desconoc
 | `GET /servers` | — | `[{id, name, engine}]`: solo los de la allowlist que el emisor puede leer; sin host ni puerto |
 | `GET /databases` | `server_id` (query, obligatorio) | `[{id, name, server_id, model_id, model_version, environment_id, status, charset, collation}]` |
 | `GET .../blueprint` | — | `{model_id, name, slug, model_version}`; `404 integration.blueprint_not_assigned` si no hay |
+| `GET .../channels/{channel_slug}` | — | `{slug, mode, version, source}` (resolver estricto: `409 release_channel.*` si no resuelve) |
 | `GET .../migrations/version` | — | `{current_version, latest_version, pending[]}` |
 | `POST /databases` | `{name, server_id, owner_id, environment_id?, charset?, collation?, notes?}` | `201`, base **vacía** (el blueprint se asigna y aplica con sus scopes) |
 | `POST /engine-users` | `{server_id, username, host?, notes?}` | `201` con `password` generada por el gateway; **única vez**, no se puede releer |
