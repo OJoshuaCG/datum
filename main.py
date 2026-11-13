@@ -108,6 +108,10 @@ async def lifespan(app: FastAPI):
     seed_environments()
     # Después de los entornos: ``stable`` se enlaza a ``production`` si ya existe.
     seed_release_channels()
+    # Backfill y red de seguridad de los punteros de los canales latest/derived.
+    from app.services.channel_pointer_sync import reconcile_all_automatic_pointers
+
+    reconcile_all_automatic_pointers()
     # Asegurar una DEK persistida (envelope encryption) en sistema fresco; idempotente.
     from app.core import crypto as _crypto
 

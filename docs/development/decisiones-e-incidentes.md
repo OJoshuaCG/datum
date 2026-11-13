@@ -2853,6 +2853,29 @@ respuesta).
 
 Guía de uso en [`release-channels.md`](../features/release-channels.md); contrato en `api-reference-v46.md`.
 
+### El puntero es la fuente única de todos los modos de canal
+
+`latest` y `derived` se resolvían en vivo (la punta del blueprint, incluso sin revisar; el mínimo leído del
+motor). Un consumidor externo que aprovisiona bases necesita una respuesta estable y sin conexiones, y `latest`
+servía versiones que nadie aprobó. Ahora todos los modos leen `blueprint_channel_pointers`, y
+`channel_pointer_sync.py` mueve los de `latest`/`derived` tras cada cambio que los determina. Decisiones que no
+son obvias:
+
+- **Solo sobre versiones revisadas**, igual que `promote`. Si el objetivo no está aprobado el puntero espera; el
+  gancho de aprobación (PATCH de la migración) vuelve a sincronizar.
+- **Sin tipos de evento nuevos**: `event_type` tiene un CHECK en la BD y ampliarlo exige una migración sin DDL
+  transaccional. Se reutilizan `promote`/`demote` con `actor_type="system"` y nota `automático (<modo>)`.
+- **`plan_channel_moves` solo cuenta canales `manual`.** El `development` sembrado (latest) siempre apunta a la
+  punta; si contara, borrar cualquier punta exigiría `confirm_token`. Aun así `_move_channel_pointers` reubica
+  TODO puntero que quede sobre la fila borrada (y deja su evento `version_deleted`), para no dejar colgantes.
+- **Backfill sin migración**: `reconcile_all_automatic_pointers()` corre en el arranque tras sembrar canales. Es
+  idempotente; el sync de cada gancho es «mejor esfuerzo» (`sync_automatic_pointers_safely` nunca tumba un apply
+  o una aprobación: el puntero es un dato derivado y el próximo gancho o reinicio lo corrige).
+- **Huecos conocidos de ganchos**: adopción (incluido el clon completo), edición de blueprint/entorno de una base y
+  borrado de base sí sincronizan. Siguen sin hacerlo el cambio de estado (cuarentena), el borrado que hace la
+  sincronización con el motor y el borrado de un servidor; los cubre el siguiente gancho o el reconciliado de
+  arranque.
+
 ### `blueprints.promote` es una capacidad aparte y sensible; `release_channels.write` no
 
 Mover el puntero de `stable` decide qué versión llega a bases reales, y eso no es autoría (`blueprints.write`,

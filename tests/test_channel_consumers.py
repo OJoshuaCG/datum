@@ -36,6 +36,7 @@ from tests.test_channel_resolver import _create_channel, _set_pointer
 from tests.test_integration_ops_api import (  # noqa: F401  (fixtures reutilizadas)
     _apply_path,
     _apply_token_headers,
+    _create_blueprint,
     _create_database_with_blueprint,
     _create_server,
     _public_context,
@@ -203,13 +204,13 @@ def test_provision_with_channel_requires_apply_migrations(admin_client, provisio
     assert provisioning["created"] == []
 
 
-def test_provision_with_latest_channel_on_unreviewed_tip_is_stopped_by_the_existing_guards(
+def test_provision_with_latest_channel_serves_the_newest_reviewed_version_not_the_unreviewed_tip(
     admin_client, monkeypatch
 ):
     """
-    R-7: ``latest`` incluye la punta sin revisar, pero el canal no es un atajo para saltarse la
-    revisión: el guard de captura sin revisar sigue frenando la migración. La BD SÍ se crea (el
-    alta es exitosa), y el desenlace va en ``migration`` con su código.
+    R-7: el puntero de ``latest`` solo cae sobre versiones REVISADAS. Con la punta sin revisar,
+    el canal sirve la última revisada, así que aprovisionar nunca llega a aplicar la captura
+    sin aprobar; cuando la aprueban, el puntero se mueve solo.
     """
     import app.controllers.managed_database_controller as mdc
     from app.services.db_admin.migrations import MigrationRunner
@@ -242,9 +243,8 @@ def test_provision_with_latest_channel_on_unreviewed_tip_is_stopped_by_the_exist
 
     assert response.status_code == 201, response.text
     data = response.json()["data"]
-    assert data["resolved_channel"]["version"] == "0002"
-    assert data["migration"]["ok"] is False
-    assert data["migration"]["error_code"] == CODE_UNREVIEWED_CAPTURE
+    assert data["resolved_channel"]["version"] == "0001"
+    assert data["migration"].get("error_code") != CODE_UNREVIEWED_CAPTURE
 
 
 # --------------------------------------------------------------------------- #
@@ -497,3 +497,271 @@ def test_integration_apply_with_channel_on_a_database_without_blueprint_is_404(
     assert response.status_code == 404, response.text
     assert _public_context(response)["code"] == CODE_INTEGRATION_BLUEPRINT_NOT_ASSIGNED
     assert recorded_apply == []
+
+
+# --------------------------------------------------------------------------- #
+# Integración: lectura del canal de la base (scope blueprint.read_channel)     #
+# --------------------------------------------------------------------------- #
+def _channel_read_path(database_id: int, channel_slug: str) -> str:
+    return f"/api/v1/integration/databases/{database_id}/channels/{channel_slug}"
+
+
+def _channel_read_headers(issuer_id: int, server_id: int, **allowlists) -> dict:
+    from app.services.integration_scope_catalog import IntegrationScope
+
+    return _token_headers(
+        issuer_id,
+        [IntegrationScope.BLUEPRINT_READ_CHANNEL],
+        server_ids=(server_id,),
+        **allowlists,
+    )
+
+
+def test_integration_channel_read_returns_the_pointer_version(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5690, "int_chr_ok", "0004"
+    )
+
+    response = integration_api.get(
+        _channel_read_path(database_id, channel_slug),
+        headers=_channel_read_headers(owner_issuer, server_id),
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["slug"] == channel_slug
+    assert data["mode"] == "manual"
+    assert data["version"] == "0004"
+    assert set(data) == {"slug", "mode", "version", "source"}
+
+
+def test_integration_channel_read_with_unset_pointer_is_409_and_not_an_empty_value(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5691, "int_chr_unset", None
+    )
+
+    response = integration_api.get(
+        _channel_read_path(database_id, channel_slug),
+        headers=_channel_read_headers(owner_issuer, server_id),
+    )
+
+    assert response.status_code == 409, response.text
+    assert _public_context(response)["code"] == channel_codes.CODE_NO_RELEASED_VERSION
+
+
+def test_integration_channel_read_of_an_unknown_channel_is_404(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    server_id, database_id, _channel_slug = _integration_database(
+        admin_client, 5692, "int_chr_unknown", "0004"
+    )
+
+    response = integration_api.get(
+        _channel_read_path(database_id, "no-such-channel"),
+        headers=_channel_read_headers(owner_issuer, server_id),
+    )
+
+    assert response.status_code == 404, response.text
+
+
+def test_integration_channel_read_on_a_database_without_blueprint_is_404(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    server_id = _create_server(admin_client, 5693)
+    database_id = sembrar_bd(server_id=server_id, name="int_chr_nobp")
+    _create_channel(admin_client, name="ch-chr-nobp", slug="ch-chr-nobp", resolution_mode="latest")
+
+    response = integration_api.get(
+        _channel_read_path(database_id, "ch-chr-nobp"),
+        headers=_channel_read_headers(owner_issuer, server_id),
+    )
+
+    assert response.status_code == 404, response.text
+    assert _public_context(response)["code"] == CODE_INTEGRATION_BLUEPRINT_NOT_ASSIGNED
+
+
+def test_integration_channel_read_keeps_the_token_server_scope(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    _server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5694, "int_chr_scope", "0004"
+    )
+    other_server_id = _create_server(admin_client, 5695)
+
+    response = integration_api.get(
+        _channel_read_path(database_id, channel_slug),
+        headers=_channel_read_headers(owner_issuer, other_server_id),
+    )
+
+    assert response.status_code == 403, response.text
+    assert _public_context(response)["code"] == CODE_INTEGRATION_SERVER_NOT_ALLOWED
+
+
+def test_integration_channel_read_keeps_the_token_blueprint_allowlist(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    from app.services.integration_scope_catalog import CODE_INTEGRATION_BLUEPRINT_NOT_ALLOWED
+
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5696, "int_chr_bp_allow", "0004"
+    )
+    unrelated_blueprint_id = _create_blueprint("Unrelated Chr Blueprint")
+
+    response = integration_api.get(
+        _channel_read_path(database_id, channel_slug),
+        headers=_channel_read_headers(
+            owner_issuer, server_id, blueprint_ids=(unrelated_blueprint_id,)
+        ),
+    )
+
+    assert response.status_code == 403, response.text
+    assert _public_context(response)["code"] == CODE_INTEGRATION_BLUEPRINT_NOT_ALLOWED
+
+
+def test_integration_channel_read_needs_its_own_scope(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    from app.services.integration_scope_catalog import (
+        CODE_INTEGRATION_SCOPE_MISSING,
+        IntegrationScope,
+    )
+
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5697, "int_chr_noscope", "0004"
+    )
+    headers = _token_headers(
+        owner_issuer, [IntegrationScope.BLUEPRINT_READ_ASSIGNED], server_ids=(server_id,)
+    )
+
+    response = integration_api.get(_channel_read_path(database_id, channel_slug), headers=headers)
+
+    assert response.status_code == 403, response.text
+    assert _public_context(response)["code"] == CODE_INTEGRATION_SCOPE_MISSING
+
+
+# --------------------------------------------------------------------------- #
+# Integración: lectura del canal por blueprint (sin base de datos)             #
+# --------------------------------------------------------------------------- #
+def _blueprint_channel_read_path(model_id: int, channel_slug: str) -> str:
+    return f"/api/v1/integration/blueprints/{model_id}/channels/{channel_slug}"
+
+
+def _blueprint_id_of(database_id: int) -> int:
+    session = Database().get_declarative_base_session()
+    try:
+        return session.get(ManagedDatabase, database_id).model_id
+    finally:
+        session.close()
+
+
+def test_integration_blueprint_channel_read_with_blueprint_allowlist_returns_the_pointer(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5710, "int_bch_ok", "0004"
+    )
+    model_id = _blueprint_id_of(database_id)
+
+    response = integration_api.get(
+        _blueprint_channel_read_path(model_id, channel_slug),
+        headers=_channel_read_headers(owner_issuer, server_id, blueprint_ids=(model_id,)),
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["slug"] == channel_slug
+    assert data["version"] == "0004"
+    assert set(data) == {"slug", "mode", "version", "source"}
+
+
+def test_integration_blueprint_channel_read_outside_the_blueprint_allowlist_is_403(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    from app.services.integration_scope_catalog import CODE_INTEGRATION_BLUEPRINT_NOT_ALLOWED
+
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5711, "int_bch_deny", "0004"
+    )
+    model_id = _blueprint_id_of(database_id)
+    unrelated_blueprint_id = _create_blueprint("Unrelated Bch Blueprint")
+
+    response = integration_api.get(
+        _blueprint_channel_read_path(model_id, channel_slug),
+        headers=_channel_read_headers(
+            owner_issuer, server_id, blueprint_ids=(unrelated_blueprint_id,)
+        ),
+    )
+
+    assert response.status_code == 403, response.text
+    assert _public_context(response)["code"] == CODE_INTEGRATION_BLUEPRINT_NOT_ALLOWED
+
+
+def test_integration_blueprint_channel_read_without_blueprint_allowlist_keeps_the_server_rule(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5712, "int_bch_srv", "0004"
+    )
+    model_id = _blueprint_id_of(database_id)
+    other_server_id = _create_server(admin_client, 5713)
+
+    allowed = integration_api.get(
+        _blueprint_channel_read_path(model_id, channel_slug),
+        headers=_channel_read_headers(owner_issuer, server_id),
+    )
+    denied = integration_api.get(
+        _blueprint_channel_read_path(model_id, channel_slug),
+        headers=_channel_read_headers(owner_issuer, other_server_id),
+    )
+
+    assert allowed.status_code == 200, allowed.text
+    assert denied.status_code == 403, denied.text
+    assert _public_context(denied)["code"] == CODE_INTEGRATION_SERVER_NOT_ALLOWED
+
+
+def test_integration_blueprint_channel_read_with_unset_pointer_is_409(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5714, "int_bch_unset", None
+    )
+    model_id = _blueprint_id_of(database_id)
+
+    response = integration_api.get(
+        _blueprint_channel_read_path(model_id, channel_slug),
+        headers=_channel_read_headers(owner_issuer, server_id, blueprint_ids=(model_id,)),
+    )
+
+    assert response.status_code == 409, response.text
+    assert _public_context(response)["code"] == channel_codes.CODE_NO_RELEASED_VERSION
+
+
+def test_integration_blueprint_channel_read_needs_its_own_scope(
+    integration_api, admin_client, owner_issuer  # noqa: F811
+):
+    from app.services.integration_scope_catalog import (
+        CODE_INTEGRATION_SCOPE_MISSING,
+        IntegrationScope,
+    )
+
+    server_id, database_id, channel_slug = _integration_database(
+        admin_client, 5715, "int_bch_noscope", "0004"
+    )
+    model_id = _blueprint_id_of(database_id)
+    headers = _token_headers(
+        owner_issuer,
+        [IntegrationScope.BLUEPRINT_READ_ASSIGNED],
+        server_ids=(server_id,),
+        blueprint_ids=(model_id,),
+    )
+
+    response = integration_api.get(
+        _blueprint_channel_read_path(model_id, channel_slug), headers=headers
+    )
+
+    assert response.status_code == 403, response.text
+    assert _public_context(response)["code"] == CODE_INTEGRATION_SCOPE_MISSING

@@ -12,8 +12,17 @@ Un canal **no toca ningún motor destino**: mover un puntero cambia qué versió
 | Modo | Qué versión sirve | Quién la decide |
 |---|---|---|
 | `manual` | La del puntero de cada blueprint | Una persona con `blueprints.promote` |
-| `derived` | La **mínima** que hoy corre en las bases vivas del entorno enlazado | El estado real de las bases |
-| `latest` | La punta del blueprint, **incluida una versión sin revisar** | Quien publica versiones |
+| `derived` | La **mínima** que registra el inventario en las bases del entorno enlazado | El estado real de las bases |
+| `latest` | La versión **revisada** más nueva del blueprint | Quien publica y aprueba versiones |
+
+**Todos los modos se sirven desde el puntero.** En `manual` lo mueve una persona (`promote`); en `latest` y `derived`
+lo mueve el gateway solo, cada vez que cambia lo que lo determina: se crea o se aprueba una versión, o una base
+cambia de versión (apply, stamp, resync). Los movimientos automáticos quedan en la bitácora con actor `system` y
+nota `automático (<modo>)`, como `promote` (avanza) o `demote` (retrocede).
+
+**El puntero nunca cae sobre una versión sin revisar.** Si la nueva punta o el nuevo mínimo no está aprobada, el
+puntero se queda donde estaba y se mueve cuando alguien la aprueba. Al arrancar, el gateway recalcula los punteros
+automáticos de todos los blueprints (es el backfill de los canales que existían sin puntero).
 
 `derived` exige un entorno enlazado. Cuenta una base solo si el gateway la posicionó alguna vez y hoy existe en el
 motor: quedan fuera las que están en cuarentena, las que no existen y las que nunca se migraron. Es **fail-closed**:
@@ -41,7 +50,7 @@ así que puede no coincidir con la numeración de hoy.
 
 ## Referencia y lectura en vivo
 
-Junto al puntero de un canal manual (o `latest`) con entorno, la pantalla muestra el **mínimo del entorno** como
+Junto al puntero de cualquier canal con entorno, la pantalla muestra el **mínimo del entorno** como
 referencia: sirve para ver si el puntero va por delante o por detrás de lo que de verdad corre. No decide nada.
 
 - El listado la calcula con la **caché del inventario** (`source: inventory_cache`) y lo rotula así: la caché puede

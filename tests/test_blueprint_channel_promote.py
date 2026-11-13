@@ -88,11 +88,15 @@ def _pointer_version(model_id: int, channel_slug: str) -> str | None:
 
 
 def _event_count(model_id: int) -> int:
+    """Eventos hechos por personas: los automáticos (actor ``system``) tienen sus propios tests."""
     session = Database().get_declarative_base_session()
     try:
         return (
             session.query(BlueprintChannelPointerEvent)
-            .filter(BlueprintChannelPointerEvent.database_model_id == model_id)
+            .filter(
+                BlueprintChannelPointerEvent.database_model_id == model_id,
+                BlueprintChannelPointerEvent.actor_type != "system",
+            )
             .count()
         )
     finally:

@@ -58,6 +58,7 @@ from app.services import audit, charset_catalog, mcp_catalog
 from app.services import data_credential_catalog as dcodes
 from app.services import environment_catalog as ecodes
 from app.services import provisioning_catalog as pcodes
+from app.services.channel_pointer_sync import sync_automatic_pointers_safely
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
@@ -1488,6 +1489,9 @@ class ManagedDatabaseController:
             session.refresh(md)
             result = self._serialize(md)
             db_id = md.id
+            # Una base adoptada con blueprint+versión (p. ej. el destino de un clon completo)
+            # puede bajar el mínimo de un canal ``derived``.
+            sync_automatic_pointers_safely(session, md.model_id)
         finally:
             session.close()
 
@@ -1769,6 +1773,11 @@ class ManagedDatabaseController:
             }
             changed = {k: (before[k], after[k]) for k in before if before[k] != after[k]}
             result = self._serialize(md)
+            # Cambiar el blueprint o el entorno de una base cambia qué cuenta para el mínimo
+            # de los canales ``derived``: se recalculan el blueprint de antes y el de ahora.
+            if "model_id" in changed or "environment_id" in changed:
+                for affected_model_id in {before["model_id"], after["model_id"]}:
+                    sync_automatic_pointers_safely(session, affected_model_id)
         finally:
             session.close()
         # Con ``detail`` vacío, una RECLASIFICACIÓN de entorno era indistinguible en el log de
@@ -1797,6 +1806,7 @@ class ManagedDatabaseController:
             md = self._get_or_404(session, db_id)
             server = get_server_or_404(session, md.server_id)
             db_name, server_id = md.name, md.server_id
+            deleted_model_id = md.model_id
             target = build_target(server) if drop_remote else None
             has_data_credential = self._data_credential_row(session, db_id) is not None
         finally:
@@ -1845,6 +1855,8 @@ class ManagedDatabaseController:
             if md:
                 session.delete(md)
                 session.commit()
+                # La base borrada deja de contar para el mínimo de los canales ``derived``.
+                sync_automatic_pointers_safely(session, deleted_model_id)
         finally:
             session.close()
 

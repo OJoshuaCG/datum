@@ -18,6 +18,7 @@ from app.models.model_migration import ModelMigration
 from app.models.project import ProjectDatabaseModel
 from app.core.logger import get_logger
 from app.services import audit
+from app.services.channel_pointer_sync import sync_automatic_pointers_safely
 from app.services import confirm_token as confirm_token_service
 from app.services import database_model_catalog as dm_codes
 
@@ -345,6 +346,7 @@ class DatabaseModelController:
                 except AppHttpException:
                     continue
             session.commit()
+            sync_automatic_pointers_safely(session, model_id)
         finally:
             session.close()
         return out

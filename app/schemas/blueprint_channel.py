@@ -134,8 +134,8 @@ class ChannelResolutionOut(BaseModel):
     derived_reference: ChannelReferenceOut | None = Field(
         None,
         description=(
-            "Mínimo de las bases vivas del entorno enlazado, junto al puntero de un canal "
-            "manual o latest que tenga entorno."
+            "Mínimo de las bases vivas del entorno enlazado, junto al puntero de cualquier "
+            "canal que tenga entorno. Es una referencia: lo que sirve el canal es el puntero."
         ),
     )
 

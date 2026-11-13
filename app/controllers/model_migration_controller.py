@@ -48,6 +48,7 @@ from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.models.release_channel import BlueprintChannelPointer
 from app.services import audit
+from app.services.channel_pointer_sync import sync_automatic_pointers_safely
 from app.services import blueprint_channel_pointers as channel_pointers
 from app.services import confirm_token as confirm_token_service
 from app.services import migration_freeze_catalog as freeze_codes
@@ -1261,6 +1262,8 @@ class ModelMigrationController:
                     )
                     self._bump_model_version(session, model_id)
                     session.commit()  # inserción + current_version en un único commit
+                    # Una versión creada ya revisada pasa a ser candidata a punta de ``latest``.
+                    sync_automatic_pointers_safely(session, model_id)
                     break
                 except IntegrityError as exc:
                     session.rollback()
@@ -1934,6 +1937,8 @@ class ModelMigrationController:
                 m.up_sql, m.up_sql_mysql, m.up_sql_postgresql, m.down_sql, m.version
             )
             session.commit()
+            # Aprobar (o revocar) una versión cambia a qué puede apuntar un canal automático.
+            sync_automatic_pointers_safely(session, model_id)
             session.refresh(m)
             result = self._serialize(m, self._policy_for(session, m))
         finally:
@@ -2906,6 +2911,7 @@ class ModelMigrationController:
 
             self._bump_model_version(session, model_id)
             session.commit()
+            sync_automatic_pointers_safely(session, model_id)
         except Exception:
             session.rollback()
             raise

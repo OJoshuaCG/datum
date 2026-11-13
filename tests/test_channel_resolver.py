@@ -3,13 +3,13 @@ Resolver de canales de liberación y sus endpoints de lectura.
 
 Contrato que fijan estos tests:
 
-- ``manual`` sirve el puntero; sin puntero es ``release_channel.no_released_version``.
-- ``latest`` sirve la punta del blueprint, INCLUYENDO una versión sin revisar.
-- ``derived`` es la versión MÍNIMA viva del entorno enlazado. Cuenta solo una base que existe y
-  fue posicionada alguna vez; en base, en cuarentena o sin existir en el motor, queda afuera.
-  Una base que cuenta y no se puede leer (o está en una versión desconocida) hace fallar el
-  cálculo cerrado: ``release_channel.derived_unreadable``. Cero bases que cuenten:
-  ``release_channel.derived_no_scope``.
+- TODOS los modos sirven el puntero; sin puntero es ``release_channel.no_released_version``.
+- ``latest`` y ``derived`` mueven su puntero solos (``channel_pointer_sync``), y solo hacia
+  versiones REVISADAS.
+- ``derived`` apunta a la versión MÍNIMA del inventario en el entorno enlazado. Cuenta solo una
+  base que existe y fue posicionada alguna vez; en base o en cuarentena queda afuera. Si el
+  cálculo no es inequívoco (versión desconocida, cero bases) el puntero no se mueve. El mínimo
+  EN VIVO contra el motor es solo la referencia (``derived_reference``).
 - El resolver ESTRICTO lanza 409; el endpoint ``/resolve`` es TOLERANTE: siempre 200 con
   ``resolved=false`` y el código. El listado usa la caché del inventario.
 
@@ -34,7 +34,6 @@ from app.services.channel_resolution import (
     SOURCE_INVENTORY_CACHE,
     SOURCE_LIVE,
     SOURCE_POINTER,
-    SOURCE_TIP,
     DatabaseVersionState,
     evaluate_derived,
 )
@@ -287,17 +286,25 @@ def test_strict_manual_pointer_to_foreign_blueprint_is_pointer_inconsistent(admi
     assert raised.value.public_context["code"] == channel_codes.CODE_POINTER_INCONSISTENT
 
 
-def test_strict_latest_is_tip_including_unreviewed(admin_client):
+def test_strict_latest_follows_the_newest_reviewed_version_and_waits_for_approval(admin_client):
     model_id = _blueprint(admin_client, "res-latest", ["0001", "0002", "0003"])
-    response = admin_client.patch(
+    assert _strict(model_id, "development").version == "0003"
+
+    # Revocar la aprobación de la punta: el puntero no puede quedar sobre una versión sin revisar.
+    revoked = admin_client.patch(
         f"{MODELS_URL}/{model_id}/migrations/0003", json={"reviewed": False}
     )
-    assert response.status_code == 200, response.text
-
+    assert revoked.status_code == 200, revoked.text
     resolution = _strict(model_id, "development")
+    assert resolution.version == "0002"
+    assert resolution.source == SOURCE_POINTER
 
-    assert resolution.version == "0003"
-    assert resolution.source == SOURCE_TIP
+    # Al aprobarla de nuevo, el puntero se mueve solo a la nueva punta.
+    approved = admin_client.patch(
+        f"{MODELS_URL}/{model_id}/migrations/0003", json={"reviewed": True}
+    )
+    assert approved.status_code == 200, approved.text
+    assert _strict(model_id, "development").version == "0003"
 
 
 def test_strict_latest_without_versions_is_no_released_version(admin_client):
@@ -320,23 +327,118 @@ def test_strict_unknown_channel_is_404(admin_client):
 
 
 # --------------------------------------------------------------------------- #
-# Resolver estricto: derived contra el motor                                   #
+# Resolver estricto: derived sirve el puntero que mantiene channel_pointer_sync #
 # --------------------------------------------------------------------------- #
-def test_strict_derived_returns_minimum_live_version(admin_client):
+def _sync(model_id: int) -> None:
+    from app.services.channel_pointer_sync import sync_automatic_pointers_safely
+
+    session = Database().get_declarative_base_session()
+    try:
+        sync_automatic_pointers_safely(session, model_id)
+    finally:
+        session.close()
+
+
+def test_strict_derived_serves_the_minimum_of_the_inventory_as_a_pointer(admin_client):
     model_id, _db_ids, _channel = _derived_setup(
         admin_client,
         "res-derived-min",
         {"dbmin1": "0003", "dbmin2": "0004", "dbmin3": "0005"},
         port_base=41000,
     )
+    _sync(model_id)
 
-    # El motor manda sobre la caché: la caché dice 0003 pero la base 'dbmin1' ya está en 0005.
-    with _engine({"dbmin1": "0005", "dbmin2": "0004", "dbmin3": "0005"}):
-        resolution = _strict(model_id, "candidate")
+    resolution = _strict(model_id, "candidate")
 
-    assert resolution.version == "0004"
-    assert resolution.source == SOURCE_LIVE
+    assert resolution.version == "0003"
+    assert resolution.source == SOURCE_POINTER
     assert resolution.resolved is True
+
+
+def test_strict_derived_pointer_follows_the_minimum_when_a_database_moves(admin_client):
+    model_id, db_ids, _channel = _derived_setup(
+        admin_client,
+        "res-derived-move",
+        {"dbmv1": "0003", "dbmv2": "0004"},
+        port_base=41050,
+    )
+    _sync(model_id)
+    assert _strict(model_id, "candidate").version == "0003"
+
+    session = Database().get_declarative_base_session()
+    try:
+        session.get(ManagedDatabase, db_ids["dbmv1"]).model_version = "0005"
+        session.commit()
+    finally:
+        session.close()
+    _sync(model_id)
+
+    assert _strict(model_id, "candidate").version == "0004"
+
+
+def test_deleting_the_lowest_database_moves_the_derived_pointer_up(admin_client):
+    model_id, db_ids, _channel = _derived_setup(
+        admin_client,
+        "res-derived-delete",
+        {"dbdel1": "0003", "dbdel2": "0004"},
+        port_base=41070,
+    )
+    _sync(model_id)
+    assert _strict(model_id, "candidate").version == "0003"
+
+    response = admin_client.delete(f"/api/v1/managed-databases/{db_ids['dbdel1']}")
+
+    assert response.status_code == 200, response.text
+    assert _strict(model_id, "candidate").version == "0004"
+
+
+def test_moving_a_database_out_of_the_environment_moves_the_derived_pointer(admin_client):
+    model_id, db_ids, _channel = _derived_setup(
+        admin_client,
+        "res-derived-env",
+        {"dbenv1": "0003", "dbenv2": "0004"},
+        port_base=41090,
+    )
+    _sync(model_id)
+    assert _strict(model_id, "candidate").version == "0003"
+    production_id = _environment_id(admin_client, "production")
+
+    response = admin_client.patch(
+        f"/api/v1/managed-databases/{db_ids['dbenv1']}",
+        json={"environment_id": production_id},
+    )
+
+    assert response.status_code == 200, response.text
+    assert _strict(model_id, "candidate").version == "0004"
+
+
+def test_strict_derived_pointer_does_not_move_onto_an_unreviewed_minimum(admin_client):
+    model_id, db_ids, _channel = _derived_setup(
+        admin_client,
+        "res-derived-unrev",
+        {"dburv1": "0003", "dburv2": "0004"},
+        port_base=41080,
+    )
+    _sync(model_id)
+    assert _strict(model_id, "candidate").version == "0003"
+    admin_client.patch(f"{MODELS_URL}/{model_id}/migrations/0002", json={"reviewed": False})
+
+    session = Database().get_declarative_base_session()
+    try:
+        session.get(ManagedDatabase, db_ids["dburv1"]).model_version = "0002"
+        session.commit()
+    finally:
+        session.close()
+    _sync(model_id)
+
+    # 0002 es el nuevo mínimo pero no está revisada: el puntero espera en 0003.
+    assert _strict(model_id, "candidate").version == "0003"
+
+    approved = admin_client.patch(
+        f"{MODELS_URL}/{model_id}/migrations/0002", json={"reviewed": True}
+    )
+    assert approved.status_code == 200, approved.text
+    assert _strict(model_id, "candidate").version == "0002"
 
 
 def test_strict_derived_ignores_never_positioned_database(admin_client):
@@ -346,13 +448,9 @@ def test_strict_derived_ignores_never_positioned_database(admin_client):
         {"dbbase1": "0004", "dbbase2": None},
         port_base=41100,
     )
+    _sync(model_id)
 
-    with _engine({"dbbase1": "0004", "dbbase2": None}):
-        resolution = _strict(model_id, "candidate")
-
-    assert resolution.version == "0004"
-    ignored = {item.database_name: item.ignored_reason for item in resolution.databases}
-    assert ignored["dbbase2"] == IGNORED_AT_BASE
+    assert _strict(model_id, "candidate").version == "0004"
 
 
 def test_strict_derived_ignores_quarantined_database(admin_client):
@@ -364,11 +462,9 @@ def test_strict_derived_ignores_quarantined_database(admin_client):
     )
     staging_id = _environment_id(admin_client, "staging")
     _place_database(db_ids["dbq2"], environment_id=staging_id, status=ProvisionStatus.error)
+    _sync(model_id)
 
-    with _engine({"dbq1": "0004", "dbq2": "0002"}):
-        resolution = _strict(model_id, "candidate")
-
-    assert resolution.version == "0004"
+    assert _strict(model_id, "candidate").version == "0004"
 
 
 def test_strict_derived_ignores_databases_of_other_environments(admin_client):
@@ -379,93 +475,107 @@ def test_strict_derived_ignores_databases_of_other_environments(admin_client):
         port_base=41300,
     )
     _place_database(db_ids["dbenv2"], environment_id=_environment_id(admin_client, "production"))
+    _sync(model_id)
 
-    with _engine({"dbenv1": "0004", "dbenv2": "0001"}):
-        resolution = _strict(model_id, "candidate")
-
-    assert resolution.version == "0004"
+    assert _strict(model_id, "candidate").version == "0004"
 
 
-def test_strict_derived_unreadable_counted_database_is_409_with_ids(admin_client):
-    model_id, db_ids, _channel = _derived_setup(
-        admin_client,
-        "res-derived-unread",
-        {"dbu1": "0004", "dbu2": "0003"},
-        port_base=41400,
+def test_strict_derived_unknown_inventory_version_leaves_the_pointer_unset(admin_client):
+    model_id, _db_ids, _channel = _derived_setup(
+        admin_client, "res-derived-unk", {"dbk1": "0099"}, port_base=41500
     )
+    _sync(model_id)
 
-    with _engine({"dbu1": "0004", "dbu2": _UNREADABLE}):
-        with pytest.raises(AppHttpException) as raised:
-            _strict(model_id, "candidate")
+    with pytest.raises(AppHttpException) as raised:
+        _strict(model_id, "candidate")
 
     assert raised.value.status_code == 409
-    assert raised.value.public_context["code"] == channel_codes.CODE_DERIVED_UNREADABLE
-    assert raised.value.public_context["managed_database_ids"] == [db_ids["dbu2"]]
-    # El texto del motor (host, usuario, contraseña) no viaja en la respuesta.
-    assert "rootpw" not in str(raised.value.public_context)
-    assert "rootpw" not in raised.value.message
+    assert raised.value.public_context["code"] == channel_codes.CODE_NO_RELEASED_VERSION
 
 
-def test_strict_derived_unknown_engine_version_is_unreadable(admin_client):
-    model_id, _db_ids, _channel = _derived_setup(
-        admin_client, "res-derived-unk", {"dbk1": "0004"}, port_base=41500
-    )
-
-    with _engine({"dbk1": "0099"}):
-        with pytest.raises(AppHttpException) as raised:
-            _strict(model_id, "candidate")
-
-    assert raised.value.public_context["code"] == channel_codes.CODE_DERIVED_UNREADABLE
-
-
-def test_strict_derived_zero_counted_is_no_scope(admin_client):
+def test_strict_derived_zero_counted_leaves_the_pointer_unset(admin_client):
     model_id, _db_ids, _channel = _derived_setup(
         admin_client, "res-derived-none", {"dbn1": None}, port_base=41600
     )
+    _sync(model_id)
 
-    with _engine({"dbn1": None}):
-        with pytest.raises(AppHttpException) as raised:
-            _strict(model_id, "candidate")
+    with pytest.raises(AppHttpException) as raised:
+        _strict(model_id, "candidate")
 
     assert raised.value.status_code == 409
-    assert raised.value.public_context["code"] == channel_codes.CODE_DERIVED_NO_SCOPE
+    assert raised.value.public_context["code"] == channel_codes.CODE_NO_RELEASED_VERSION
+
+
+def test_automatic_moves_leave_a_system_event_in_the_log(admin_client):
+    from app.models.release_channel import BlueprintChannelPointerEvent
+
+    model_id, _db_ids, _channel = _derived_setup(
+        admin_client, "res-derived-evt", {"dbe1": "0003"}, port_base=41650
+    )
+    _sync(model_id)
+
+    session = Database().get_declarative_base_session()
+    try:
+        events = (
+            session.query(BlueprintChannelPointerEvent)
+            .filter(
+                BlueprintChannelPointerEvent.database_model_id == model_id,
+                BlueprintChannelPointerEvent.to_version == "0003",
+                BlueprintChannelPointerEvent.note == "automático (derived)",
+            )
+            .all()
+        )
+    finally:
+        session.close()
+    assert [event.actor_type for event in events] == ["system"]
+    assert events[0].note.startswith("automático")
 
 
 # --------------------------------------------------------------------------- #
-# Endpoint /resolve: tolerante y en vivo                                       #
+# Endpoint /resolve: tolerante; el mínimo en vivo es solo la referencia        #
 # --------------------------------------------------------------------------- #
-def test_resolve_endpoint_derived_unreadable_is_200_with_per_database_flags(admin_client):
+def test_resolve_endpoint_derived_unreadable_database_only_affects_the_reference(admin_client):
     model_id, db_ids, _channel = _derived_setup(
         admin_client,
         "res-api-unread",
         {"dbr1": "0004", "dbr2": "0003"},
         port_base=41700,
     )
+    _sync(model_id)
 
     with _engine({"dbr1": "0004", "dbr2": _UNREADABLE}):
         data = _resolve_api(admin_client, model_id, "candidate")
 
-    assert data["resolved"] is False
-    assert data["code"] == channel_codes.CODE_DERIVED_UNREADABLE
-    assert data["version"] is None
-    readable_by_name = {item["database_name"]: item["readable"] for item in data["databases"]}
+    # El valor que sirve el canal es el puntero, aunque una base no responda ahora mismo...
+    assert data["resolved"] is True
+    assert data["version"] == "0003"
+    assert data["source"] == SOURCE_POINTER
+    # ...y la referencia en vivo es la que informa la base ilegible.
+    assert data["derived_reference"]["resolved"] is False
+    assert data["derived_reference"]["code"] == channel_codes.CODE_DERIVED_UNREADABLE
+    readable_by_name = {
+        item["database_name"]: item["readable"] for item in data["derived_reference"]["databases"]
+    }
     assert readable_by_name == {"dbr1": True, "dbr2": False}
 
 
-def test_resolve_endpoint_derived_ok_reports_live_source(admin_client):
+def test_resolve_endpoint_derived_ok_serves_the_pointer_with_live_reference(admin_client):
     model_id, _db_ids, _channel = _derived_setup(
         admin_client,
         "res-api-ok",
         {"dbo1": "0003", "dbo2": "0005"},
         port_base=41800,
     )
+    _sync(model_id)
 
-    with _engine({"dbo1": "0003", "dbo2": "0005"}):
+    with _engine({"dbo1": "0004", "dbo2": "0005"}):
         data = _resolve_api(admin_client, model_id, "candidate")
 
     assert data["resolved"] is True
     assert data["version"] == "0003"
-    assert data["source"] == SOURCE_LIVE
+    assert data["source"] == SOURCE_POINTER
+    assert data["derived_reference"]["version"] == "0004"
+    assert data["derived_reference"]["source"] == SOURCE_LIVE
     assert data["code"] is None
 
 
@@ -543,10 +653,11 @@ def test_list_channels_uses_inventory_cache_and_never_opens_the_engine(admin_cli
     assert by_slug["stable"]["version"] == "0004"
     assert by_slug["stable"]["source"] == SOURCE_POINTER
     assert by_slug["development"]["version"] == "0005"
-    assert by_slug["development"]["source"] == SOURCE_TIP
+    assert by_slug["development"]["source"] == SOURCE_POINTER
     assert by_slug["candidate"]["resolved"] is True
     assert by_slug["candidate"]["version"] == "0003"
-    assert by_slug["candidate"]["source"] == SOURCE_INVENTORY_CACHE
+    assert by_slug["candidate"]["source"] == SOURCE_POINTER
+    assert by_slug["candidate"]["derived_reference"]["source"] == SOURCE_INVENTORY_CACHE
 
 
 def test_list_channels_unresolved_channel_does_not_fail_the_list(admin_client):

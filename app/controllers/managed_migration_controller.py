@@ -55,6 +55,7 @@ from app.models.model_migration_statement import ModelMigrationStatement
 from app.core.actor import Actor, actor_type_of, identity_of
 from app.core.context import current_http_identifier
 from app.services import audit
+from app.services.channel_pointer_sync import sync_automatic_pointers_safely
 from app.services import engine_error_catalog
 from app.services import environment_catalog as ecodes
 from app.services import migration_capture_catalog as ccodes
@@ -3433,6 +3434,8 @@ class ManagedMigrationController:
             if md is not None:
                 md.model_version = version
                 session.commit()
+                # El mínimo del entorno puede haber cambiado: ver ``channel_pointer_sync``.
+                sync_automatic_pointers_safely(session, md.model_id)
         finally:
             session.close()
 

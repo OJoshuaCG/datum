@@ -129,15 +129,24 @@ def _pointers_on(migration_id: int) -> int:
         session.close()
 
 
-def _events(model_id: int) -> list[BlueprintChannelPointerEvent]:
+def _events(model_id: int, channel_slug: str | None = None) -> list[BlueprintChannelPointerEvent]:
+    """
+    Eventos del blueprint; con ``channel_slug``, de UN canal (``development``, latest, también se
+    reubica al borrar la punta y deja su propio evento).
+    """
     session = Database().get_declarative_base_session()
     try:
-        rows = (
-            session.query(BlueprintChannelPointerEvent)
-            .filter(BlueprintChannelPointerEvent.database_model_id == model_id)
-            .order_by(BlueprintChannelPointerEvent.id.asc())
-            .all()
+        query = session.query(BlueprintChannelPointerEvent).filter(
+            BlueprintChannelPointerEvent.database_model_id == model_id,
+            # Los movimientos automáticos (actor ``system``) tienen sus propios tests.
+            BlueprintChannelPointerEvent.actor_type != "system",
         )
+        if channel_slug is not None:
+            query = query.join(
+                ReleaseChannel,
+                ReleaseChannel.id == BlueprintChannelPointerEvent.release_channel_id,
+            ).filter(ReleaseChannel.slug == channel_slug)
+        rows = query.order_by(BlueprintChannelPointerEvent.id.asc()).all()
         session.expunge_all()
         return rows
     finally:
@@ -368,7 +377,7 @@ def test_delete_records_version_deleted_event(admin_client):
 
     _delete_with_token(admin_client, model_id, "0003")
 
-    events = _events(model_id)
+    events = _events(model_id, "stable")
     assert [event.event_type for event in events] == ["promote", "version_deleted"]
     automatic_event = events[-1]
     assert automatic_event.from_migration_id == deleted_migration_id

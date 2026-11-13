@@ -32,6 +32,7 @@ from app.models.release_channel import (
     ReleaseChannel,
 )
 from app.services import audit
+from app.services.channel_pointer_sync import reconcile_all_automatic_pointers
 from app.services import environment_catalog as environment_codes
 from app.services import release_channel_catalog as channel_codes
 
@@ -187,6 +188,8 @@ class ReleaseChannelController:
             self._guard_resulting_state(channel)
             session.add(channel)
             session.commit()
+            # Un canal automático nuevo nace sin puntero: se calcula para cada blueprint.
+            reconcile_all_automatic_pointers()
             session.refresh(channel)
             audit.record(
                 "release_channel.create",
@@ -238,6 +241,8 @@ class ReleaseChannelController:
                 setattr(channel, field, data[field])
             self._guard_resulting_state(channel)
             session.commit()
+            # Cambiar el modo o el entorno cambia hacia dónde apunta un canal automático.
+            reconcile_all_automatic_pointers()
             session.refresh(channel)
 
             after = {

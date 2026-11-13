@@ -422,18 +422,13 @@ class BlueprintChannelController:
             environment_slug=self._environment_slug(session, channel.environment_id),
         )
 
-        if channel.resolution_mode == channel_codes.MODE_MANUAL:
-            self._resolve_manual(session, model, channel, resolution)
-        elif channel.resolution_mode == channel_codes.MODE_LATEST:
-            self._resolve_latest(session, model, resolution)
-        else:
-            self._resolve_derived(session, model, channel, resolution, live=live)
+        # El puntero manda en TODOS los modos: ``manual`` lo mueve una persona y ``latest`` /
+        # ``derived`` los mueve ``channel_pointer_sync`` cuando cambia algo de lo que dependen.
+        self._resolve_manual(session, model, channel, resolution)
 
-        wants_reference = (
-            include_reference
-            and channel.resolution_mode != channel_codes.MODE_DERIVED
-            and channel.environment_id is not None
-        )
+        # El mínimo del entorno es una REFERENCIA en todos los modos: dice si el puntero va por
+        # delante o por detrás de lo que de verdad corre, y no decide nada.
+        wants_reference = include_reference and channel.environment_id is not None
         if wants_reference:
             # Objeto aparte: la referencia nunca pisa el valor que el canal sirve de verdad.
             reference = ChannelResolution(
@@ -458,7 +453,7 @@ class BlueprintChannelController:
                 resolution,
                 channel_codes.CODE_NO_RELEASED_VERSION,
                 f"El canal '{channel.slug}' todavía no tiene una versión liberada para este "
-                "blueprint.",
+                "blueprint (el puntero espera una versión revisada).",
             )
             return
         pointed = session.get(ModelMigration, pointer.model_migration_id)
@@ -472,27 +467,6 @@ class BlueprintChannelController:
         resolution.version = pointed.version
         resolution.model_migration_id = pointed.id
         resolution.source = resolution_codes.SOURCE_POINTER
-
-    def _resolve_latest(
-        self, session, model: DatabaseModel, resolution: ChannelResolution
-    ) -> None:
-        """
-        La punta INCLUYE versiones sin revisar. Es el comportamiento que ya tiene el
-        aprovisionamiento sin ``target_version``, y las guardas de "revisada" siguen aplicando
-        en quien consume: el canal no las reemplaza ni las relaja.
-        """
-        migrations = session.query(ModelMigration).filter(ModelMigration.model_id == model.id).all()
-        if not migrations:
-            self._fail(
-                resolution,
-                channel_codes.CODE_NO_RELEASED_VERSION,
-                "El blueprint todavía no tiene versiones.",
-            )
-            return
-        tip = max(migrations, key=lambda row: version_sort_key(row.version))
-        resolution.version = tip.version
-        resolution.model_migration_id = tip.id
-        resolution.source = resolution_codes.SOURCE_TIP
 
     def _resolve_derived(
         self,
