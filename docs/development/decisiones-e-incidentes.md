@@ -2288,7 +2288,7 @@ Cambio `mcp-readonly-query-execution`, entrega 6 (última). Contrato en `docs/ap
 → "nunca EJECUTA" (entrega 1) → **"ejecuta únicamente `SELECT` únicos validados, en una transacción
 `READ ONLY` y bajo una credencial por base con `SELECT` solamente"**. No se relajó el guard: se movió
 la barrera al motor (cuenta + transacción + timeout) y el validador pasó a ser defensa en profundidad.
-Editado en `docs/features/mcp-para-colaboradores.md`, `docs/api-reference-v23.md` §9.5 y el plan 12
+Editado en `docs/features/mcp-para-colaboradores.md`, `api-reference.md` §24 y el plan 12
 §4/§13.
 
 **D16 — un no-`SELECT` en `run_select` es TEXTO, no un error.** Escritura, DDL, bloqueado e ilegible
@@ -2509,7 +2509,7 @@ retiro del formato legado y rompe a todo agente que no haya rotado.
 **Decisión.** Cada persona administra sus propios tokens de agente sin `access.admin`. Se agregó UNA
 capacidad, `tokens.own`, que tienen los tres roles como `self.read`, y las rutas de `/api-tokens` aceptan
 `access.admin` (todos los tokens) o `tokens.own` (solo los de `created_by_admin_id` igual al propio id).
-Detalle del contrato en `docs/api-reference-v40.md`.
+Detalle del contrato en `api-reference.md` §25.17.
 
 **Por qué una capacidad más y no partir `access.admin`.** El invariante 10 fija `access_admin` como
 exactamente `{access.admin}` y existe por la separación de deberes que costó la partición de
@@ -2567,7 +2567,7 @@ las capacidades de su rol; el alcance por entorno no restringe un token (documen
 
 Tres capacidades se partieron tras una revisión independiente. Regla común: **cada rol hereda la capacidad
 nueva según lo que ya podía hacer**, de modo que nadie pierde un flujo legítimo salvo las dos restricciones
-intencionales de abajo. Contrato en `docs/api-reference-v41.md`.
+intencionales de abajo. Contrato en `api-reference.md` §25.18.
 
 ### `policy.admin` → `audit.read` + `crypto.rotate`
 

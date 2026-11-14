@@ -6,7 +6,7 @@
 > después el modelo creció más allá de este plan: alcance por destino en toda ruta, capacidades
 > puntuales, `gateway.admin` partida en `access.admin`/`policy.admin`, separación de deberes,
 > segundo aprobador en lugar del techo por tenencia, siembra `viewer` + `access_admin` con
-> ventana de arranque, step-up exigido y lectura de auditoría (`api-reference-v29.md`). Se conserva
+> ventana de arranque, step-up exigido y lectura de auditoría (`api-reference.md` §25.9). Se conserva
 > como **registro del razonamiento de diseño**; ante una contradicción, manda el código y
 > `authorization.md`.
 >
@@ -186,7 +186,7 @@ módulo M".
 
 > Esta fila era `gateway-admin` (único), compartida por `access_admin` y `security_officer`; se
 > partió en `access.admin` / `policy.admin` para que los conjuntos de las dos globales sean
-> disjuntos (ver `api-reference-v29.md`).
+> disjuntos (ver `api-reference.md` §25.9).
 
 **Tabla NORMATIVA: cada ruta declara exactamente UNA capacidad** (§6.3 punto 1), así que las
 asignaciones no pueden aparecer dos veces con nombres distintos. Tres que hay que fijar acá y no

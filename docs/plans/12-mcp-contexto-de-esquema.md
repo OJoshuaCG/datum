@@ -5,7 +5,7 @@
 > de agente (`databases.read`, `blueprints.read`, `schema_diff.read`). Faltan las tools que leen el
 > catálogo del motor (`list_objects`, `get_schema`, `check_freshness`), bloqueadas por falta de
 > verificación contra motores reales (`TODO.md` `T-260909-ojoshuac-mcp-tools-motor`). Contrato en
-> `api-reference-v23.md` §9 y `v24.md` §3; autorización vigente en
+> `api-reference.md` §25.16 y `v24.md` §3; autorización vigente en
 > [`docs/features/authorization.md`](../features/authorization.md). Las menciones a
 > `get_current_admin`/`AdminDep` de abajo describen el gateway de la fecha de relevamiento.
 >

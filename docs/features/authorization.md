@@ -1,7 +1,7 @@
 # Autorización del gateway: roles, capacidades y controles
 
 Resumen **vigente** del modelo de autorización. Reúne en un solo lugar lo que está repartido entre
-[`authentication.md`](authentication.md), los addenda `api-reference-v23.md`, `v24.md` y `v29.md` y
+[`authentication.md`](authentication.md), los addenda `api-reference.md` §25, `v24.md` y `v29.md` y
 la §19 de [`api-reference.md`](../api-reference.md). Los contratos completos (forma de cada
 respuesta, cada código de error) siguen en esos addenda; acá se explica **cómo encajan** y
 **por qué**.
@@ -21,7 +21,7 @@ Módulos: `app/services/capability_catalog.py`, `app/core/{authz,scope,step_up,s
 
 ---
 
-## 1. Roles, globales y las 32 capacidades
+## 1. Roles, globales y capacidades
 
 Cada usuario del gateway tiene:
 
@@ -39,7 +39,7 @@ o cambia de forma irreversible datos o estructura del tercero.
 
 ### 1.1 Tabla del catálogo
 
-Generada desde `capability_matrix()` (32 filas al escribirse; los canales de liberación suman 3, ver abajo). `✓` = sí, `—` = no. *Cursiva* = capacidad global.
+Generada desde `capability_matrix()` (tabla parcial; el catálogo completo, generado de `capability_catalog.py`, está en `api-reference.md` §25.1). `✓` = sí, `—` = no. *Cursiva* = capacidad global.
 "Sensible" = otorgarla suelta pide un segundo aprobador (§3).
 
 | Capacidad | Módulo | Nivel | Eje | mutates | discloses | destructive | step-up | agente | otorgable | sensible | Roles / global |
@@ -102,7 +102,7 @@ Conteos de la tabla original (anterior a `tokens.own`, `data.*`, v41): 16 con st
 - `operator`: `viewer` + la escritura **no destructiva y no divulgante**: `engine_users.write`,
   `databases.write`, `blueprints.write` (solo autoría), `exports.execute` y el código de los
   objetos de esquema (`schema.definitions`). No divulga nada (invariante 7b; por eso
-  `schema.definitions` no se marca `discloses`: ver `api-reference-v41.md`). No delega privilegios
+  `schema.definitions` no se marca `discloses`: ver `api-reference.md` §25.18). No delega privilegios
   (`engine_users.grant_admin` es solo de `owner`).
 - `owner`: todo lo **operativo** del alcance: `operator` + las capacidades exclusivas de `owner`
   (las *sensibles* de la tabla: 17 desde v46, que suma `blueprints.promote`; eran 16 desde v44 y 15 desde v41). No
@@ -231,7 +231,7 @@ global, una capacidad puntual sensible o un `sod_override`. `operator` no es ele
 - una solicitud nueva sobre la misma persona **reemplaza** a la pendiente anterior (`superseded`).
 
 **Reglas de aprobación** (`/access-requests`, todo `access.admin`; contrato en
-`api-reference-v29.md` §9.3–§9.4):
+`api-reference.md` §25.10–§9.4):
 
 - aprueba **otro** `access_admin`: ni quien pidió (`access.self_approval_forbidden`) ni la persona
   destino (`access.self_modification_forbidden`);
@@ -248,7 +248,7 @@ global, una capacidad puntual sensible o un `sod_override`. `operator` no es ele
 hasta 100 solicitudes pendientes de una vez, **de mejor esfuerzo**: cada ítem aplica las mismas reglas
 que `approve`/`reject` (una sola fuente, `_block_reason`) y el que se bloquea no frena a los demás.
 Una confirmación de step-up (ventana de 5 minutos) cubre toda la llamada. Contrato en
-`api-reference-v43.md`. El alta masiva (`.../capability-grants/bulk`) acepta varias capacidades y
+`api-reference.md` §25.14. El alta masiva (`.../capability-grants/bulk`) acepta varias capacidades y
 decide pendiente/activa por capacidad, todo o nada.
 
 **Último `access_admin`.** No se puede desactivar ni quitarle la global al último `access_admin`
@@ -260,7 +260,7 @@ de escritura, no solo como pre-chequeo.
 ## 5. Separación de deberes
 
 Regla pura en `app/core/separation_of_duties.py`; escritor y reportes en `app/services/sod_service.py`.
-Contrato en `api-reference-v29.md` §8.
+Contrato en `api-reference.md` §25.9.
 
 **Las dos reglas.** Una cuenta con `security_officer` no puede tener además:
 
@@ -339,7 +339,7 @@ exportación usa `exports.execute`, que no pide step-up, así que no figura.
 ## 7. Arranque: siembra, ventana de arranque y recuperación
 
 Detalle operativo en [authentication.md](authentication.md#primer-arranque-la-ventana-de-arranque);
-contrato en `api-reference-v29.md` §10.
+contrato en `api-reference.md` §25.11.
 
 - **Siembra** (`bootstrap_admin`, solo con la tabla `users` vacía): `ADMIN_USERNAME` como
   **`viewer` + `access_admin`**, nada más. Con usuarios ya creados no siembra ni repara nada.
@@ -388,7 +388,7 @@ contrato en `api-reference-v29.md` §10.
 **Quién lee la auditoría.** `GET /audit-log` y `GET /audit-log/{id}` exigen **`audit.read`**
 (`security_officer`). `access_admin` recibe `403`: quien hace los cambios de acceso no revisa el
 rastro que los registra. La lectura **no divulga** (dice quién hizo qué, no datos del tercero), así
-que un `GET` no pide step-up. Filtros y forma en `api-reference-v29.md` §11.3.
+que un `GET` no pide step-up. Filtros y forma en `api-reference.md` §25.12.
 
 ---
 
@@ -419,13 +419,13 @@ mismo `422 gateway_user.not_found` (sin `410`, que era un oráculo de cuentas pe
   Nada que mute ni divulgue (invariante 5) y nada con step-up (invariante 11).
 - `parse_scopes` **intersecta** los scopes guardados con el techo al leer: una fila manipulada nunca
   otorga más, aunque el string lo diga.
-- Crear, listar, editar y revocar los tokens de TODOS es `access.admin`; cada persona administra los suyos con `tokens.own` (los tres roles; ver `api-reference-v40.md`). Un token está atado a un proyecto, vence
+- Crear, listar, editar y revocar los tokens de TODOS es `access.admin`; cada persona administra los suyos con `tokens.own` (los tres roles; ver `api-reference.md` §25.17). Un token está atado a un proyecto, vence
   (`MCP_TOKEN_MAX_TTL_DAYS`, default 90) y el servidor MCP está apagado por defecto (`MCP_ENABLED`).
 - El dispatcher MCP exige el scope de cada herramienta (`mcp.scope_denied`, auditado).
 - Qué BD ve un agente lo decide la **política**, no el acceso: `allows_agent_access` del entorno y
   `PUT /managed-databases/{id}/agent-access`, ambos `environments.write` (`security_officer`).
 
-Contrato en `api-reference-v23.md` §9 y `api-reference-v24.md` §3; guía de uso en
+Contrato en `api-reference.md` §25.16 y `api-reference.md` §25.16; guía de uso en
 [mcp-para-colaboradores.md](mcp-para-colaboradores.md).
 
 ### Tokens de integración (REST)
@@ -464,16 +464,16 @@ automatiza un conjunto cerrado de operaciones (ver [integration-api-tokens.md](i
 
 | Ruta | Capacidad | Contrato |
 |---|---|---|
-| `GET /auth/me` | `self.read` | `api-reference.md` §5 y §19; `api-reference-v29.md` §8.5 y §10.4 |
+| `GET /auth/me` | `self.read` | `api-reference.md` §5 y §19; `api-reference.md` §25.9 y §10.4 |
 | `POST /auth/step-up`, `POST /auth/password` | `self.read` | `api-reference.md` §5 |
-| `GET /auth/sessions`, `POST /auth/sessions/revoke-others` | `self.read` | `api-reference-v23.md` §7.4 |
-| `GET /authz/catalog` | `self.read` | `api-reference-v23.md` §2 |
-| `GET /authz/scope-readiness`, `GET /authz/sod-report` | `access.admin` | `api-reference-v23.md` §8; `api-reference-v29.md` §8.6 |
-| `/gateway-users/*` (salvo `invite/accept`, público) | `access.admin` | `api-reference-v24.md` §2; `api-reference-v29.md` §9 y §11 |
+| `GET /auth/sessions`, `POST /auth/sessions/revoke-others` | `self.read` | `api-reference.md` §25.6 |
+| `GET /authz/catalog` | `self.read` | `api-reference.md` §25.3 |
+| `GET /authz/scope-readiness`, `GET /authz/sod-report` | `access.admin` | `api-reference.md` §25.7; `api-reference.md` §25.9 |
+| `/gateway-users/*` (salvo `invite/accept`, público) | `access.admin` | `api-reference.md` §25.13; `api-reference.md` §25.10 y §11 |
 | `/gateway-users/{id}/capability-grants`, `/capability-grants/*` | `access.admin` | `api-reference.md` §19 |
-| `/access-requests/*` | `access.admin` | `api-reference-v29.md` §9.4 |
-| `/api-tokens/*` | `access.admin` (todos) o `tokens.own` (solo los propios) | `api-reference-v24.md` §3 |
-| `/audit-log`, `/audit-log/{id}` | `audit.read` | `api-reference-v29.md` §11.3–§11.4 |
+| `/access-requests/*` | `access.admin` | `api-reference.md` §25.10 |
+| `/api-tokens/*` | `access.admin` (todos) o `tokens.own` (solo los propios) | `api-reference.md` §25.16 |
+| `/audit-log`, `/audit-log/{id}` | `audit.read` | `api-reference.md` §25.12–§11.4 |
 | `POST /admin/crypto/rotate` | `crypto.rotate` | `api-reference.md` §13 |
 
 ---
@@ -498,7 +498,7 @@ step-up. El razonamiento largo vive en los docstrings citados.
 | El arranque no revive ni re-eleva cuentas sin `ADMIN_RECOVERY=1`, y la recuperación solo devuelve `access_admin`. | Si un reinicio reparara solo, desactivar al administrador sería reversible por reinicio. |
 | Step-up activo por defecto, ventana de 5 min por sesión, no deslizante; el login cuenta. | Fricción mínima en flujos de varios requests sin dejar que una cookie robada mantenga abierta la ventana. |
 | Las cancelaciones están exentas de step-up (lista cerrada, chequeada en CI). | Frenar una operación destructiva nunca puede costar más que lanzarla. |
-| Leer la auditoría es `audit.read` (antes `policy.admin`, partida en `audit.read` + `crypto.rotate`: ver `api-reference-v41.md`), no `access.admin`; no pide step-up. | El revisado no se revisa a sí mismo; la auditoría no divulga datos del tercero. |
+| Leer la auditoría es `audit.read` (antes `policy.admin`, partida en `audit.read` + `crypto.rotate`: ver `api-reference.md` §25.18), no `access.admin`; no pide step-up. | El revisado no se revisa a sí mismo; la auditoría no divulga datos del tercero. |
 | `access_admin` puede ver y cerrar las sesiones de otra persona; no toca la contraseña. | Responder a un incidente sin tocar la credencial; ante una filtración se combina con desactivar la cuenta. |
 | Al leer, una combinación sin excepción pierde `security_officer`, no `owner` ni `access_admin`. | Quitar `access_admin` podría dejar al gateway sin quien lo repare; lo que se cae es la política. |
 | Una BD sin clasificar cuenta como el entorno más protegido. | "Sin entorno derivable" nunca puede significar "permitido". |

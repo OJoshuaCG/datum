@@ -768,4 +768,4 @@ metadatos, pero no el SQL.
   `body_omitted_reason: "scope_disabled"`; tampoco devuelve SQL de un diff. `diff_schemas` dice QUÉ difiere y nada más; no guarda
   la comparación ni emite un `confirm_token`.
 
-El contrato técnico completo está en `docs/api-reference-v23.md` §9.
+El contrato técnico completo está en `api-reference.md` §25.16.

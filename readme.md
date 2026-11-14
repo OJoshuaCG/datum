@@ -70,7 +70,7 @@ El sistema separa dos planos:
 | **Multi-motor** | Adaptadores para MySQL, MariaDB y PostgreSQL tras una interfaz común |
 | **Seguridad SQL** | Validación + quoting de identificadores (anti-inyección); valores parametrizados o escapados |
 | **Credenciales** | Cifrado en reposo con Fernet derivado de `SECRET_KEY` |
-| **Autenticación y autorización** | Multiusuario: sesiones server-side con cookie httpOnly firmada, CSRF, roles (`viewer`/`operator`/`owner`) y 32 capacidades con alcance por entorno o servidor, separación de deberes, segundo aprobador, step-up y auditoría. Ver [Autorización](docs/features/authorization.md) |
+| **Autenticación y autorización** | Multiusuario: sesiones server-side con cookie httpOnly firmada, CSRF, roles (`viewer`/`operator`/`owner`) y capacidades con alcance por entorno o servidor, separación de deberes, segundo aprobador, step-up y auditoría. Ver [Autorización](docs/features/authorization.md) |
 | **Base (template)** | `ApiResponse[T]`, `AppHttpException`, middlewares, rate limiting, paginación, logging con Request ID |
 
 > Ya implementado además de la Iteración 1: inventario de usuarios/BDs/blueprints,

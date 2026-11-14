@@ -58,7 +58,7 @@ arranque reparara solo, desactivar al administrador sería reversible por reinic
 > instalación que se actualiza conserva su cuenta sembrada antes, que junta `owner` +
 > `access_admin` + `security_officer` con la combinación **heredada** (`sod_exceptions`,
 > `reason='grandfathered'`). No se parte sola: se reparte creando cuentas de una función (ver
-> `api-reference-v29.md` §8.4 y §10).
+> `api-reference.md` §25.9 y §10).
 
 ### Primer arranque: la ventana de arranque
 
@@ -108,14 +108,14 @@ sea un acto explícito, acotado y auditado, y que un reinicio común nunca reviv
 Las dos globales no se solapan: `access_admin` = `{access.admin}` (usuarios, accesos,
 capacidades puntuales, tokens) y `security_officer` = `{audit.read, crypto.rotate, servers.admin,
 catalogs.write, environments.write}`. Un `security_officer` **sin** `access_admin` no administra
-usuarios, y un `access_admin` sin `security_officer` no rota el cifrado (`api-reference-v29.md`).
+usuarios, y un `access_admin` sin `security_officer` no rota el cifrado (`api-reference.md` §25.9).
 
 **Separación de deberes.** `security_officer` no puede convivir con `owner` (en ninguna forma)
 ni con `access_admin` en una cuenta: los escritores responden `409 access.sod_conflict` salvo un
 `sod_override` con motivo (auditado, vence en 7 días como mucho), y el lector descarta
 `security_officer` si la combinación no tiene excepción viva. El admin sembrado ANTES de C4 junta
 las tres cosas; la migración `f8b0d2e4a6c9` le **heredó** la combinación (`sod_exceptions`,
-`reason='grandfathered'`) y el arranque la reporta (`access.sod_grandfathered`). Contrato completo en `api-reference-v29.md` §8; la regla, en
+`reason='grandfathered'`) y el arranque la reporta (`access.sod_grandfathered`). Contrato completo en `api-reference.md` §25.9; la regla, en
 `app/core/separation_of_duties.py`.
 
 **Segundo aprobador para las elevaciones.** Quien administra accesos ya no tiene un techo por
@@ -127,7 +127,7 @@ Lo que no eleva, y siempre las bajas, se aplica en el acto; la respuesta con alg
 `202 access.elevation_pending`. Es lo que impide que un solo administrador se cree un títere
 `owner` y entre con su invitación. Con un solo administrador real (y solo entonces),
 `ACCESS_FOUR_EYES=False` deja elevar sin segundo aprobador: el arranque avisa y cada elevación se
-audita `access.elevation_unapproved`. Contrato en `api-reference-v29.md` §9; la ventana de
+audita `access.elevation_unapproved`. Contrato en `api-reference.md` §25.10; la ventana de
 arranque que deja a una instalación nueva crear su segundo `access_admin`, en §10.
 
 > `is_superuser` **se retiró**: se escribía en tres lugares y no se leía en ninguno para
@@ -296,7 +296,7 @@ real (`idle`/`absolute`) que les pone el próximo intento.
 
 **La auditoría la lee otra función.** Quien corta sesiones (`access_admin`) no lee
 `GET /audit-log`: eso es `audit.read` (`security_officer`), para que el revisado no se revise a
-sí mismo. Contrato completo de las dos piezas en `api-reference-v29.md` §11.
+sí mismo. Contrato completo de las dos piezas en `api-reference.md` §25.12.
 
 ## Bearer de integración (no es sesión)
 
