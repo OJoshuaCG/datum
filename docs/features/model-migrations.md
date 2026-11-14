@@ -36,7 +36,7 @@ la [capa de conexión remota](remote-connections.md) y la [autenticación](authe
 | `kind` | (auto) | `schema` (DDL, default) o `data` (datos-semilla upsert de un snapshot). Una migración `data` está **atada a `source_engine`** (la sintaxis upsert difiere por motor) y **no se traduce** cross-engine |
 | `reviewed` | (auto) | `true` para migraciones escritas a mano; toda migración generada por **snapshot** (Plan 09) nace `false` y **no se aplica** hasta aprobarla (`PATCH reviewed=true`) |
 | `source_engine` / `is_baseline` / `has_non_portable` | (auto) | Metadatos de una migración generada por snapshot (motor de origen; si trae objetos procedurales no portables). El snapshot puede dividirse en varias versiones — ver [adopción/snapshot](adoption-reconcile-snapshot.md) |
-| `created_by_admin_id` / `created_by_username` / `created_by_actor_type` | (auto) | **Autor de la versión**: el actor de la request que la creó (`admin` o `api_token`), sin FK para que sobreviva al usuario. `null` = autor desconocido: versión anterior al registro de autoría que el backfill desde `audit_log` no pudo atribuir. Ver [api-reference-v28.md](../api-reference-v28.md) |
+| `created_by_admin_id` / `created_by_username` / `created_by_actor_type` | (auto) | **Autor de la versión**: el actor de la request que la creó (`admin` o `api_token`), sin FK para que sobreviva al usuario. `null` = autor desconocido: versión anterior al registro de autoría que el backfill desde `audit_log` no pudo atribuir. Ver api-reference-v28.md |
 
 El gateway **auto-traduce** `up_sql` de MySQL a PostgreSQL con `sqlglot`; el campo
 calculado `translated` muestra el SQL efectivo por motor. Los overrides solo se necesitan
@@ -127,7 +127,7 @@ POST   /api/v1/destructive-approvals/{approval_id}/revoke                       
   `destructive_approval.batch_multi_environment`; se filtra con `environment_id`.
 - **No consumen aprobaciones:** integración, MCP, alta de base (`create_database`) y `adopt`.
 
-Contrato completo y códigos de error: [api-reference-v47.md](../api-reference-v47.md). Reglas del entorno:
+Contrato completo y códigos de error: [`api-reference.md` §23](../api-reference.md). Reglas del entorno:
 [environments.md](environments.md#aprobación-de-versiones-destructivas).
 
 ### Búsqueda en el SQL de las versiones
@@ -285,7 +285,7 @@ hace que la cadena entera figure pendiente sin que nada falle. Con
 
 El incidente que originó todo esto, la cadena causal completa y por qué no hay auto-corrección
 están en [`docs/development/decisiones-e-incidentes.md`](../development/decisiones-e-incidentes.md).
-Contrato para el frontend: [`docs/api-reference-v25.md`](../api-reference-v25.md).
+Contrato para el frontend: `docs/api-reference-v25.md`.
 
 ## Integridad, cuarentena y recuperación
 
@@ -372,8 +372,8 @@ Contrato para el frontend: [`docs/api-reference-v25.md`](../api-reference-v25.md
 
 ## Cuándo se puede editar o eliminar una versión
 
-> Contrato para el frontend: [`docs/api-reference-v18.md`](../api-reference-v18.md)
-> (el borrado con renumerado) y [`docs/api-reference-v14.md`](../api-reference-v14.md)
+> Contrato para el frontend: `docs/api-reference-v18.md`
+> (el borrado con renumerado) y `docs/api-reference-v14.md`
 > (el criterio de congelamiento del que parte).
 
 Editar el `up_sql` de una versión o borrarla **no ejecuta ni deshace nada en el motor**: solo
@@ -598,7 +598,7 @@ El `DELETE` **no** se destraba por acá: editar una versión no la vuelve borrab
 Son dos freezes con criterios distintos a propósito — la edición usa `>=` (cualquier BD que ya
 pasó por la versión), el borrado usa **igualdad** (solo la que está parada exactamente en
 ella). Un borrado que igual haga falta va por su propio camino, con su propio doble factor:
-ver «[Borrar una versión intermedia](../api-reference-v18.md)».
+ver «Borrar una versión intermedia».
 
 ### Los `reason`
 

@@ -299,7 +299,7 @@ peor que no tenerla.
 | Nivel | Estado en v1 | Por qué |
 |---|---|---|
 | `inspect` (estructura, sin cuerpos) | **SÍ** | Es el caso de uso real |
-| `inspect:bodies` (cuerpos de vistas/rutinas/triggers) | Scope propio, **apagado por default** (implementado como `data.definitions` + `MCP_SCHEMA_DEFINITIONS_ENABLED`, tool `get_definition`; ver [api-reference-v39](../api-reference-v39.md)) | Es el canal de fuga: un procedure real lleva tokens, hosts internos y emails hardcodeados. Y es la carga de inyección más estructurada que el motor puede devolver |
+| `inspect:bodies` (cuerpos de vistas/rutinas/triggers) | Scope propio, **apagado por default** (implementado como `data.definitions` + `MCP_SCHEMA_DEFINITIONS_ENABLED`, tool `get_definition`; ver [`api-reference.md` §24.10](../api-reference.md)) | Es el canal de fuga: un procedure real lleva tokens, hosts internos y emails hardcodeados. Y es la carga de inyección más estructurada que el motor puede devolver |
 | `analyze` (diff, previews) | **NO** | Filtra el `confirm_token` (§2.1) |
 | `author` (borradores de migración) | **NO** | Se auto-aprueba `reviewed=true` (§2.4), y lee filas de negocio embebidas en `up_sql` (§2.5) |
 | `query` (SQL de solo lectura) | **NO** | Corre con pseudo-root y cruza bases (§2.3) |

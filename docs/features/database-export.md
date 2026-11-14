@@ -11,7 +11,7 @@ dentro del artefacto**: el módulo nunca ejecuta DDL contra el origen. La única
 hace es en su propio disco de spool.
 
 Diseño completo y decisiones: [`docs/plans/10-exportacion-de-bases-de-datos.md`](../plans/10-exportacion-de-bases-de-datos.md).
-Contrato para el equipo de frontend: [`docs/api-reference-v10.md`](../api-reference-v10.md).
+Contrato para el equipo de frontend: `docs/api-reference-v10.md`.
 
 > ⚠️ **Riesgo aceptado, declarado arriba de todo y no escondido en un apéndice**: este módulo
 > **no tiene enmascarado de datos** ([§sin enmascarado](#riesgo-aceptado-no-hay-enmascarado)).

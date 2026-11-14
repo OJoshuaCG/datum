@@ -91,7 +91,7 @@ confirma con `confirm_token` + `confirm_target_name`.
 1. **`POST /servers/{server_id}/databases/{database}/collation-conversions`** — crea un PLAN.
    Valida el motor (422 si es PostgreSQL), que la BD no sea de sistema, que la BD exista en
    vivo y que el par `(target_charset, target_collation)` esté **habilitado en el catálogo
-   global** (ver [charsets/collations](../api-reference-v2.md)). Persiste el job en `pending`
+   global** (ver charsets/collations). Persiste el job en `pending`
    con un `source_fingerprint` (anti-TOCTOU) y TTL (`COLLATION_CONVERSION_TTL_HOURS`, 24 h).
    Funciona con BDs **adoptadas y crudas** (patrón "por identidad").
 2. **`GET /collation-conversions/{id}/objects`** — inventario en vivo para armar la selección:
@@ -469,7 +469,7 @@ distintos, y mezclarlas es justo lo que dispara el conflicto.
 
 ## Lote por blueprint: convertir las N bases de una vez
 
-Guía de API: [`api-reference-v17.md`](../api-reference-v17.md).
+Guía de API: `api-reference-v17.md`.
 
 Un blueprint es un esquema que N bases replican. Convertir una sola no dejaba rastro y las otras
 quedaban como estaban: el módulo no miraba `model_id` ni una vez.

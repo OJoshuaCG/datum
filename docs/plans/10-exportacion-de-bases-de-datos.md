@@ -11,7 +11,7 @@
 >
 > **Guías de uso derivadas de este plan** (son la documentación viva; este archivo es el
 > histórico de por qué): [`docs/features/database-export.md`](../features/database-export.md) y
-> [`docs/api-reference-v10.md`](../api-reference-v10.md).
+> `docs/api-reference-v10.md`.
 >
 > **Verificado** — por ejecución directa de los tests, sin `pytest` (política del proyecto):
 > 81 checks HTTP de extremo a extremo (`tests/test_api_database_exports.py`, TestClient +

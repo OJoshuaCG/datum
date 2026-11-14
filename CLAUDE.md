@@ -51,14 +51,10 @@ Tres destinos, por tipo de pregunta. No hay índice: la convención de nombres a
 - **«¿Cómo se usa X?»** → `docs/features/<feature>.md`
 - **«¿Por qué X está hecho así?» / «¿puedo simplificar este guard?»** →
   `docs/development/decisiones-e-incidentes.md`
-- **«¿Qué contrato consume el frontend?»** → `docs/api-reference.md` primero, y **después** el
-  addendum de la feature puntual
-
-**Los `api-reference-vN.md` NO son versiones del mismo documento: son addendums por feature.**
-`api-reference.md` es el consolidado, pero solo absorbió v2–v5; de **v6 en adelante siguen
-sueltos**. Así que el número más alto no es "lo más nuevo del contrato", es el último addendum
-escrito — v14 son 149 líneas sobre descongelar una versión de blueprint, no la API. Buscá el
-addendum por su **título**, no por su número.
+- **«¿Qué contrato consume el frontend?»** → `docs/api-reference.md`, el único documento de
+  referencia. No hay addendums `api-reference-vN.md`: se eliminaron y viven en el historial de git
+  (`git show b61def1:docs/api-reference-vN.md`). Una feature nueva actualiza su sección de
+  `api-reference.md` en el mismo commit; no crea un archivo nuevo.
 
 **Antes de "limpiar" código que parece paranoia excesiva, buscalo en el archivo de decisiones
 e incidentes.** Casi todo lo que sobra a primera vista es el resultado de un incidente real de

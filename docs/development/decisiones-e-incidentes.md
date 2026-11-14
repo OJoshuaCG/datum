@@ -1959,7 +1959,7 @@ de llegar a cualquier migración nueva. La regla de introspección e idempotenci
 
 ## Aprovisionar la credencial de solo lectura del MCP
 
-`POST /servers/{id}/readonly-credential/provision` (api-reference-v32). Tres decisiones que no se
+`POST /servers/{id}/readonly-credential/provision` (`api-reference.md` §24.2). Tres decisiones que no se
 deducen del código y que alguien va a querer "simplificar":
 
 - **`REVOKE ALL` antes de otorgar (MySQL/MariaDB).** `CREATE USER IF NOT EXISTS` + `ALTER USER`
@@ -2028,7 +2028,7 @@ valiendo aunque la cuenta sea propia).
 
 Entrega 1 de `mcp-readonly-query-execution`. El MCP pasó de "nunca acepta SQL del agente" a
 "nunca **ejecuta** SQL del agente": `draft_query` recibe un texto, lo clasifica y devuelve solo
-texto (`touches_engine: false`), sin abrir una conexión. Contrato en `docs/api-reference-v34.md`;
+texto (`touches_engine: false`), sin abrir una conexión. Contrato en `docs/api-reference.md §24.7`;
 el validador es `app/services/db_admin/agent_sql_policy.py`. Lo que sigue es el porqué de lo que
 parece exagerado.
 
@@ -2094,7 +2094,7 @@ parece exagerado.
 
 ## MCP: credencial de datos por base y migración única (D9, D13)
 
-Entrega 2 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35.md`.
+Entrega 2 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference.md §24.4`.
 
 - **D9 — tabla propia 1:1 y no reutilizar `servers.readonly_*`.** Esas columnas son por servidor y
   ven estructura; una credencial de datos con ese alcance leería filas de TODAS las bases del
@@ -2120,7 +2120,7 @@ Entrega 2 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35
 
 ## MCP: sonda de la credencial de datos (D18, enmienda S32)
 
-Entrega 3 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35.md`.
+Entrega 3 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference.md §24.4`.
 
 - **Allowlist estricta y distinta de la de estructura.** La credencial de datos es `SELECT` sobre una
   base y nada más, así que `mysql_data_grant_violations` solo admite `USAGE ON *.*` y `SELECT` sobre la
@@ -2160,7 +2160,7 @@ Entrega 3 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35
 
 ## MCP: scopes de datos, excepción cerrada del catálogo y opt-in (D12 del catálogo)
 
-Entrega 4 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v36.md`.
+Entrega 4 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference.md §24.5`.
 
 - **La excepción es un conjunto cerrado y no "se quitó el invariante".** Los invariantes 5 ("un token
   nunca muta ni divulga") y 11 ("step-up implica no agente") siguen siendo reglas de import; solo se
@@ -2282,7 +2282,7 @@ datos; el kill switch de datos se mira primero de todos en las tools.
 
 ## MCP `run_select`: SQL de solo lectura del agente y el invariante final (D4, D15, D16)
 
-Cambio `mcp-readonly-query-execution`, entrega 6 (última). Contrato en `docs/api-reference-v38.md`.
+Cambio `mcp-readonly-query-execution`, entrega 6 (última). Contrato en `docs/api-reference.md §24.9`.
 
 **El invariante cambió, y conviene saber de cuál a cuál.** "El MCP nunca acepta SQL del agente" (v1)
 → "nunca EJECUTA" (entrega 1) → **"ejecuta únicamente `SELECT` únicos validados, en una transacción
@@ -2351,7 +2351,7 @@ no se tocó en esta slice. No verificado contra un motor real.
 
 ## MCP definiciones de esquema, S2 a S7: `get_definition`, `get_table_stats` y sus límites
 
-Contrato en [`api-reference-v39.md`](../api-reference-v39.md). Acá solo el porqué.
+Contrato en [`api-reference.md` §24.10](../api-reference.md). Acá solo el porqué.
 
 **Scope propio `data.definitions` y no `databases.read`.** El cuerpo de una vista, rutina, trigger o evento
 lleva literales, reglas de negocio y a veces credenciales del tercero: divulga aunque no lea filas. Colgarlo
@@ -2428,7 +2428,7 @@ triggers y eventos (su ausencia es silenciosa) y a la vez permiten crearlos. La 
 
 ## MCP definiciones de esquema, S6 y S8: `mysql.proc` por servidor (D7, D8, D9)
 
-Contrato en [`api-reference-v39.md`](../api-reference-v39.md). Acá solo el porqué.
+Contrato en [`api-reference.md` §24.10](../api-reference.md). Acá solo el porqué.
 
 **D7: la sonda conoce la bandera (`allow_mysql_proc`), en vez de tolerar siempre `mysql.proc`.** Una sonda
 que aceptara `SELECT ON mysql.proc` con la bandera apagada dejaría verificar una credencial que expone el
@@ -2752,7 +2752,7 @@ rechaza toda clave que contenga `port`. El selector de scopes de la SPA (otro re
 ## Tokens de integración (REST) y API `/integration`
 
 Guía de uso en [`integration-api-tokens.md`](../features/integration-api-tokens.md); contrato en
-`api-reference-v45.md`. Esta sección cubre los diez scopes de lectura y escritura; revertir y marcar migraciones
+`api-reference.md` §22. Esta sección cubre los diez scopes de lectura y escritura; revertir y marcar migraciones
 tiene su propia entrada cuando llegue.
 
 ### Un vocabulario de scopes propio, que mapea a capacidades (no capacidades nuevas)
@@ -2851,7 +2851,7 @@ respuesta).
 
 ## Canales de liberación de blueprints
 
-Guía de uso en [`release-channels.md`](../features/release-channels.md); contrato en `api-reference-v46.md`.
+Guía de uso en [`release-channels.md`](../features/release-channels.md); contrato en `api-reference.md` §21.
 
 ### El puntero es la fuente única de todos los modos de canal
 
@@ -2931,7 +2931,7 @@ de cada consumidor. Es una decisión abierta, no un descuido.
 ## Aprobación de versiones destructivas para producción
 
 Guía de uso en [`environments.md`](../features/environments.md#aprobación-de-versiones-destructivas); contrato en
-`api-reference-v47.md`. Reemplaza el bloqueo absoluto de `environment.destructive_blocked` por una aprobación de una
+`api-reference.md` §23. Reemplaza el bloqueo absoluto de `environment.destructive_blocked` por una aprobación de una
 segunda persona, sin abrir ningún camino a las máquinas.
 
 ### El hash es del texto fuente, no del SQL resuelto por motor

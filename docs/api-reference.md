@@ -4,11 +4,12 @@
 > Documenta cada endpoint, sus parámetros, tipos y valores permitidos, ejemplos de
 > uso (`curl` + JSON) y el orden en que deben consumirse para cumplir cada propósito.
 >
-> Este documento **consolida** el contenido de los addendums `api-reference-v2.md` a
-> `api-reference-v5.md` y de las guías de feature específicas para frontend
-> (`docs/features/*-frontend-api.md`). Esos archivos siguen existiendo como historial
-> con más detalle narrativo (escenarios, mockups, diagramas de flujo), pero **este es
-> el documento a leer primero**.
+> Este es el **único** documento de referencia de la API. Los addendums `api-reference-vN.md`
+> (v2 a v48) se eliminaron: cada uno describía una feature ya aplicada en el frontend, y su texto
+> completo sigue en el historial de git (último commit que los contiene: `b61def1`; el v48 nunca se
+> commiteó y vive en la §21). Para recuperar uno: `git show b61def1:docs/api-reference-vN.md`.
+> Las secciones 21 a 24 (canales, integración, aprobaciones destructivas y MCP) están escritas
+> contra el código; el resto de la API se documenta en las secciones 1 a 20 y en `docs/features/`.
 >
 > ⚠️ **Los addendums de v6 en adelante NO están consolidados acá.** Siguen sueltos, y
 > cada uno cubre una feature distinta — el número **no** indica antigüedad del contrato
@@ -74,6 +75,10 @@
 18. [Apéndice: variables de entorno del integrador](#18-apéndice-variables-de-entorno-del-integrador)
 19. [Capacidades puntuales (`/gateway-users/{id}/capability-grants`)](#19-capacidades-puntuales-gateway-usersidcapability-grants)
 20. [Autorización: dónde está cada contrato](#20-autorización-dónde-está-cada-contrato)
+21. [Canales de liberación](#21-canales-de-liberación-release-channels-y-database-modelsidchannels)
+22. [Tokens de integración y API `/integration`](#22-tokens-de-integración-y-api-integration)
+23. [Aprobación de versiones destructivas para producción](#23-aprobación-de-versiones-destructivas-para-producción)
+24. [MCP: acceso de agentes (credenciales, tokens y tools)](#24-mcp-acceso-de-agentes-credenciales-tokens-y-tools)
 
 ---
 
@@ -284,7 +289,7 @@ exige una capacidad. Sin ella responde `403 access.forbidden`. Modelo completo e
 
 `POST /api/v1/auth/login` está limitado a **20 peticiones por minuto por IP**, **5 por minuto
 por IP + usuario** y **20 por hora por usuario** desde cualquier IP (ver
-[`api-reference-v24.md`](api-reference-v24.md) §7). La cookie de sesión no cuenta para este
+`api-reference-v24.md` §7). La cookie de sesión no cuenta para este
 límite. El resto de
 endpoints comparten el rate limit global configurado en el servidor, salvo los
 específicos anotados en cada sección (`grants`, `apply-all`, `apply`/`rollback`/`stamp`,
@@ -3006,8 +3011,1758 @@ línea: ante una contradicción con `v29` o con `features/authorization.md`, man
 
 ---
 
-*Generado a partir del código fuente del backend (rutas, schemas y DTOs), consolidando
-`api-reference-v2.md` a `api-reference-v5.md` y las guías de feature para frontend. Para
-el detalle narrativo con escenarios, mockups y diagramas, esos documentos siguen
-disponibles; para detalles de cada feature a nivel backend, consulta `docs/features/`;
-para el roadmap, `docs/plans/`.*
+---
+
+## 21. Canales de liberación (`/release-channels` y `/database-models/{id}/channels`)
+
+Un canal (`stable`, `development`…) es un nombre global al que cada blueprint apunta con un **puntero** a una de
+sus versiones. **Todo canal sirve siempre lo que dice su puntero**, sea cual sea su modo. Mover un puntero **no
+toca ningún motor destino**: es configuración del gateway. Cómo se usa, en
+[`features/release-channels.md`](features/release-channels.md); el porqué, en `development/decisiones-e-incidentes.md`
+(«El puntero es la fuente única de todos los modos de canal»).
+
+### 21.1 Capacidades
+
+| Capacidad | Eje | Roles | Step-up | Qué protege |
+|---|---|---|:-:|---|
+| `release_channels.read` | global | viewer, operator, owner | — | Listar y leer el catálogo |
+| `release_channels.write` | global | `security_officer` | ✓ | Crear, editar y borrar canales |
+| `blueprints.promote` | entorno | owner (sensible) | ✓ | Promover y retroceder el puntero de un blueprint |
+
+`blueprints.promote` se evalúa en el entorno más protegido entre las bases del blueprint (mismo guard de dos capas
+que el borrado de una versión).
+
+### 21.2 Catálogo (`/api/v1/release-channels`)
+
+| Método y ruta | Capacidad | Qué hace |
+|---|---|---|
+| `GET /release-channels` | `release_channels.read` | Lista paginada. Cada canal trae `pointer_count` |
+| `POST /release-channels` | `release_channels.write` | Crea. `201`. Body `{name, slug, resolution_mode, environment_id?}` |
+| `GET /release-channels/{id}` | `release_channels.read` | Un canal |
+| `PATCH /release-channels/{id}` | `release_channels.write` | Edita `name`, `resolution_mode`, `environment_id`. **El `slug` es inmutable** |
+| `DELETE /release-channels/{id}` | `release_channels.write` | Borra. Con punteros exige `?confirm_slug=<slug>` |
+
+`resolution_mode` es un vocabulario cerrado: `manual`, `latest` o `derived`. `derived` exige `environment_id`. El
+modo decide **quién mueve el puntero**, no de dónde sale lo que se sirve (siempre del puntero).
+
+El sembrado de arranque solo corre con la tabla vacía: `stable` (`manual`, enlazado a `production` si existe) y
+`development` (`latest`, sin entorno).
+
+### 21.3 Cómo se mueve el puntero
+
+| Modo | Quién lo mueve | A qué versión |
+|---|---|---|
+| `manual` | Una persona, con `POST .../promote` | La que elige (solo revisadas) |
+| `latest` | El gateway | La versión **revisada** más nueva del blueprint |
+| `derived` | El gateway | El **mínimo** de `ManagedDatabase.model_version` de las bases del blueprint en el entorno del canal |
+
+- **Solo versiones revisadas.** Si la nueva punta (o el nuevo mínimo) no está revisada, el puntero **se queda donde
+  estaba**; al aprobarla, el gateway recalcula y se mueve.
+- **Sin datos parciales.** Un canal `derived` sin entorno enlazado, o con alguna base de versión ilegible, no se
+  mueve. Las bases en cuarentena no cuentan; una base en la versión base (`at_base`) tampoco.
+- **Si nunca hubo valor**, el canal responde `409 release_channel.no_released_version` hasta el primer movimiento
+  válido.
+- **Idempotente:** si el destino calculado ya es el puntero, no se escribe nada ni queda evento.
+- **Cuándo se recalcula** (en la misma transacción del cambio que lo dispara): crear o importar una versión,
+  aprobar o revocar su revisión, aplicar migraciones a una base, dar de alta o adoptar una base (incluye el clon),
+  cambiar el blueprint o el entorno de una base, y borrar una base. Además, **al arrancar** el gateway hace una
+  pasada sobre todos los blueprints.
+- **Huecos conocidos** (el puntero puede quedar atrasado hasta el próximo gancho o reinicio): el cambio de estado
+  de una base (por ejemplo, a cuarentena), el borrado de una base por sincronización con el motor y el borrado de
+  un servidor. Un puntero atrasado nunca apunta a una versión sin revisar ni de otro blueprint.
+
+### 21.4 Puntero de cada blueprint (`/api/v1/database-models/{id}/channels`)
+
+| Método y ruta | Capacidad | Qué hace |
+|---|---|---|
+| `GET .../channels` | `blueprints.read` | Cada canal con la versión que sirve para este blueprint. **No paginado** |
+| `GET .../channels/{slug}/resolve` | `blueprints.read` | Lectura **tolerante** para pantalla. `20/min` |
+| `POST .../channels/{slug}/promote` | `blueprints.promote` + step-up | Mueve el puntero de un canal manual |
+| `GET .../channels/{slug}/history` | `blueprints.read` | Bitácora del puntero, paginada, la más reciente primero |
+
+**`ChannelResolutionOut`** (listado y `resolve`): `channel_slug`, `channel_name`, `resolution_mode`,
+`environment_slug`, `resolved`, `code`, `version`, `model_migration_id`, `source`, `databases[]` y
+`derived_reference`.
+
+- `source` es siempre `pointer`. `derived_reference.source` es `live` (mínimo leído del motor, solo en `resolve`) o
+  `inventory_cache` (mínimo calculado con la versión anotada en el inventario, en el listado).
+- **Un canal que no resuelve no es un error HTTP** en estas dos rutas: responden `200` con `resolved: false` y el
+  motivo en `code`. Solo los consumidores (alta de base, aplicar a todas, integración) lo convierten en `409`.
+- `derived_reference` trae el mínimo del entorno **junto** al puntero de todo canal con entorno enlazado. Es una
+  referencia para la persona y **no decide nada**. Sus códigos `release_channel.derived_unreadable` y
+  `release_channel.derived_no_scope` solo describen `derived_reference.code`; no salen de ningún consumidor.
+- `databases[]` explica el cálculo `derived`: por base `current_version`, `readable`, `counted` e `ignored_reason`
+  (`quarantined`, `database_missing`, `at_base`).
+
+**`POST .../promote`**: body `{version, note?}` o `{model_migration_id, note?}` (exactamente uno de los dos).
+
+- Solo canales `manual`: otro modo es `409 release_channel.not_manual`.
+- Solo versiones **revisadas**: `409 release_channel.version_unreviewed`.
+- Un **retroceso** exige `?confirm_slug=<slug>`; sin él, `409 release_channel.promote_backward_requires_confirm`.
+- Misma versión que la actual: `200` con `changed: false`, sin escritura y sin evento.
+- Versión inexistente: `422 release_channel.version_not_found`; de otro blueprint:
+  `422 release_channel.version_not_in_blueprint`.
+
+Respuesta: `{channel_slug, changed, event_type, from_version, to_version, model_migration_id}`.
+
+**Bitácora** (`ChannelPointerEventOut`): `event_type` es `promote`, `demote` o `version_deleted` (vocabulario
+cerrado). Un movimiento automático se reconoce por `actor_type: "system"`, `actor_username: "sistema"`,
+`actor_admin_id: null` y `note: "automático (latest)"` o `"automático (derived)"`. Borrar la versión apuntada deja
+`version_deleted` también en canales automáticos.
+
+### 21.5 Superficies que consumen canales
+
+El destino se pide por versión **o** por canal, nunca por los dos (`422 release_channel.target_conflict`).
+
+| Superficie | Campo | Nota |
+|---|---|---|
+| `POST /managed-databases` | `channel` | Excluyente con `target_version`; exige `apply_migrations`. La respuesta trae `resolved_channel {slug, mode, version, source}` |
+| `POST /database-models/{id}/migrations/apply-all` | query `channel` o `target_version` (`^\d{4,10}$`) | Las bases por encima del tope no retroceden (`pending_versions: []`) |
+| `POST /integration/databases/{db_id}/migrations/apply` | body `channel` | Excluyente con `version`. Solo hacia adelante (`422 integration.migration_target_not_forward`) |
+| `GET .../migrations/{version}/delete-plan` y `DELETE .../migrations/{version}` | respuesta `channel_moves[]` | `{release_channel_id, channel_slug, from_version, to_version, to_migration_id}` |
+| `DELETE /environments/{id}` | — | `409 environment.has_release_channels` (con `channel_count`) si algún canal lo enlaza |
+
+**`channel_moves` y el borrado de una versión.** Si la versión a borrar es la apuntada por un canal, el puntero se
+mueve a la versión revisada inmediatamente anterior (o queda sin versión, `to_version: null`) en la misma
+transacción local del renumerado, con un evento `version_deleted`. El borrado **nunca se bloquea** por un canal.
+`requires_confirmation` es `stamp_plan` **o** `channel_moves`: borrar una versión apuntada por un canal manual
+exige el `confirm_token` del plan aunque ninguna base se toque.
+
+### 21.6 Lectura de canales por la API de integración (bearer)
+
+Base `/api/v1/integration`. Scope **`blueprint.read_channel`** (capacidad evaluada `blueprints.read`). Solo
+lectura, sin cuerpo; quedan auditadas como `integration.call`.
+
+| Ruta | Para qué |
+|---|---|
+| `GET /databases/{db_id}/channels/{channel_slug}` | Versión que sirve el canal para el blueprint **asignado a la base** |
+| `GET /blueprints/{model_id}/channels/{channel_slug}` | Lo mismo **sin necesitar una base**: lo que se lee antes de crear nada |
+
+`channel_slug`: 1 a 60 caracteres, se recorta y pasa a minúsculas. Respuesta `200` (`ResolvedChannelOut`), idéntica
+en las dos rutas, y **estricta**: o trae `version`, o es un `409 release_channel.*`; nunca `null` ni «la última».
+
+```json
+{ "data": { "slug": "stable", "mode": "manual", "version": "0004", "source": "pointer" } }
+```
+
+`mode` es informativo y no cambia cómo se interpreta `version`; `source` es siempre `pointer`. No se abre ninguna
+conexión a las bases al responder.
+
+**Autorización del destino**
+
+| Ruta | Regla |
+|---|---|
+| Por base | El blueprint sale de la base, nunca del llamador. Rigen la allowlist de servidores y, si el token la tiene, la de blueprints. Base inexistente o de un servidor fuera de la allowlist: el mismo `403 integration.server_not_allowed` |
+| Por blueprint, token **con** `blueprint_ids` | `model_id` debe estar en la lista (`403 integration.blueprint_not_allowed`). No se exige que tenga bases ni se mira la allowlist de servidores |
+| Por blueprint, token **sin** `blueprint_ids` | El blueprint debe tener bases y todas en servidores de la allowlist; si no, `403 integration.server_not_allowed` |
+| `model_id` inexistente | Responde igual que uno no permitido (`403`), para no revelar qué ids existen |
+
+Para aprovisionar, el token debe emitirse **con `blueprint_ids`**: antes de la primera base la ruta por base no
+sirve, y la ruta por blueprint sin esa lista se niega. Un token anterior a esta función no trae
+`blueprint.read_channel`: hay que emitir uno nuevo o hacer `PATCH` con la lista completa de `scopes`. Si al emisor
+le bajan `blueprints.read`, el scope queda suspendido (`403 integration.scope_missing`).
+
+**Flujo recomendado para generar la base de un cliente** (token con `servers.list`, `blueprint.read_channel`,
+`engine_users.create`, `databases.create`, `databases.assign_blueprint`, `migrations.apply_forward`,
+`engine_users.assign_database`, `migrations.read_version`):
+
+1. `GET /blueprints/{model_id}/channels/{channel}` → versión vigente. Si es `409 release_channel.no_released_version`,
+   **detener**.
+2. `GET /servers` → elegir servidor.
+3. `POST /engine-users` → guardar la `password` devuelta (única vez).
+4. `POST /databases` → base vacía.
+5. `PUT /databases/{db_id}/blueprint` → asignar `model_id`.
+6. `POST /databases/{db_id}/migrations/apply` con `{"channel": "<canal>", "dry_run": true}`, revisar `blocked_by`,
+   repetir sin `dry_run`.
+7. `POST /engine-users/{user_id}/databases/{db_id}` → dar el perfil.
+8. `GET /databases/{db_id}/migrations/version` → confirmar `pending: []`.
+
+Si el canal es automático, el puntero puede moverse entre el paso 1 y el 6. Con `channel` en el paso 6 se aplica
+«lo vigente al aplicar»; con `version` se aplica exactamente lo leído en el paso 1.
+
+### 21.7 Códigos de error
+
+Todos viajan en `detail.public_context.code`. El modo inválido no tiene código propio: es el `422` estándar de
+Pydantic.
+
+| Código | HTTP | Cuándo |
+|---|:-:|---|
+| `release_channel.not_found` | 404 / 422 | El canal no existe (404 en la ruta, 422 si llega en un body o query) |
+| `release_channel.name_taken` / `release_channel.slug_taken` | 409 | Nombre o slug repetido |
+| `release_channel.environment_required` | 422 | `derived` sin entorno |
+| `release_channel.confirmation_required` | 422 | Borrar un canal con punteros sin `confirm_slug` correcto |
+| `release_channel.not_manual` | 409 | Promover un canal que no es manual |
+| `release_channel.version_not_found` / `release_channel.version_not_in_blueprint` | 422 | Versión inexistente / de otro blueprint |
+| `release_channel.version_unreviewed` | 409 | Promover una versión sin revisar |
+| `release_channel.promote_backward_requires_confirm` | 409 | Retroceso sin `confirm_slug` |
+| `release_channel.no_released_version` | 409 | El puntero no tiene valor para el blueprint (solo en consumidores) |
+| `release_channel.pointer_inconsistent` | 409 | El puntero apunta a una versión de otro blueprint |
+| `release_channel.target_conflict` | 422 | `channel` y `target_version`/`version` a la vez |
+| `environment.has_release_channels` | 409 | Borrar un entorno enlazado por canales |
+| `integration.blueprint_not_assigned` | 404 | Ruta por base: la base no tiene blueprint |
+| `integration.blueprint_not_allowed` / `integration.server_not_allowed` / `integration.scope_missing` | 403 | Ver autorización del destino |
+| `integration.token_invalid` / `integration.disabled` | 401 / 503 | Bearer inválido / integración apagada |
+
+Los `409 release_channel.*` de los consumidores son estrictos a propósito: no se tratan como «versión 0» ni se cae a
+«la última».
+
+### 21.8 Qué NO se verificó
+
+No hubo llamadas con un token real ni contra un servidor real; la pasada de arranque que rellena punteros no se
+probó con datos reales; los ejemplos salen de los schemas, no de una captura.
+
+---
+
+## 22. Tokens de integración y API `/integration`
+
+Dos superficies: la gestión de tokens (`/api/v1/integration-tokens`, con sesión, para personas) y la API de
+integración (`/api/v1/integration/...`, con bearer, para el backend de un proyecto web). Cómo habilitarla y
+operarla, en [`features/integration-api-tokens.md`](features/integration-api-tokens.md); guía para quien integra,
+en [`integration-api-contract.md`](integration-api-contract.md); el porqué, en `development/decisiones-e-incidentes.md`.
+
+Nace **apagada** (`INTEGRATION_API_ENABLED=false`). Apagada, `/integration/*` responde `503 integration.disabled` y
+la gestión no crea ni edita (listar y revocar siguen andando). El contrato tiene **13 scopes**: 5 de lectura,
+6 de escritura y 2 destructivos (`migrations.rollback`, `migrations.stamp`). Las rutas de lectura de canales
+(`blueprint.read_channel`) están detalladas en la §21.6.
+### 22.1 El bearer
+
+`Authorization: Bearer datumint.<public_id>.<secret>`. Solo el HMAC del secreto se guarda; el valor completo se
+muestra **una vez**, en la respuesta de creación. La cookie de sesión **no** autentica `/integration/*` y el
+bearer **no** autentica el resto de la API ni `/mcp/`.
+
+### 22.2 Gestión de tokens (`/api/v1/integration-tokens`, sesión + CSRF)
+
+Guard: `access.admin` **o** `integration_tokens.own` (los tres roles base). Con `integration_tokens.own` se
+administran solo los tokens propios; `access.admin` lista y revoca los de todos, no los edita.
+
+| Método y ruta | Qué hace | Notas |
+|---|---|---|
+| `GET /integration-tokens` | Lista (paginada) | `suspended_scopes` solo en los tokens propios |
+| `GET /integration-tokens/ceiling` | Scopes que quien llama puede otorgar hoy, `enabled`, `max_ttl_days`, `max_write_ttl_days` | Un scope que el rol no tiene **no aparece** (ni como deshabilitado) |
+| `POST /integration-tokens` | Emite un token; `201` con `token` (el bearer) | 10/min; `503` con el kill switch apagado |
+| `PATCH /integration-tokens/{token_pk}` | Reemplaza `name`, `scopes`, `server_ids`, `blueprint_ids`, `note` (lo enviado reemplaza) | El secreto, el TTL y el emisor no cambian |
+| `DELETE /integration-tokens/{token_pk}` | Revoca | `409` si ya estaba revocado |
+
+Todo método no seguro (alta, edición y revocación) exige **step-up fresco** de la persona, por el guard de la
+ruta; la máquina que usa el token nunca lo responde, así que la contraseña de quien emite se paga al otorgar el
+scope.
+
+`POST` acepta `{name (3..128), scopes[≥1], server_ids[], blueprint_ids[], expires_in_days?, note?}` con
+`extra="forbid"`. No hay campo de secreto.
+
+#### Reglas de emisión
+
+- **Vocabulario cerrado**: cada scope pertenece a la lista de abajo; cualquier otro valor (incluidas capacidades
+  reales como `access.admin`, `data.read` o `blueprints.apply`) es `422 integration_token.unknown_scope`.
+- **Techo del emisor**: un scope que quien emite no tiene hoy es `403 integration_token.scope_not_allowed`.
+- **Allowlist de servidores obligatoria** (`422 integration_token.server_allowlist_required`).
+- **TTL**: 90 días con solo lectura, 30 con cualquier scope de escritura (`INTEGRATION_TOKEN_MAX_TTL_DAYS`,
+  `INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS`). Excederlo es `422 integration_token.ttl_too_long` con `max_days`; una
+  edición que lo excede deja el token intacto.
+- **Sin expiración**: `never_expires: true` en la emisión (excluyente con `expires_in_days`) deja `expires_at: null`.
+  Solo con `INTEGRATION_ALLOW_NON_EXPIRING_TOKENS=true`, y nunca con scopes destructivos (tampoco se pueden agregar
+  después). `GET /integration-tokens/ceiling` informa `allow_non_expiring`.
+- **Scopes suspendidos**: lo efectivo es `guardado ∩ vocabulario ∩ lo que el emisor tiene hoy`. Si el emisor
+  pierde una capacidad, el scope queda suspendido en el acto (se informa en `suspended_scopes`) y vuelve si
+  la recupera; no se puede volver a agregar mientras esté suspendido, sí quitar.
+
+### 22.3 Scopes
+
+| Scope | Nivel | Capacidad evaluada | Ruta |
+|---|---|---|---|
+| `servers.list` | lectura | `servers.read` | `GET /integration/servers` |
+| `databases.list` | lectura | `databases.read` | `GET /integration/databases?server_id=` |
+| `blueprint.read_assigned` | lectura | `blueprints.read` | `GET /integration/databases/{db_id}/blueprint` |
+| `blueprint.read_channel` | lectura | `blueprints.read` | `GET /integration/databases/{db_id}/channels/{channel_slug}` · `GET /integration/blueprints/{model_id}/channels/{channel_slug}` |
+| `migrations.read_version` | lectura | `blueprints.read` | `GET /integration/databases/{db_id}/migrations/version` |
+| `databases.create` | escritura | `databases.write` | `POST /integration/databases` |
+| `engine_users.create` | escritura | `engine_users.write` | `POST /integration/engine-users` |
+| `engine_users.assign_profile` | escritura | `engine_users.write` | `POST /integration/engine-users/{user_id}/profiles/{profile_id}` |
+| `engine_users.assign_database` | escritura | `engine_users.write` | `POST /integration/engine-users/{user_id}/databases/{db_id}` |
+| `databases.assign_blueprint` | escritura | `databases.write` | `PUT /integration/databases/{db_id}/blueprint` |
+| `migrations.apply_forward` | escritura | `blueprints.apply` | `POST /integration/databases/{db_id}/migrations/apply` |
+| `migrations.rollback` | **destructivo** | `blueprints.apply` | `POST /integration/databases/{db_id}/migrations/rollback` |
+| `migrations.stamp` | **destructivo** | `blueprints.apply` | `POST /integration/databases/{db_id}/migrations/stamp` |
+
+Ningún scope se publica en `/authz/catalog`: son un vocabulario propio, que **mapea** a capacidades existentes.
+
+### 22.4 Operaciones
+
+Todas las respuestas usan `ApiResponse[T]`. Los cuerpos rechazan campos desconocidos (`422`): `force`,
+`password`, `model_id` al crear una base, etc. no se ignoran en silencio.
+
+| Operación | Cuerpo | Respuesta |
+|---|---|---|
+| `GET /servers` | — | `[{id, name, engine}]`: solo los de la allowlist que el emisor puede leer; sin host ni puerto |
+| `GET /databases` | `server_id` (query, obligatorio) | `[{id, name, server_id, model_id, model_version, environment_id, status, charset, collation}]` |
+| `GET .../blueprint` | — | `{model_id, name, slug, model_version}`; `404 integration.blueprint_not_assigned` si no hay |
+| `GET .../channels/{channel_slug}` | — | `{slug, mode, version, source}` (resolver estricto: `409 release_channel.*` si no resuelve) |
+| `GET .../migrations/version` | — | `{current_version, latest_version, pending[]}` |
+| `POST /databases` | `{name, server_id, owner_id, environment_id?, charset?, collation?, notes?}` | `201`, base **vacía** (el blueprint se asigna y aplica con sus scopes) |
+| `POST /engine-users` | `{server_id, username, host?, notes?}` | `201` con `password` generada por el gateway; **única vez**, no se puede releer |
+| `POST .../profiles/{profile_id}` | `{object_mappings[≥1]}` (nivel ≠ `global`, `object_ref.database` obligatorio) | `ApplyProfileResult` |
+| `POST .../databases/{db_id}` | `{profile_id}` (el mapeo lo arma el gateway) | `ApplyProfileResult` |
+| `PUT .../blueprint` | `{model_id}` | Base actualizada; repetir el mismo es éxito sin cambios |
+| `POST .../migrations/apply` | `{version?, dry_run?}` | `MigrationApplyOut`; `force=False` y `on_failure="auto"` fijos |
+| `POST .../migrations/rollback` | `{from_version, to_version}` (ambas obligatorias) | `MigrationRollbackOut`; sin `dry_run`, `force` ni `purge` (`422`) |
+| `POST .../migrations/stamp` | `{expected_current_version, version}` (la clave es obligatoria; puede ser `null`) | `MigrationStatusOut`; sin `force` ni `purge` (`422`) |
+
+Reglas que cambian el resultado:
+
+- **Servidor desconocido o fuera de la allowlist**: un mismo `403 integration.server_not_allowed` (no se pueden
+  enumerar ids). Un blueprint fuera de la allowlist del token: `403 integration.blueprint_not_allowed`.
+- **Perfiles**: un perfil con cualquier ítem que delega poder (`ALL PRIVILEGES`, `GRANT OPTION`) es
+  `403 integration.profile_requires_grant_admin` **antes** de aplicar un solo grant. Un usuario de otro servidor
+  o inexistente, o una base no gestionada en su servidor, es `409 integration.server_mismatch`.
+- **Blueprint**: reemplazar uno ya asignado es `409 integration.blueprint_already_assigned`.
+- **Migraciones**: una `version` menor a la actual es `422 integration.migration_target_not_forward`; la actual
+  es un no-op exitoso. La guarda de migraciones destructivas de los entornos protegidos rige como para una persona.
+
+#### Nivel destructivo (`migrations.rollback`, `migrations.stamp`)
+
+Sobre lo anterior, y siempre antes de tocar nada (ninguna de estas negativas deja una fila `attempt`):
+
+- **Allowlist de blueprints obligatoria** en el token (`422 integration_token.blueprint_allowlist_required` al
+  emitir o editar). En la llamada, una base sin blueprint, o fuera de la allowlist, o un token con la allowlist
+  vaciada, es `403 integration.blueprint_not_allowed` (falla cerrado).
+- **Entorno**: un entorno que bloquea migraciones destructivas es `409 integration.environment_blocks_destructive`; una
+  base **sin entorno** es `409 integration.environment_unclassified` (el flujo humano la deja pasar; una máquina no).
+- **Cuarentena**: base en `error` es `409 integration.database_quarantined`.
+- **Rollback**: compare-and-set en ambos extremos (`from_version` debe ser la versión viva, lo valida el
+  controlador con `422`; `to_version` debe ser anterior). No hay "un paso atrás" ni "volver a la base". **Prueba de
+  historial**: cada versión que se desharía tiene que constar, en su última fila de `database_migration_history`,
+  como `up` exitoso con el `checksum` que el blueprint tiene hoy; si no, `409 integration.rollback_unapplied_version`
+  (con `versions[]`). Una versión solo marcada con `stamp`, editada después de correr, o con fila legada sin
+  dirección, no tiene prueba.
+- **Stamp**: `expected_current_version` distinto de la versión viva es `409 integration.stamp_version_conflict`;
+  contabilidad huérfana es `409 integration.stamp_orphan_accounting`; marcar la versión en la que ya está es un
+  `200` sin cambios, auditado y sin llegar al controlador. Nunca limpia una cuarentena.
+- **Step-up al emitir**: agregar o editar un scope destructivo exige un step-up de `blueprints.apply` **de la persona
+  que emite** (en tiempo de ejecución el bearer no lo pide, como en el resto). Con `STEP_UP_ENFORCED=false` se
+  respeta el interruptor global. TTL máximo `INTEGRATION_DESTRUCTIVE_TOKEN_MAX_TTL_DAYS` (7 días).
+- **Auditoría**: `audit.record_intent` (falla cerrado, `500` y no se ejecuta nada) con acción
+  `integration.migration.rollback` / `integration.migration.stamp`, antes de delegar en el controlador humano.
+- **Cupo**: `INTEGRATION_DESTRUCTIVE_RATE_LIMIT` (`5/minute`) por token, además de los de lectura y escritura.
+
+Los errores propios del controlador (versión de confirmación distinta `422`, falta `down_sql` `409`, captura sin revisar
+`409`, checkpoint parcial `409`, versión desconocida `422`) llegan sin cambios.
+
+### 22.5 Códigos de error (`public_context.code`)
+
+| Código | HTTP | Cuándo |
+|---|---|---|
+| `integration.disabled` | 503 | Kill switch apagado |
+| `integration.token_invalid` | 401 | Bearer ausente, malformado, desconocido, revocado, vencido o con emisor inactivo (misma respuesta byte a byte) |
+| `integration.scope_missing` | 403 | El token no tiene el scope efectivo de la ruta |
+| `integration.server_not_allowed` | 403 | Servidor fuera de la allowlist o inexistente |
+| `integration.blueprint_not_allowed` | 403 | Blueprint fuera de la allowlist del token |
+| `integration.profile_requires_grant_admin` | 403 | El perfil delega poder |
+| `integration.blueprint_already_assigned` | 409 | La base ya tiene otro blueprint |
+| `integration.server_mismatch` | 409 | Usuario o base de otro servidor |
+| `integration.blueprint_not_assigned` | 404 | La base no tiene blueprint |
+| `integration.migration_target_not_forward` | 422 | Versión objetivo anterior a la actual |
+| `integration.environment_blocks_destructive` | 409 | El entorno de la base bloquea operaciones destructivas |
+| `integration.environment_unclassified` | 409 | La base no tiene entorno asignado |
+| `integration.database_quarantined` | 409 | La base está en cuarentena |
+| `integration.rollback_unapplied_version` | 409 | Una versión a revertir no consta como aplicada por el gateway con su definición actual |
+| `integration.stamp_version_conflict` | 409 | `expected_current_version` no coincide con la versión viva |
+| `integration.stamp_orphan_accounting` | 409 | La base tiene contabilidad de migraciones huérfana |
+| `integration_token.blueprint_allowlist_required` | 422 | Un scope destructivo exige allowlist de blueprints |
+| `integration_token.not_found` | 404 | Token ajeno o inexistente |
+| `integration_token.ttl_too_long` | 422 | TTL por encima del tope del nivel (`max_days`); también `never_expires` con un scope destructivo |
+| `integration_token.non_expiring_not_allowed` | 422 | `never_expires: true` con `INTEGRATION_ALLOW_NON_EXPIRING_TOKENS` apagado |
+| `integration_token.scope_not_allowed` | 403 | El emisor no tiene la capacidad del scope |
+| `integration_token.unknown_scope` | 422 | Scope fuera del vocabulario |
+| `integration_token.server_allowlist_required` | 422 | Falta la allowlist de servidores |
+| `integration_token.already_revoked` | 409 | El token ya estaba revocado |
+| `integration_token.server_not_found` | 422 | Un `server_ids` no existe |
+| `integration_token.blueprint_not_found` | 422 | Un `blueprint_ids` no existe |
+
+Además, `429` con `Retry-After` al superar el cupo por token (`INTEGRATION_RATE_LIMIT`, y el de escritura
+`INTEGRATION_WRITE_RATE_LIMIT` en los de escritura, `INTEGRATION_DESTRUCTIVE_RATE_LIMIT` en los destructivos) y `429` por IP al superar los rechazos de credencial
+(`INTEGRATION_AUTH_FAILURE_RATE_LIMIT`).
+
+### 22.6 Auditoría
+
+Cada llamada autenticada deja `integration.call` con `actor_type = "integration"`, `integration_token_id` = PK del
+token, `admin_id` = el emisor y `admin_username = "integration:<public_id>"`. `GET /audit-log?actor_type=integration`
+filtra por ellas. La gestión deja `integration_token.create|update|revoke` con la persona como actor. Ninguna fila
+lleva el secreto ni la contraseña generada.
+
+### 22.7 Variables de entorno
+
+`INTEGRATION_API_ENABLED` (`false`), `INTEGRATION_TOKEN_MAX_TTL_DAYS` (`90`), `INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS`
+(`30`, no puede superar la anterior), `INTEGRATION_RATE_LIMIT` (`120/minute`), `INTEGRATION_WRITE_RATE_LIMIT`
+(`20/minute`), `INTEGRATION_DESTRUCTIVE_TOKEN_MAX_TTL_DAYS` (`7`, no puede superar el de escritura: con
+`INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS` menor a 7 hay que bajar también este), `INTEGRATION_DESTRUCTIVE_RATE_LIMIT`
+(`5/minute`), `INTEGRATION_AUTH_FAILURE_RATE_LIMIT` (`30/minute`). Se leen una vez al importar
+`app/core/environments.py`: cambiarlas exige reinicio.
+
+---
+
+## 23. Aprobación de versiones destructivas para producción
+
+Una versión **destructiva** (`DROP`, `TRUNCATE`, `DELETE` sin `WHERE`, `ALTER ... DROP COLUMN`) no queda bloqueada
+para siempre en un entorno con `blocks_destructive_migrations`: se ejecuta si **otra persona** la aprobó antes. La
+aprobación solo escribe metadatos del gateway; ejecutar es el `apply` / `rollback` de siempre. Cómo se usa, en
+[`features/environments.md`](features/environments.md) y [`features/model-migrations.md`](features/model-migrations.md);
+el porqué, en `development/decisiones-e-incidentes.md`.
+### 23.1 Capacidades
+
+| Capacidad | Eje | Roles | Step-up | Qué protege |
+|---|---|---|:-:|---|
+| `blueprints.approve_destructive` | entorno | owner (sensible) | ✓ (salvo revocar) | Aprobar y revocar aprobaciones |
+| `blueprints.apply_destructive` | entorno | owner (sensible) | ✓ | Ejecutar una versión destructiva ya aprobada en un entorno protegido |
+
+Ninguna la tiene un token de integración ni el MCP (`agent_allowed=false`). El conjunto sensible pasa de 17 a 19.
+Aprobar y ejecutar son capacidades separadas: quien ejecuta puede ser el autor, o la misma persona que aprobó.
+
+### 23.2 Endpoints
+
+| Método y ruta | Capacidad | Qué hace |
+|---|---|---|
+| `GET /database-models/{id}/destructive-versions` | `blueprints.read` | Versiones destructivas del blueprint, una fila por dirección. Query `managed_database_id` opcional |
+| `POST /database-models/{id}/migrations/{version}/destructive-approvals` | `approve_destructive` + step-up | Aprueba para **todo el blueprint** (alcance `blueprint`). `201` |
+| `POST /managed-databases/{db_id}/migrations/{version}/destructive-approvals` | `approve_destructive` + step-up | Aprueba para **una base** (alcance `database`). `201` |
+| `POST /database-models/{id}/destructive-approvals/batch` | `approve_destructive` + step-up | Aprueba **varias versiones** con alcance `blueprint`. `200`, resultado parcial por ítem |
+| `POST /managed-databases/{db_id}/destructive-approvals/batch` | `approve_destructive` + step-up | Lo mismo con alcance `database`. `200` |
+| `POST /destructive-approvals/{approval_id}/revoke` | `approve_destructive`, **sin step-up** | Revoca. Idempotente |
+
+`{version}` cumple `^\d{4,10}$`. Todas responden con `ApiResponse[T]`.
+
+#### Listar (`GET .../destructive-versions`)
+
+Devuelve `list[DestructiveVersionOut]`: `migration_id`, `version`, `name`, `direction` (`up` | `down`), `sql_hash`,
+`reasons_by_engine`, `author`, `last_sql_editor`, `author_unknown`, `approval_status`, `effective_approval_id` y
+`approvals[]` (historial completo, la más reciente primero).
+
+- `sql_hash` es el hash **actual** del SQL de esa dirección y es el `expected_sql_hash` que hay que enviar al aprobar.
+- `approval_status` es `approved`, `unapproved`, `revoked` o `stale_hash`. Con `managed_database_id` se evalúa para
+  esa base (sus aprobaciones y las del blueprint); sin él, solo cuentan las de alcance `blueprint`.
+- `stale_hash`: hay una aprobación vigente, pero de otro SQL (se editó después) o con otra `hash_basis`. **Nunca se
+  toma por aprobada**: hay que re-aprobar.
+- Una dirección `down` solo aparece si hay `down_sql`.
+
+#### Aprobar
+
+Body (igual en las dos rutas): `{direction, expected_sql_hash, reason}`.
+
+| Campo | Regla |
+|---|---|
+| `direction` | `up` (aplicar) o `down` (revertir). Una **no cubre** a la otra: el `down_sql` es otro SQL con otro hash |
+| `expected_sql_hash` | 64 hex. Debe coincidir con el SQL actual; si no, `409 destructive_approval.sql_changed` |
+| `reason` | 10 a 500 caracteres, recortado antes de medir |
+
+Reglas:
+
+- **Cuatro ojos.** El aprobador debe ser una persona distinta del **creador** y del **último editor del SQL**.
+  Si no: `409 access.self_approval_forbidden`, con `public_context.rule` = `creator` o `last_editor`. Para un token
+  de API, la persona es quien lo emitió.
+- **Autoría desconocida.** Las versiones anteriores a esta función no tienen último editor. Se permite aprobar y la
+  aprobación queda con `author_unknown: true` (y la auditoría lo dice).
+- **Alcance `blueprint`** cubre las bases actuales y las que se creen después, pero solo las de entornos protegidos.
+  Exige la capacidad en **cada** entorno que bloquea lo destructivo (activo o no): un owner acotado a `staging` no
+  puede pre-aprobar bases futuras de producción.
+- **Alcance `database`** exige la capacidad en esa base. Gana sobre una aprobación `blueprint` cuando existen las dos.
+- **Re-aprobar tras editar el SQL** reemplaza la aprobación anterior en la misma transacción
+  (`revoke_reason: "superseded"`). Aprobar el mismo hash dos veces: `409 destructive_approval.duplicate`.
+- **Sin vencimiento.** Una aprobación vale hasta que se revoca o se edita el SQL.
+- Un actor máquina (integración, MCP) no aprueba: `403 destructive_approval.machine_actor`.
+
+Respuesta `DestructiveApprovalOut`: `id`, `model_migration_id`, `database_model_id`, `version`, `direction`, `scope`,
+`managed_database_id`, `sql_hash`, `hash_basis` (`raw_source_v1`), `destructive_summary`, `author`,
+`last_sql_editor`, `author_unknown`, `reason`, `approved_by`, `approved_at`, `is_live`, `revoked_at`, `revoked_by`,
+`revoke_reason`, `last_executed_at`, `last_executed_by`, `execution_count`.
+
+#### Aprobar en lote
+
+Body (igual en las dos rutas): `{reason, items: [{version, direction, expected_sql_hash}]}`. El `reason` es único
+para todo el lote y queda registrado en cada aprobación. Entre 1 y 100 ítems; repetir `(version, direction)` es `422`.
+
+Cada ítem sigue **exactamente** las reglas de «Aprobar» (hash, cuatro ojos, alcance, reemplazo, duplicado): el lote no
+tiene ningún atajo. El resultado es **parcial**: responde `200` aunque algún ítem falle, y los ítems que pasan quedan
+aprobados (cada uno en su transacción, con su entrada de auditoría). Si el cliente necesita todo-o-nada, tiene que
+revocar lo aprobado.
+
+Respuesta: `{total, approved_count, failed_count, results[]}`. Cada resultado trae `version`, `direction`, `status`
+(`approved` | `failed`), `approval` (un `DestructiveApprovalOut`, solo si `approved`) y `error`
+(`{code, message, status_code, rule}`, solo si `failed`). Los `code` son los de la aprobación individual; un error
+inesperado de un ítem sale como `destructive_approval.batch_item_failed` (500) y el detalle va al log.
+
+Lo que no depende del ítem corta **toda la petición** antes de aprobar nada: `403 access.forbidden` (en el alcance
+`blueprint`, falta la capacidad en algún entorno protegido), `403 destructive_approval.machine_actor` y `403
+access.step_up_required`.
+
+#### Revocar
+
+Body: `{reason}` (10 a 500). Pueden revocar: quien aprobó, **o** quien tiene `approve_destructive` en el alcance de
+la aprobación, o un owner. **`access.admin` no tiene camino**: no es operativa por diseño del catálogo.
+
+- Afecta solo ejecuciones futuras. No toca lo ya aplicado.
+- **Idempotente**: revocar una aprobación ya revocada o reemplazada responde `200` con la fila tal cual (mismo
+  revocador y fecha). No existe `already_revoked`.
+- No exige step-up: frenar una operación destructiva no puede costar más que lanzarla.
+- Un `approval_id` que no existe, o que el actor no puede ver, responde `404` o `403`.
+
+### 23.3 Extensiones: el flujo dry-run, token, re-tipeo, step-up
+
+Se aplica igual a **apply**, **rollback** y **apply-all** cuando el entorno de la base bloquea lo destructivo y hay
+versiones destructivas en juego. Una base sin entorno, o en un entorno que no bloquea, **no cambia**.
+
+1. **Dry-run.** Devuelve el plan. Solo si todas las versiones están aprobadas **y** quien consulta es una persona con
+   `apply_destructive` en la base, trae un `confirm_token`.
+2. **Ejecución.** Se envía el `confirm_token` y el re-tipeo (`confirm_name` o `confirm_phrase`). Todo bajo step-up.
+3. **Re-chequeo.** El servidor vuelve a resolver las aprobaciones en una sesión nueva al ejecutar: una revocación
+   entre el plan y la ejecución se rechaza.
+
+El token vale **300 s** y ata el conjunto exacto de aprobaciones. El re-tipeo lo valida el **servidor**: el token da
+frescura, no intención. `force` **no** interviene en nada de esto.
+
+#### Aplicar a una base — `POST /managed-databases/{id}/migrations/apply`
+
+Query nuevos: `confirm_token` (≤200) y `confirm_name` (≤128, el nombre exacto de la base).
+
+El dry-run trae `blocked_by` (versiones sin aprobación vigente) y `destructive_plan`:
+`{direction, requires_confirmation, executor_allowed, all_approved, versions[], confirm_token, expires_at,
+confirm_name_expected}`. Cada elemento de `versions[]`: `version`, `migration_id`, `sql_hash`, `reasons`,
+`approval_status`, `approval_id`, `approval_scope`.
+
+#### Revertir — `POST /managed-databases/{id}/migrations/rollback`
+
+**Cambio de comportamiento.** El rollback antes no miraba el entorno. Ahora, si el `down_sql` de alguna versión del
+camino es destructivo en un entorno protegido, exige una aprobación de dirección `down` (la `up` no alcanza),
+`apply_destructive`, token y re-tipeo.
+
+Query nuevos: `dry_run`, `confirm_token`, `confirm_name`. `confirm_version` pasa a ser **opcional solo con
+`dry_run=true`**; sin dry-run y sin él responde `422`. El dry-run no escribe en el motor y devuelve
+`rollback_path_versions`, `blocked_by` y `destructive_plan` con `direction: "down"`.
+
+#### Aplicar a todas — `POST /database-models/{id}/migrations/apply-all`
+
+Query nuevos: `confirm_token` (≤200) y `confirm_phrase` (≤128, el **slug del entorno**, por ejemplo `production`).
+
+El dry-run suma al resultado `destructive_confirmation`: `{required, confirm_token, expires_at, environment_slug,
+environment_slugs, entry_count, executor_allowed, all_approved, unapproved_databases[]}` y, por ítem,
+`destructive_plan` sin token. Un único token respalda todo el lote. No se emite si el lote toca más de un entorno
+protegido.
+
+**Cambio de contrato intencional: `apply-all` es todo o nada para las bases protegidas.** Antes, una base con una
+versión destructiva sin aprobar fallaba en su ítem (`error_code`) y las demás se aplicaban, con respuesta `200`.
+Ahora el preflight corre **antes de ejecutar la primera base**: si una versión no está aprobada, o falta el token, la
+capacidad o el re-tipeo, **toda la petición** responde con error y **no se ejecuta ninguna base**. Un cliente que
+leía `items[].error_code` para este caso debe leer el `409` de la petición. Los rechazos por ítem quedan solo como
+defensa ante carreras (una revocación a mitad del lote).
+
+Una máquina no pasa por el preflight: cada ítem se rechaza con `environment.destructive_blocked`, como antes.
+
+### 23.4 Códigos de error
+
+Todos viajan en `detail.public_context.code`.
+
+| Código | HTTP | Cuándo |
+|---|:-:|---|
+| `environment.destructive_blocked` | 409 | Versión sin aprobación vigente (sin aprobar, revocada o con SQL cambiado). Trae `environment_slug`, `blocked_versions`, `direction`, `approved_versions` y `approval_status` por versión. En `apply-all` trae `blocked_databases[]` |
+| `access.self_approval_forbidden` | 409 | El aprobador es el creador o el último editor (`rule`) |
+| `destructive_approval.not_found` | 404 | Versión o aprobación inexistente |
+| `destructive_approval.not_destructive` | 422 | Ese SQL no es destructivo: no hay nada que aprobar |
+| `destructive_approval.down_sql_missing` | 422 | Dirección `down` sin `down_sql` |
+| `destructive_approval.scope_invalid` | 422 | La base no usa este blueprint |
+| `destructive_approval.sql_changed` | 409 | `expected_sql_hash` distinto del SQL actual |
+| `destructive_approval.duplicate` | 409 | Ya hay una aprobación vigente igual |
+| `destructive_approval.machine_actor` | 403 | Una máquina intentó aprobar |
+| `destructive_approval.executor_forbidden` | 403 | Falta `blueprints.apply_destructive` en la base |
+| `destructive_approval.confirmation_required` | 409 | Falta el `confirm_token`, o las aprobaciones cambiaron desde el plan |
+| `destructive_approval.confirmation_invalid` | 422 | Token alterado o de otro conjunto de versiones/aprobaciones |
+| `destructive_approval.confirmation_expired` | 410 | Token vencido: pedir un dry-run nuevo |
+| `destructive_approval.confirm_phrase_mismatch` | 422 | El re-tipeo no coincide (nombre de la base o slug del entorno) |
+| `destructive_approval.batch_item_failed` | 500 | Solo dentro de un ítem de la aprobación en lote: error inesperado, el detalle está en el log |
+| `destructive_approval.batch_multi_environment` | 422 | El lote toca más de un entorno protegido: filtrar por `environment_id` |
+
+### 23.5 Cosas que sorprenden
+
+- **Los rollbacks destructivos ahora necesitan aprobación `down`.** Un `down_sql` que borra lo que creó el `up`
+  (`DROP TABLE`) cuenta. Quien tenía rollbacks de producción en un runbook debe aprobar la dirección `down` antes.
+- **Integración y MCP no consumen aprobaciones.** Aunque exista una aprobación vigente, `apply` por integración sigue
+  respondiendo `409 environment.destructive_blocked`.
+- **`POST /managed-databases` (alta con `apply_migrations`) no las consume.** El alta no lleva `confirm_token`: la
+  base se crea igual (201) y la migración falla con `migration.ok = false` y `migration.error_code` en
+  `destructive_approval.confirmation_required` (había aprobación) o `environment.destructive_blocked` (no la había).
+  Se termina con el `apply` de la base. `adopt` solo hace `stamp` (no ejecuta SQL), así que el guard no aplica.
+- **Editar el SQL invalida la aprobación**, no la borra: queda como evidencia con `stale_hash`.
+- **La aprobación sigue la versión por id**, no por número: renumerar o borrar versiones no la mueve.
+- **Desplegar esta versión cambia el resultado de `apply-all`** descripto arriba.
+
+---
+
+## 24. MCP: acceso de agentes (credenciales, tokens y tools)
+
+El MCP (`POST /mcp/`) deja que un agente lea el catálogo y, opcionalmente, datos de las bases del gateway. **Invariante
+vigente:** el MCP ejecuta únicamente `SELECT` únicos validados, dentro de una transacción `READ ONLY` y bajo una
+credencial por base con `SELECT` solamente; ninguna otra tool ejecuta SQL ni procedimientos, triggers, eventos o vistas.
+Orden de lectura: 24.1 credencial de solo lectura del servidor, 24.2 aprovisionarla, 24.3 estado de acceso por base, 24.4 credencial de datos, 24.5 scopes de datos y opt-in, 24.6 `search_schema`, 24.7 `draft_query`, 24.8 a 24.9 tools de datos, 24.10 definiciones y estadísticas, 24.11 tools de blueprints, 24.12 versión del motor. El transporte y las tools base del MCP (`list_databases`,
+`list_objects`, `get_schema`, `check_freshness`, `diff_schemas`, `list_environments`, `list_exports`, `list_clones`,
+`list_catalogs`) están descritos en `api-reference-v23.md` §9, eliminado (ver historial de git). Guía para colaboradores:
+[`features/mcp-para-colaboradores.md`](features/mcp-para-colaboradores.md).
+
+### 24.1 Credencial de solo lectura del servidor (manual)
+
+Relacionado con la credencial de **solo lectura** que el MCP usa para leer el catálogo de un motor
+(plan 12 §5.2). Lo consume la pantalla de detalle de servidor del frontend.
+
+#### Resumen para el frontend
+
+| Cambio | Ruta | Capacidad |
+|---|---|---|
+| Campos nuevos en `ServerOut` | todas las que devuelven un servidor | — |
+| Nuevo | `PUT /api/v1/servers/{server_id}/readonly-credential` | `servers.admin` + step-up |
+| Nuevo | `DELETE /api/v1/servers/{server_id}/readonly-credential` | `servers.admin` + step-up |
+| Parámetro nuevo | `POST /api/v1/servers/{server_id}/test-connection?credential=readonly` | `servers.read`, y escala a `servers.admin` + step-up con `credential=readonly` |
+| Campo nuevo en `ConnectionInfo` | respuesta de `test-connection` | — |
+
+Ningún contrato existente cambia de forma: todo es aditivo.
+
+#### `ServerOut`: dos campos nuevos
+
+```jsonc
+{
+  "has_readonly_credential": true,          // hay usuario y contraseña de solo lectura
+  "readonly_verified_at": "2026-10-02T15:04:05" // null = sin verificar (el MCP no lo lee)
+}
+```
+
+**Nunca** sale el usuario ni la contraseña de solo lectura, cifrados o en claro.
+
+`readonly_verified_at` vuelve a `null` cuando:
+
+- se registra o reemplaza la credencial (`PUT`);
+- la sonda negativa falla;
+- se quita la credencial (`DELETE`).
+
+Además, un `PATCH /servers/{id}` que **re-apunta** el servidor (cambia `host`, `port` o `engine`, o
+debilita un TLS `require` o más fuerte) **descarta la credencial de solo lectura** entera:
+`has_readonly_credential` vuelve a `false`. El `audit_log` lo registra como «credencial de solo
+lectura descartada por re-apuntado».
+
+#### `PUT /servers/{server_id}/readonly-credential`
+
+```json
+{ "username": "mcp_ro", "password": "…" }
+```
+
+- `extra="forbid"`: un campo de más es `422`.
+- Responde `ServerOut`, con `readonly_verified_at: null`. El mensaje recuerda que falta verificarla.
+- Auditado como `server.readonly_credential.set`, sin usuario ni contraseña.
+
+#### `DELETE /servers/{server_id}/readonly-credential`
+
+- Idempotente: quitarla dos veces no es un error.
+- Responde `ServerOut` con `has_readonly_credential: false`.
+- Auditado como `server.readonly_credential.clear`.
+
+#### `POST /servers/{server_id}/test-connection?credential=readonly`
+
+`credential` admite `root` (default, comportamiento de siempre) o `readonly`.
+
+Con `readonly` corre la **sonda negativa**: conecta con la credencial de solo lectura y exige que
+el motor observe que no puede escribir. Si pasa, fija `readonly_verified_at` y lo devuelve en
+`ConnectionInfo`:
+
+```jsonc
+{ "ok": true, "dialect": "mysql", "server_version": "8.0.36",
+  "readonly_verified_at": "2026-10-02T15:04:05" }
+```
+
+No cambia el `status` del servidor, que describe la conexión con la pseudo-root.
+
+Errores con `public_context.code`:
+
+| Código | Status | Cuándo |
+|---|---|---|
+| `server.readonly_credential_missing` | 409 | El servidor no tiene credencial de solo lectura registrada |
+| `server.readonly_probe_failed` | 422 | La credencial puede escribir. `public_context.violations` lista los motivos (`privilege:insert`, `global_privilege:select`, `select_on_mysql_schema`, `grant_option`, `unrecognized_grant`, `role_attribute:rolsuper`, `default_transaction_read_only_off`, `create_on_database`, `create_on_schema_public`, `member_of:pg_write_all_data`, `table_write_privileges`, `write_attempt_succeeded`) |
+| `access.step_up_required` | 403 | Falta la confirmación de contraseña (`servers.admin` la exige) |
+
+Los errores de conexión del motor son los mismos que en la prueba con `root`.
+
+**Sugerencia de UI:** un bloque «Acceso de agentes (MCP)» en el detalle del servidor, con el estado
+(sin credencial / sin verificar / verificada el …, vencida a los `MCP_READONLY_MAX_AGE_DAYS` días),
+un formulario de alta o reemplazo, el botón «Verificar» y el botón «Quitar». Cuando
+`server.readonly_probe_failed`, listar las `violations` como texto para el DBA.
+
+#### Scopes nuevos para tokens de agente
+
+`POST /api/v1/api-tokens` acepta ahora, además de `blueprints.read`, `databases.read` y
+`schema_diff.read` (ya existían en el techo), estos cuatro: `environments.read`, `exports.read`,
+`clones.read` y `catalogs.read`. El catálogo (`GET /authz/catalog`) los publica con
+`agent_allowed: true`. Un selector de scopes en el alta de tokens tiene que ofrecer los siete.
+
+#### Editar los scopes de un token (`PATCH /api-tokens/{id}`)
+
+Antes, para darle más scopes a un token había que emitir otro y cambiar `GATEWAY_MCP_TOKEN`. Los
+scopes viven en la fila (`api_tokens.scopes`) y no dentro del bearer, así que ahora se reemplazan
+sin tocar el secreto: el agente los ve **desde su llamada siguiente** (no hay caché), con el mismo
+bearer y sin abrir una terminal nueva.
+
+`PATCH /api/v1/api-tokens/{id}` — `id` es el `id` numérico del listado, no el `token_id`.
+Requiere `access.admin`, CSRF y step-up (todo método no seguro lo exige).
+
+```json
+{ "scopes": ["blueprints.read", "databases.read"] }
+```
+
+- **Solo `scopes`**, y la lista es el **reemplazo completo** (no suma ni resta). Cualquier otro
+  campo (`name`, `project_id`, …) es 422.
+- Respuesta 200: `ApiResponse[ApiTokenOut]` (el token con sus scopes nuevos, **sin secreto**).
+- Se valida contra el **techo de agente**, igual que el alta.
+- Auditoría: `api_token.update` con `scopes=[antes]->[después]`.
+
+| Código | Status | Cuándo |
+|---|---|---|
+| `api_token.scope_not_allowed` | 422 | Scope desconocido o fuera del techo de agente (`public_context.allowed` lo lista cuando es lo segundo) |
+| (validación de Pydantic) | 422 | Lista vacía (un token sin permisos se revoca) o campo extra |
+| `api_token.not_found` | 404 | El token no existe |
+| `api_token.already_revoked` | 409 | El token está revocado; no se edita (un token vencido sí) |
+| `access.step_up_required` | 403 | Falta la confirmación de contraseña |
+
+**Sugerencia de UI:** un botón de edición en las filas activas, junto a «Revocar», con el mismo
+selector de scopes del alta. Avisar que ampliar un token ya repartido amplía lo que puede hacer
+quien lo tenga.
+
+### 24.2 Aprovisionar la credencial de solo lectura (un click)
+
+Relacionado con 24.1: un solo click reemplaza el trío «el DBA crea la cuenta → `PUT` → `test-connection`».
+Lo consume el bloque «Acceso de agentes (MCP)» del detalle de servidor.
+
+#### Resumen para el frontend
+
+| Cambio | Ruta | Capacidad |
+|---|---|---|
+| Nuevo | `POST /api/v1/servers/{server_id}/readonly-credential/provision` | `servers.admin` + step-up |
+
+Aditivo: ningún contrato existente cambia. `PUT`/`DELETE .../readonly-credential` y
+`test-connection?credential=readonly` siguen siendo el camino manual.
+
+#### `POST /servers/{server_id}/readonly-credential/provision`
+
+- **Sin cuerpo.** Ni usuario, ni host, ni contraseña, ni grants: los fija el servidor
+  (`MCP_READONLY_ACCOUNT_USERNAME`, `MCP_READONLY_ACCOUNT_HOST` y una lista fija de privilegios).
+  Un cuerpo enviado se ignora.
+- **Respuesta 200:** `ApiResponse[ServerOut]` con `has_readonly_credential: true` y
+  `readonly_verified_at` cargado. **Nunca** devuelve usuario ni contraseña.
+- **Límite de tasa:** 3/minuto.
+- **Idempotente solo para cuentas propias:** si la cuenta existe y este servidor ya guarda una
+  credencial de solo lectura con ese usuario, rota la contraseña y re-aplica los grants; si existe y
+  no es propia, 409 `readonly_account.already_exists` sin cambios. Aprovisionar de nuevo invalida la
+  contraseña anterior (el gateway guarda la nueva, sin verificar, antes de que el motor cambie).
+  `SHOW_ROUTINE` solo se otorga en MySQL >= 8.0.20.
+- **Es una operación sobre el motor de un tercero** con la pseudo-root, y la credencial es **por
+  servidor**: alcanza todas sus bases no internas, no solo las de un proyecto. La UI tiene que
+  decirlo en la confirmación.
+- Auditoría: `server.readonly_credential.provision` (intención `attempt` y resultado
+  `success`/`error`), más los `set` y `verify` que ya existían. Sin usuario ni contraseña.
+- No existe una tool equivalente en el MCP, a propósito.
+
+Errores con `public_context.code`:
+
+| Código | Status | Cuándo |
+|---|---|---|
+| `server.readonly_probe_failed` | 422 | La cuenta creada puede escribir; `public_context.violations` lista los motivos. El servidor queda **sin verificar** y la credencial registrada, para corregir grants y reintentar |
+| `readonly_account.already_exists` | 409 | En el motor ya existe una cuenta con el usuario configurado y el gateway no la tiene guardada como credencial de solo lectura de este servidor. No se cambió nada: registrarla a mano (`PUT`) o cambiar `MCP_READONLY_ACCOUNT_USERNAME` |
+| `readonly_account.has_roles` | 409 | La cuenta propia (MySQL/MariaDB) tiene roles u otros grants que el aprovisionamiento no puede quitar. No se cambió nada: revocarlos en el motor y reintentar |
+| `readonly_provision.in_progress` | 409 | Ya hay un aprovisionamiento de este servidor en curso (lock por proceso). No se cambió nada: reintentar al terminar |
+| `engine_user.protected_account` | 409 | El nombre configurado es una cuenta reservada, la pseudo-root, o un rol PostgreSQL con privilegios de administración |
+| `access.step_up_required` | 403 | Falta la confirmación de contraseña |
+| (sin código) | 404 | El servidor no existe |
+| (sin código) | 4xx/5xx | Fallo del motor al crear la cuenta; los mismos mapeos que el resto de operaciones del motor. Es reintentable y deja `readonly_verified_at: null` |
+
+Los tres códigos `readonly_account.*` / `readonly_provision.*` viven en `app/services/server_catalog.py`. La UI debería mapearlos a un mensaje claro para el operador (mismas indicaciones que la columna «Cuándo»).
+
+**Sugerencia de UI:** un botón «Aprovisionar credencial» junto a «Registrar manualmente», con
+confirmación que diga que se usará la pseudo-root y que el alcance es todo el servidor. Si la base
+nueva no aparece en el MCP, la respuesta es repetir el aprovisionamiento (no cubre bases creadas
+después).
+
+### 24.3 Estado de acceso de agentes en `ManagedDatabaseOut`
+
+Cierra el pendiente de `api-reference-v24.md` §10.1: el estado de acceso de
+agentes (MCP) de cada base gestionada, que se escribía con `PUT /managed-databases/{id}/agent-access`
+pero no se devolvía en ninguna respuesta.
+
+#### Resumen para el frontend
+
+| Cambio | Dónde | Capacidad |
+|---|---|---|
+| Dos campos nuevos en `ManagedDatabaseOut` | toda ruta que devuelve una base | `databases.read` |
+
+Es un **cambio de forma del envelope**, aditivo: no hay rutas nuevas y ningún campo existente
+cambia. Ver la advertencia de la cabecera de `api-reference-v24.md` sobre cambios de forma.
+
+#### `ManagedDatabaseOut`: dos campos nuevos
+
+```jsonc
+{
+  "agent_access_allowed": false,  // opt-in por base; default false
+  "agent_access_blocked": false   // veto de emergencia; default false
+}
+```
+
+- `agent_access_allowed`: el opt-in. Es el eje que **decide** el alcance: sin esto en `true`,
+  ningún agente ve la base aunque su entorno los permita.
+- `agent_access_blocked`: el veto de emergencia. **Gana** sobre `allowed` y no tiene override. Con
+  `allowed: true, blocked: true` la base está cerrada; el campo crudo muestra igual los dos ejes.
+- Los dos tienen default `false`: una base recién creada está cerrada a agentes y un cliente que
+  no los conoce los ignora sin romperse. Un cliente nuevo debe leer un campo ausente como `false`
+  (falla cerrado), nunca como «abierta».
+
+Aparecen en: `POST`/`GET`/`PATCH` de `/managed-databases`, la lista, las bases de un usuario de
+servidor, las bases de un modelo (`ModelDatabaseStatusOut`) y la respuesta del propio
+`PUT .../agent-access`, que ahora confirma el estado resultante.
+
+#### Quién los ve
+
+Todo el que tenga `databases.read`. No hay filtro por `environments.write`: el incremento de
+información es chico (el entorno ya expone `allows_agent_access` y `list_databases` del MCP
+revela las abiertas). **Escribirlos** sigue siendo `environments.write` (`security_officer`) con
+step-up.
+
+#### Habilitar un entorno no abre ninguna base
+
+`PATCH /environments/{id}` con `allows_agent_access: true` (que exige `?confirm_slug=`) solo
+habilita la **posibilidad**. El default-deny es por base: cada una necesita su propio
+`agent_access_allowed = true`. Una pantalla debe decirlo, porque `allows_agent_access` en `true`
+con todas las bases en `false` significa que ningún agente ve nada.
+
+#### Auditoría
+
+`managed_database.agent_access_open` y `managed_database.agent_access_close` incluyen ahora en el
+`detail` el estado de acceso previo (`antes`). La semántica no cambia: abrir sigue siendo
+fail-closed.
+
+#### Orden de despliegue
+
+**Backend primero, frontend después.** El frontend define los campos con default `false`, así que
+contra un backend viejo todo se lee como cerrado; el orden inverso mostraría «cerrada» sobre
+bases que quizá estén abiertas.
+
+### 24.4 Credencial de DATOS por base gestionada
+
+Relacionado con 24.1 y 24.2 (credencial de solo lectura **por servidor**, que sirve a la
+estructura). Esta es la hermana **por base**: una cuenta del motor con `SELECT` sobre UNA base y nada
+más. Es la credencial que usan las tools de datos (`sample_rows`,
+`distinct_values`, `count_rows`, `run_select`). La sonda `POST .../verify` comprueba que sirve.
+
+#### Resumen para el frontend
+
+| Cambio | Ruta | Capacidad |
+|---|---|---|
+| Nuevo | `POST /api/v1/managed-databases/{db_id}/data-credential/provision` | `servers.admin` + step-up |
+| Nuevo | `DELETE /api/v1/managed-databases/{db_id}/data-credential` | `servers.admin` + step-up |
+| Nuevo | `POST /api/v1/managed-databases/{db_id}/data-credential/verify` | `servers.admin` + step-up |
+
+Aditivo. Nueva tabla `managed_database_data_credentials` (migración `e4a6c8f0b2d5`, vacía al
+desplegar) y nuevas variables `MCP_DATA_ACCOUNT_PREFIX` (default `mcp_d_`) y
+`MCP_DATA_CREDENTIAL_MAX_AGE_DAYS` (default `7`). No cambia ningún contrato
+existente ni `ManagedDatabaseOut`.
+
+#### `POST /managed-databases/{db_id}/data-credential/provision`
+
+- **Sin cuerpo.** Usuario (`MCP_DATA_ACCOUNT_PREFIX` + id de la base, p. ej. `mcp_d_42`), host
+  (`MCP_READONLY_ACCOUNT_HOST`), grants y contraseña los fija el servidor. Un cuerpo enviado se
+  ignora.
+- **Alcance POR BASE:** MySQL/MariaDB `GRANT SELECT ON <base>.*` y nada más (sin `SHOW VIEW`,
+  `TRIGGER`, `EVENT` ni privilegios globales), con `MAX_USER_CONNECTIONS 6` (cinco consultas más la
+  conexión del vigilante que cancela; una cuenta ya creada conserva su tope hasta regenerarla) y
+  `MAX_STATEMENT_TIME 30` en MariaDB. PostgreSQL: rol `LOGIN` sin atributos de administración,
+  `CONNECTION LIMIT 3`,
+  `default_transaction_read_only = on`, `statement_timeout = '30s'`, `CONNECT` sobre la base y
+  `USAGE` + `SELECT` por cada esquema de usuario. Una tabla creada después no queda cubierta hasta
+  repetir el aprovisionamiento.
+- **Respuesta 200:** `ApiResponse[DataCredentialOut]`: `managed_database_id`, `has_data_credential`,
+  `verified_at`, `probed_at`, `probe_violations`, `probe_warnings`, `data_access_allowed`. **Nunca**
+  devuelve usuario, contraseña ni el cifrado. Tras aprovisionar, `verified_at` es `null`: la sonda es
+  un paso aparte (`POST .../verify`) y hasta que pase ninguna tool de datos puede usar la credencial.
+- **Límite de tasa:** 3/minuto.
+- **Elegibilidad:** la base tiene que estar `active` (existir en el motor) y no ser una base de
+  sistema ni la base de metadatos del propio gateway.
+- **Idempotente solo para cuentas propias:** si la cuenta existe y esta base ya guarda una
+  credencial de datos con ese usuario, rota la contraseña y re-aplica el grant. Si existe y no es
+  propia: 409 sin cambios. El gateway guarda la contraseña nueva (cifrada, sin verificar) **antes**
+  de que el motor cambie, así que un reintento tras una falla a medias converge.
+- Auditoría: `managed_database.data_credential.provision` (intención `attempt`, fail-closed, y
+  resultado `success`/`error`). Sin usuario ni contraseña.
+- No existe una tool equivalente en el MCP, a propósito.
+
+#### `DELETE /managed-databases/{db_id}/data-credential`
+
+Palanca de emergencia, **idempotente**: sin credencial no hace nada. Con credencial, primero la
+des-verifica y cierra el opt-in (el corte es inmediato aunque el motor no conteste), después borra
+la cuenta del motor (`DROP USER` / `DROP ROLE`) y, solo si eso funcionó, la fila. Si el motor falla,
+responde el error del motor y la fila queda para que el reintento termine la revocación. Nunca borra
+una cuenta que el gateway no creó. **Hacerlo antes de bajar la migración**: borrar la tabla pierde
+la contraseña y deja huérfanas las cuentas del motor. Auditoría: `managed_database.data_credential.clear`.
+
+#### `POST /managed-databases/{db_id}/data-credential/verify`
+
+Sonda NEGATIVA. Sin cuerpo; 6/minuto; mismo lock por base que aprovisionar y revocar. Conecta con la
+cuenta de DATOS de esa base (nunca la pseudo-root) y exige que el motor muestre SELECT sobre
+**exactamente esa base**:
+
+- MySQL/MariaDB (`SHOW GRANTS FOR CURRENT_USER()`): sin privilegios globales salvo `USAGE`, sin ningún
+  privilegio que no sea `SELECT`, sin patrones con `_`/`%` sin escapar, sin grants sobre otras bases,
+  sin `GRANT OPTION`/roles/`PROXY` ni líneas que la sonda no entienda. El nombre se compara
+  distinguiendo mayúsculas salvo `lower_case_table_names` 1 o 2. Tablas `FEDERATED`/`CONNECT`/`SPIDER`
+  en la base **bloquean**.
+- PostgreSQL: sin atributos de administración, sin pertenencia a roles, cero privilegios de escritura
+  sobre relaciones de usuario (también los de `PUBLIC`), `default_transaction_read_only = on` e intento
+  real de escritura rechazado, `CONNECTION LIMIT` entre 1 y 3, `statement_timeout` fijado, sin `CONNECT`
+  explícito a otras bases y sin `dblink`/`postgres_fdw`/`mysql_fdw`/`file_fdw` (bloquean).
+
+**200** (`DataCredentialOut`): `verified_at` fijado y `probe_warnings` con lo no bloqueante
+(`cross_schema_view_reference`, `definer_views_present`, `public_connect_other_databases`,
+`create_on_database`, `create_on_schema_public`). **422** `managed_database.data_probe_failed`:
+`verified_at` queda en `null` (se BORRA la verificación anterior), `public_context.reasons` lleva
+códigos públicos cerrados y `public_context.violations` los motivos cortos; nunca texto de grants ni
+mensaje del motor. Si la sonda no pudo correr (motor caído), también se des-verifica y responde el error
+del motor. Auditoría: `managed_database.data_credential.verify`.
+
+| `reasons` | Motivos cortos (`violations`) |
+|---|---|
+| `CREDENTIAL_TOO_BROAD` | `global_privilege:*`, `extra_privilege:*`, `wildcard_database_pattern`, `select_outside_database`, `grant_option`, `unrecognized_grant`, `role_attribute:*`, `member_of:*`, `member_of_role` |
+| `WRITE_PRIVILEGE_PRESENT` | `privilege:*`, `all_privileges`, `table_write_privileges`, `default_transaction_read_only_off`, `write_attempt_succeeded` |
+| `FEDERATED_TABLE_PRESENT` | `foreign_engine_table`, `foreign_access_extension` |
+| `PROBE_NOT_GREEN` | `missing_select_on_database`, `connection_limit`, `statement_timeout_unset`, `engine_unsupported` |
+
+La verificación vale `MCP_DATA_CREDENTIAL_MAX_AGE_DAYS` (7) días; pasado el plazo, las tools de datos
+(entregas 5 y 6) la rechazan con `PROBE_NOT_GREEN`. Re-aprovisionar borra la verificación: la
+contraseña nueva no está verificada.
+
+#### Errores con `public_context.code`
+
+| Código | Status | Cuándo |
+|---|---|---|
+| `data_credential.account_already_exists` | 409 | En el motor ya existe una cuenta con ese usuario y el gateway no la creó. No se cambió nada: configurar otro `MCP_DATA_ACCOUNT_PREFIX` |
+| `data_credential.provision_in_progress` | 409 | Ya hay un aprovisionamiento o una revocación de esta base en curso (lock por proceso). No se cambió nada |
+| `data_credential.database_not_eligible` | 409 | La base no está `active`, es de sistema o es la base de metadatos del gateway |
+| `data_credential.missing` | 409 | `verify` sobre una base sin credencial de datos |
+| `managed_database.data_probe_failed` | 422 | La sonda observó que la credencial no es SELECT-only sobre esa base (ver `reasons` y `violations`) |
+| `engine_user.protected_account` | 409 | El usuario resultante es una cuenta reservada o un rol PostgreSQL con privilegios de administración |
+| `access.step_up_required` | 403 | Falta la confirmación de contraseña |
+| (sin código) | 404 | La base no existe |
+| (sin código) | 4xx/5xx | Fallo del motor; reintentable |
+
+Los códigos `data_credential.*` y `managed_database.data_probe_failed` viven en `app/services/data_credential_catalog.py`.
+
+### 24.5 Scopes de datos de un token y opt-in de datos por base
+
+Relacionado con 24.4 (credencial de DATOS por base). El catálogo de scopes tiene `data.read` y `data.query`, el emisor se
+re-autentica al darlos, cada base tiene un opt-in de datos con segundo aprobador y hay dos kill
+switches. Las tools de datos (24.6) exigen estos scopes.
+
+#### Resumen para el frontend
+
+| Cambio | Ruta | Capacidad |
+|---|---|---|
+| Nuevo | `GET /api/v1/managed-databases/{db_id}/data-credential` | `databases.read` |
+| Nuevo | `POST /api/v1/managed-databases/{db_id}/data-access/request` | `data.read` en el entorno + step-up |
+| Nuevo | `POST /api/v1/managed-databases/{db_id}/data-access/approve` | `data.read` en el entorno + step-up |
+| Nuevo | `DELETE /api/v1/managed-databases/{db_id}/data-access` | `data.read` en el entorno + step-up |
+| Cambia | `POST /api-tokens`, `PATCH /api-tokens/{id}` | aceptan `data.read` y `data.query` (ver abajo) |
+| Cambia | `GET /authz/catalog` | dos filas nuevas; `agent_allowed` + `discloses` + `requires_step_up` a la vez |
+
+`DataCredentialOut` gana `data_access_state` (`closed` / `pending` / `open`) y
+`data_access_second_approver_required` (aditivo, con default). Variables nuevas:
+`MCP_DATA_READ_ENABLED=false`, `MCP_DATA_QUERY_ENABLED=false`, `MCP_DATA_TOKEN_MAX_TTL_DAYS=0`
+(0 = sin tope propio de vida para los tokens de datos).
+
+#### Catálogo: `data.read` y `data.query`
+
+- Divulgan, exigen step-up, son del techo de agente, **no mutan**, eje `environment`, solo `owner`
+  (nunca `viewer`/`operator`) y **sensibles** (otorgarlas sueltas pide segundo aprobador): el conjunto
+  sensible pasa de 11 a 13.
+- Son la ÚNICA excepción cerrada a "un token nunca divulga" y a "step-up implica no agente"
+  (`AGENT_DATA_EXCEPTIONS`, invariante 13 del catálogo). Mutar no tiene excepción.
+
+#### Tokens (`/api-tokens`)
+
+- Un scope de datos exige un **step-up fresco del emisor** al crear y al editar: 403
+  `access.step_up_required` si la ventana venció. El token no tiene contraseña; la da quien lo emite.
+- Rastro `api_token.data_scope_grant` con `record_intent` **fail-closed** (500 y no se otorga si el
+  rastro no se persiste).
+- Vida de un token con scope de datos: por defecto **sin tope propio** (`MCP_DATA_TOKEN_MAX_TTL_DAYS=0`),
+  o sea que rige solo el tope general `MCP_TOKEN_MAX_TTL_DAYS` (90) y siguen sin existir tokens
+  perpetuos. Con `MCP_DATA_TOKEN_MAX_TTL_DAYS` >= 1 el tope propio vuelve: 422
+  `api_token.ttl_too_long` con `max_days`; en el PATCH cuenta la vida **restante** del token, y sin
+  `expires_in_days` el default (90) lo excede y también da 422 (hay que pedir el TTL explícito).
+- Con el kill switch de la capacidad apagado el scope se **guarda y se lista** pero el token no lo
+  ejerce (inerte). `GET /api-tokens` lo muestra igual para que un PATCH no lo pierda.
+
+#### Opt-in de datos por base
+
+Sin cuerpo en los tres. Capa 2 sobre la base: hace falta `data.read` EN su entorno (owner).
+
+- `POST .../data-access/request`: en `production` (y en bases sin entorno) el pedido queda `pending`;
+  en los demás entornos abre en el acto (`open`). Exige credencial de datos (409
+  `data_credential.missing`). 409 `data_access.already_open` si ya estaba abierto. Audita
+  `managed_database.data_access_request` / `_open` con `record_intent` fail-closed.
+- `POST .../data-access/approve`: lo aprueba **otro** owner. 403
+  `data_access.self_approval_forbidden` para el solicitante; 409 `data_access.not_pending` sin pedido.
+- `DELETE .../data-access`: cierra o cancela el pedido. Inmediato e idempotente; no toca el motor ni la
+  credencial (borrarla es `DELETE .../data-credential`). Audita `managed_database.data_access_close`.
+- Abrir NO alcanza para leer: el gate exige además credencial con sonda verde reciente y el kill
+  switch encendido.
+
+#### Errores con `public_context.code`
+
+| Código | Status | Cuándo |
+|---|---|---|
+| `data_access.self_approval_forbidden` | 403 | El solicitante intentó aprobar su propio pedido |
+| `data_access.not_pending` | 409 | `approve` sin un pedido pendiente |
+| `data_access.already_open` | 409 | `request` con el acceso ya abierto |
+| `data_access.identity_required` | 403 | El actor no es un usuario del gateway (fail-closed) |
+| `data_credential.missing` | 409 | La base no tiene credencial de datos |
+| `api_token.ttl_too_long` | 422 | Token que excede `MCP_TOKEN_MAX_TTL_DAYS`, o con scope de datos que excede `MCP_DATA_TOKEN_MAX_TTL_DAYS` (solo si es >= 1) |
+| `access.step_up_required` | 403 | Falta la confirmación de contraseña |
+
+Los de `data_access.*` viven en `app/services/data_credential_catalog.py`.
+
+### 24.6 Tool `search_schema`
+
+Relacionado con `api-reference-v23.md` §9 (transporte y tools del MCP). Agrega una tool de solo
+lectura y publica `annotations` en `tools/list`. No cambia ninguna ruta REST ni el frontend.
+
+#### Resumen
+
+| Cambio | Dónde | Scope |
+|---|---|---|
+| Tool nueva `search_schema` | `tools/list` / `tools/call` | `databases.read` |
+| `annotations` en cada tool de `tools/list` | `tools/list` | — |
+| Variable `MCP_SEARCH_MAX_TABLES` (default 200) | entorno del proceso | — |
+| Warnings `mcp.warn.search_scan_truncated`, `mcp.warn.search_results_truncated` | respuesta | — |
+
+Aditivo. Un token que ya tiene `databases.read` pasa a ver la tool nueva sin reemitirse.
+
+#### Entrada
+
+```jsonc
+{ "database_id": 12,          // el que devuelve list_databases
+  "query": "fecha nacimiento", // 2..100 caracteres tras recortar espacios
+  "kinds": ["table", "view", "column"], // opcional; default esos tres; también routine, trigger
+  "limit": 20 }                // opcional; 1..50, default 20
+```
+
+Schema cerrado: cualquier otra clave se rechaza. `query` vacía, solo espacios, sin letras ni
+dígitos, fuera de rango, o un `kinds`/`limit` inválido → error de tool `mcp.invalid_argument`,
+antes de abrir ninguna conexión.
+
+#### Salida (`structuredContent`)
+
+Mismo envelope que `get_schema` (`notice`, `untrusted_fields`, `clipped_fields`, `warnings`,
+`database`). `data`:
+
+| Campo | Significado |
+|---|---|
+| `query_tokens` | La consulta ya normalizada (sin acentos, sin palabras vacías) |
+| `hits[]` | Resultados ordenados por `score` descendente, desempate estable |
+| `count` / `total_matches` | Devueltos / coincidencias totales (puede haber más que `limit`) |
+| `truncated` | `true` si CUALQUIER motivo de `truncated_reasons` recortó la búsqueda |
+| `truncated_reasons` | `results_limit`, `scan_cap` (más tablas que `MCP_SEARCH_MAX_TABLES`), `time_budget` |
+| `scanned_tables` / `total_tables` | Tablas cuyo detalle se leyó / tablas de la base |
+| `searched_kinds` | Los tipos efectivamente buscados |
+| `next_step` | Cómo seguir con `get_schema` |
+
+Cada elemento de `hits[]`: `kind`, `name`, `table`, `column`, `data_type`, `key_flags[]`
+(`primary_key` / `foreign_key` / `unique`), `references` (`tabla.columna` de una FK), `comment`
+(texto de terceros, máx. 200 caracteres), `score`, `matched_on` (`name`, `name_and_table`,
+`comment`, `name_and_comment`), `matched_tokens[]` y `get_schema_object` (`{kind, name}` para
+`get_schema.objects`). Los nombres de tablas y vistas se buscan siempre; las columnas y los
+comentarios de tabla solo en las tablas leídas (ver `scanned_tables`).
+
+#### Errores
+
+Idénticos a `get_schema` (mismo gate de ocho ejes, misma credencial de solo lectura): una base que
+el token no alcanza responde `mcp.not_found`, igual que una inexistente; sin credencial vigente,
+`mcp.readonly_credential_missing`; sesión agotada, `mcp.session_timeout`.
+
+#### Privilegios
+
+**No hacen falta privilegios nuevos.** La credencial de solo lectura ya tiene `SELECT`,
+`SHOW VIEW`, `TRIGGER` y `EVENT` por base: alcanza para leer nombres, columnas y comentarios del
+catálogo, que es todo lo que la tool consulta. Ver
+[`docs/features/mcp-para-colaboradores.md`](features/mcp-para-colaboradores.md) (A.6).
+
+### 24.7 Tool `draft_query`
+
+Relacionado con `api-reference-v23.md` §9 (transporte y tools del MCP). Agrega una tool que
+**recibe un texto SQL y devuelve solo texto**. No cambia ninguna ruta REST ni el frontend, no
+agrega variables de entorno ni migraciones, y no abre ninguna conexión a un motor.
+
+#### Resumen
+
+| Cambio | Dónde | Scope |
+|---|---|---|
+| Tool nueva `draft_query` | `tools/list` / `tools/call` | `databases.read` |
+| Códigos públicos de razón y de advertencia del sobre | respuesta | — |
+| Invariante de v23 §9.5 (anterior): "no acepta SQL" pasa a "no **ejecuta** SQL" | documentación | — |
+
+Aditivo. Un token que ya tiene `databases.read` pasa a ver la tool nueva sin reemitirse.
+
+#### Entrada
+
+```jsonc
+{ "database_id": 12,   // el que devuelve list_databases
+  "sql": "UPDATE t SET a = 1" } // cualquier texto; el schema no fija un máximo a propósito
+```
+
+Schema cerrado: cualquier otra clave se rechaza (error de protocolo). Un `database_id` que no sea
+entero o un `sql` que no sea cadena → error de tool `MALFORMED_REQUEST`. **Todo texto** —vacío,
+ilegible, enorme— devuelve un sobre; un error de protocolo por un SQL mal escrito invitaría a
+reintentar en loop.
+
+#### Salida (`structuredContent`)
+
+Exactamente estas cinco claves, siempre:
+
+```jsonc
+{ "classification": "write",
+  "reasons": ["NOT_SELECT"],
+  "warnings": ["WRITE_NOT_EXECUTED"],
+  "query_text": "UPDATE t SET a = 1",
+  "touches_engine": false }
+```
+
+| Campo | Significado |
+|---|---|
+| `classification` | `read`, `write`, `ddl`, `blocked` o `invalid` (conjunto cerrado) |
+| `reasons[]` | Códigos públicos cerrados que explican por qué NO es una lectura aceptable. Vacío si `read` |
+| `warnings[]` | `WRITE_NOT_EXECUTED` (escritura), `DDL_NOT_EXECUTED` (DDL). Una escritura o un DDL **siempre** los traen |
+| `query_text` | El texto canónico si es una lectura aceptada; si no, el texto recibido sin caracteres de control y recortado a 16 KiB |
+| `touches_engine` | **Siempre `false`**: redactar nunca ejecuta, ni siquiera una lectura |
+
+`classification`: `read` es una lectura que el validador acepta; `write` y `ddl` salen de la
+política de la consola; `blocked` es lo que la consola prohíbe incluso confirmando **o** una
+lectura que el perfil de agente rechaza (con sus `reasons`); `invalid` es un texto vacío, ilegible,
+enorme o con varias sentencias.
+
+##### Códigos de `reasons`
+
+`PARSE_FAILED`, `MULTIPLE_STATEMENTS`, `NOT_SELECT`, `DML_IN_CTE`, `DML_IN_SUBQUERY`,
+`SELECT_INTO`, `LOCKING_READ`, `FUNCTION_NOT_ALLOWED`, `VARIABLE_ASSIGNMENT`,
+`EXECUTABLE_COMMENT`, `COMMENT_NOT_ALLOWED`, `SYSTEM_SCHEMA`, `CROSS_DATABASE`, `UNSUPPORTED_NODE`,
+`LIMIT_NOT_BOUNDABLE`, `OFFSET_TOO_HIGH`, `SQL_TOO_LARGE`.
+
+El vocabulario público completo (que incluye códigos de capas posteriores, como `DATA_DISABLED` o
+`QUERY_TIMEOUT`) vive en `app/services/mcp_catalog.py`; los códigos internos del validador nunca
+salen.
+
+Lo que sqlglot 30.11 no parsea se rechaza como `PARSE_FAILED`, con el código más específico
+sumado cuando se lee de los tokens: `SELECT … INTO OUTFILE` (`SELECT_INTO`) y un DML dentro de un
+subselect (`DML_IN_SUBQUERY`).
+
+#### Qué decide el validador
+
+La decisión sale del **AST** (nunca de palabras sueltas): una lista blanca de tipos de nodo, de
+argumentos de cada nodo y de funciones, sobre el árbol completo. Un texto se acepta solo si:
+
+- es exactamente **una** sentencia (`SELECT`, `UNION`/`INTERSECT`/`EXCEPT`, con `WITH` opcional);
+- no tiene **ningún comentario** (los `/*!…*/` y `/*M!…*/`, que el motor ejecuta, se rechazan sobre
+  el texto crudo, incluso dentro de un literal);
+- todas sus funciones están en la lista blanca (cerrada; las desconocidas y las calificadas se
+  rechazan);
+- no asigna ni lee variables, no toma locks (`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`) ni
+  materializa el resultado (`INTO`);
+- solo nombra la base fijada por `database_id` (otra base, un nombre de tres partes en PostgreSQL y
+  los esquemas del sistema se rechazan);
+- su `LIMIT`/`OFFSET` son literales enteros (un `OFFSET` mayor a 10 000 se rechaza).
+
+El render canónico del árbol vuelve a pasar por el pipeline completo y tiene que dar el mismo
+conjunto de nodos; si no, se rechaza (`UNSUPPORTED_NODE`).
+
+**Falsos positivos deliberados:** en MySQL/MariaDB un literal con barra invertida o con salto de
+línea se rechaza (`PARSE_FAILED`) porque el mismo texto significaría otra cosa bajo
+`NO_BACKSLASH_ESCAPES`; `a DIV 2` se rechaza (`UNSUPPORTED_NODE`) porque sqlglot lo renderiza como
+otro árbol. Un `LIMIT ALL` de PostgreSQL se acepta (el parser no deja rastro y la consulta se acota
+igual con un `LIMIT` empujado por el gateway).
+
+#### Lo que el validador NO detecta
+
+El parseo no ve: vistas con `DEFINER`, tablas `FEDERATED`/`CONNECT`/`SPIDER` (y extensiones tipo
+`dblink`) que leen otras bases, ni las diferencias entre cómo sqlglot y el motor leen el mismo
+texto. **La barrera real es la cuenta del motor**: `SELECT` sobre una sola base, transacción
+`READ ONLY` y timeout del lado del servidor. El validador es defensa en profundidad, y esta tool
+no ejecuta nada, así que hoy esos residuales no tienen un camino al motor.
+
+#### Errores
+
+El gate de la base es el de las demás tools: una base que el token no alcanza responde
+`mcp.not_found`; sin scope, `mcp.scope_denied`; sin credencial de solo lectura vigente en el
+servidor, `mcp.readonly_credential_missing` (aunque `draft_query` no la use para conectar).
+
+### 24.8 Tools `sample_rows`, `distinct_values`, `count_rows`
+
+Relacionado con 24.5. **No hay rutas
+HTTP nuevas**: son tools del endpoint `/mcp/`. Existen solo con `MCP_DATA_READ_ENABLED=true`; scope
+`data.read`. Contrato para el frontend: ninguno (la SPA ya gestiona scopes y opt-in, ver 24.5).
+
+#### Tools
+
+| Tool | Argumentos | Sentencia que arma el gateway |
+|---|---|---|
+| `sample_rows` | `database_id`, `table`, `columns?`, `limit?` | `SELECT <cols|*> FROM <t> LIMIT n+1` |
+| `distinct_values` | `database_id`, `table`, `column`, `limit?` | `SELECT DISTINCT <c> FROM <t> ORDER BY <c> LIMIT n+1` |
+| `count_rows` | `database_id`, `table` | `SELECT COUNT(*) FROM <t> LIMIT 2` |
+
+Identificadores cuoteados, validados contra el catálogo y pasados por `validate_agent_select`.
+
+#### Respuesta
+
+`{notice, data:{columns, rows[arreglos]}, row_count, truncated, truncation_reason (row_cap|byte_budget|null),
+clipped_cells, executed_sql, human_query, duration_ms, warnings, untrusted_fields, untrusted_content,
+source, database}`. `data.columns` y `data.rows` son contenido no confiable de terceros.
+
+#### Topes y códigos
+
+Filas 100/200/500; timeout 20 s/30 s; respuesta 128 KiB (recorta filas); celda 512. Códigos de error
+cerrados: `DATA_DISABLED`, `PROBE_NOT_GREEN`, `UNKNOWN_IDENTIFIER`, `MALFORMED_REQUEST`,
+`QUERY_TIMEOUT`, `QUERY_FAILED`, `AUDIT_UNAVAILABLE`, `DATA_ACCOUNT_BUSY` (429: la cuenta de datos
+llegó a su tope de conexiones; la credencial está bien y se reintenta en unos segundos); más los de
+autorización (`mcp.scope_denied`, `mcp.not_found`, `mcp.environment_denies_agents`…). Advertencia:
+`LIMIT_TOO_HIGH`.
+
+Variables nuevas: `MCP_QUERY_DEFAULT_ROWS`, `MCP_QUERY_MAX_ROWS`, `MCP_QUERY_TIMEOUT_MS`,
+`MCP_QUERY_MAX_OFFSET`, `MCP_QUERY_MAX_SQL_BYTES`, `MCP_DATA_MAX_RESULT_BYTES`.
+
+### 24.9 Tool `run_select`
+
+Relacionado con 24.8. **No hay
+rutas HTTP nuevas**: es una tool del endpoint `/mcp/`. Existe solo con `MCP_DATA_QUERY_ENABLED=true`
+(apagado por default; independiente de `MCP_DATA_READ_ENABLED`); scope `data.query`. Contrato para el
+frontend: ninguno (scopes y opt-in ya están en 24.5).
+
+#### Invariante (reemplaza al de `api-reference-v23.md` §9.5)
+
+**El MCP ejecuta únicamente `SELECT` únicos validados, dentro de una transacción `READ ONLY` y bajo una
+credencial por base con `SELECT` solamente.** Antes: "no acepta SQL del agente" (hasta `search_schema`) y "no EJECUTA
+SQL del agente" (`draft_query`). Lo que no es un `SELECT` aceptable no llega al motor.
+
+#### Tool
+
+| Tool | Argumentos | Qué hace |
+|---|---|---|
+| `run_select` | `database_id`, `sql`, `limit?` | Valida el `sql` con el validador compartido; si es una lectura aceptada la ejecuta con la credencial de datos de la base; si no, devuelve el sobre del borrador |
+
+Mismo gate que 24.8 (kill switch → scope → base y entorno → opt-in → credencial con sonda fresca), mismo
+servicio y mismos topes (filas 100/200/500, timeout 20 s/30 s, respuesta 128 KiB, celda 512). `limit`
+solo puede igualar o bajar el máximo; por encima se recorta y `warnings` trae `LIMIT_TOO_HIGH`.
+
+#### Respuestas
+
+- **Lectura aceptada**: el sobre de 24.8 (`data.rows` como arreglos, `untrusted_fields`, `truncated`,
+  `human_query`, `executed_sql`, …). `executed_sql` es el render de `sqlglot` del árbol verificado, no el
+  texto del agente: un `LIMIT` propio literal `<=` tope se ejecuta tal cual; uno mayor o ausente se
+  reemplaza por tope + 1.
+- **Todo lo demás** (escritura, DDL, bloqueado, ilegible): el sobre del borrador, **sin filas, sin
+  conexión y sin intención de auditoría de ejecución**:
+  `{classification: read|write|ddl|blocked|invalid, reasons[], warnings[], query_text, touches_engine: false}`.
+  Un rechazo no es un error de protocolo. Códigos de `reasons`: `PARSE_FAILED`, `MULTIPLE_STATEMENTS`,
+  `NOT_SELECT`, `DML_IN_CTE`, `DML_IN_SUBQUERY`, `SELECT_INTO`, `LOCKING_READ`, `FUNCTION_NOT_ALLOWED`,
+  `VARIABLE_ASSIGNMENT`, `EXECUTABLE_COMMENT`, `COMMENT_NOT_ALLOWED`, `SYSTEM_SCHEMA`, `CROSS_DATABASE`,
+  `UNSUPPORTED_NODE`, `OFFSET_TOO_HIGH` (literal `> MCP_QUERY_MAX_OFFSET`), `LIMIT_NOT_BOUNDABLE`,
+  `SQL_TOO_LARGE`. Advertencias: `WRITE_NOT_EXECUTED`, `DDL_NOT_EXECUTED`.
+- **Errores de tool** (códigos cerrados, mensaje fijo, nunca texto del motor): `DATA_DISABLED`,
+  `PROBE_NOT_GREEN`, `QUERY_TIMEOUT`, `QUERY_FAILED`, `AUDIT_UNAVAILABLE`, `DATA_ACCOUNT_BUSY`
+  (cuenta de datos en su tope de conexiones, 429), `MALFORMED_REQUEST` (solo
+  argumentos ausentes o mal tipados) y los de autorización (`mcp.scope_denied`, `mcp.not_found`,
+  `mcp.environment_denies_agents`…). El gate corre ANTES del validador: con el gate cerrado ni siquiera
+  se clasifica el texto.
+
+La fila de auditoría del despacho (`mcp.run_select`) marca `touched_engine=false` cuando la respuesta fue
+un borrador (`touches_engine: false`), y `true` cuando hubo ejecución; la ejecución se audita aparte
+(`mcp.agent_query`, intención antes de conectar).
+
+#### Riesgo residual aceptado
+
+La barrera real es la cuenta del motor (`SELECT` sobre una sola base, transacción `READ ONLY`, timeout
+del lado del servidor); el validador es defensa en profundidad. Quedan: (1) **inyección de prompt por los
+datos de las filas** (mitigada por el sobre, contenida porque ninguna tool escribe); (2) lo que el parseo
+no ve — vistas con `DEFINER`, tablas `FEDERATED`/`CONNECT`/`SPIDER`/FDW y diferenciales entre `sqlglot` y
+el motor; (3) **los datos personales no se filtran**: la lista de denegación por PII quedó diferida
+(enmienda S14; `PII_BLOCKED` reservado), así que lo legible lo fija el `GRANT`. Costo deliberado: en
+MySQL/MariaDB un literal con barra invertida se rechaza (`PARSE_FAILED`).
+
+Variable nueva: `MCP_DATA_QUERY_ENABLED` (ya listada en 24.8 junto a los topes).
+
+### 24.10 `get_definition`, `get_table_stats` y lectura de cuerpos de rutinas
+
+Relacionado con 24.9. Las tools
+(`get_definition`, `get_table_stats`) son del endpoint `/mcp/`. **La única ruta HTTP nueva** es
+`PUT /servers/{id}/readonly-credential/routine-bodies` (S6, ver la sección de `routine-bodies` más abajo),
+y `ServerOut` gana `readonly_proc_grant`. La SPA (S8) agrega `data.definitions` al selector de scopes
+de token y el control de esa bandera en el panel de la credencial de solo lectura.
+
+#### Invariante
+
+**El MCP nunca ejecuta un procedimiento, una función, un trigger, un evento ni una vista, y ninguna de
+estas tools acepta SQL.** Reciben identificadores (`database_id`, `kind`, `name`), leen el código con
+`SHOW CREATE` o `pg_get_*` y lo entregan como texto. Lo que rige para `run_select` (24.9) no cambia:
+solo `run_select` ejecuta, y solo `SELECT` validados.
+
+#### Scope `data.definitions` y kill switch
+
+| Aspecto | Comportamiento implementado |
+|---|---|
+| Capacidad | `data.definitions`, tercer miembro de la excepción cerrada `AGENT_DATA_EXCEPTIONS` (junto a `data.read` y `data.query`; invariante 13 del catálogo). Nunca se agrega una capacidad que mute |
+| Quién la tiene | Solo `owner` (no `operator`: el invariante 7b prohíbe que `operator` divulgue) |
+| Sensible | Sí: segundo aprobador al otorgarla suelta (el conjunto sensible pasó de 13 a 14) |
+| Step-up | Lo cumple el **emisor humano** al crear o editar el token (`api_token_controller._validate_scopes`); el token no tiene contraseña que reconfirmar |
+| Rastro | `api_token.data_scope_grant` con `record_intent` fail-closed, igual que los otros scopes de datos |
+| TTL del token | Rige el tope propio `MCP_DATA_TOKEN_MAX_TTL_DAYS` (default `0` = desactivado, el token vive hasta `MCP_TOKEN_MAX_TTL_DAYS`; con `>= 1` se acota, error `422` con `max_days`). Se aplica porque el scope pertenece a `AGENT_DATA_EXCEPTIONS` |
+| Agregar a un token ya emitido | Solo quien lo emitió o quien ya tiene hoy el permiso (`_require_editor_may_add_data_scopes`) |
+| Kill switch | `MCP_SCHEMA_DEFINITIONS_ENABLED`, **default `false`**, independiente de `MCP_DATA_READ_ENABLED` y `MCP_DATA_QUERY_ENABLED` |
+
+Con el kill switch apagado: el scope queda inerte (`parse_scopes` lo descarta), **`get_definition` no
+aparece en `tools/list`** y, si igual se la invoca (el registro se arma al importar y el handler vuelve a
+mirar el switch en cada llamada), responde `403` con código `mcp.definitions_disabled`. Es el primer paso:
+no valida argumentos ni lee el inventario, así que no se distingue por tiempo ni por efectos de una tool
+inexistente. Cambiar el switch exige reiniciar el proceso para que `tools/list` cambie.
+
+#### `get_definition`
+
+| Tool | Argumentos | Qué hace |
+|---|---|---|
+| `get_definition` | `database_id`, `objects: [{kind, name, routine_kind?}]` | Devuelve el texto de vistas, triggers, eventos y rutinas pedidos por nombre |
+
+`kind` admite `view`, `trigger`, `event`, `routine`. `routine_kind` (`PROCEDURE` | `FUNCTION`) solo aplica a
+`routine` y desambigua dos rutinas con el mismo nombre. Cada elemento admite únicamente esas tres claves.
+
+**Topes**
+
+- **3 objetos por llamada** (`maxItems` del schema publicado; se vuelve a exigir en el handler y en
+  `read_definitions`). Más es `422 mcp.invalid_argument`. Los duplicados se colapsan.
+- `name` de 1 a 128 caracteres. No se rechaza por sus caracteres: un nombre con comilla o prefijo de otra
+  base no está en el índice y vuelve en `missing`, sin que se emita SQL con ese texto.
+- **64 KiB por cuerpo**, medidos sobre su codificación JSON y **después de redactar**. Un cuerpo mayor
+  **se rechaza, no se trunca**: vuelve `body_available=false`, `unavailable_reason=too_large` y su
+  `size_bytes`. El dispatcher cuenta cada resultado dos veces (texto y `structuredContent`):
+  3 x 64 KiB x 2 = 384 KiB entran en su presupuesto de 512 KiB.
+- Lo que no está en el índice de la base vuelve en `missing[]` (`{kind, name, routine_kind}`) y **no se
+  consulta al motor**. Nunca hay un éxito vacío: o hay objetos, o hay `missing`, o la llamada falló con su
+  código.
+
+**Orden del gate** (cada paso corta el siguiente)
+
+1. Kill switch (`mcp.definitions_disabled`, 403).
+2. Argumentos (sin conectar; `422 mcp.invalid_argument`).
+3. Scope `data.definitions` del token (`mcp.scope_denied`).
+4. Proyecto del token (`mcp.not_found`).
+5. Credencial de **estructura** (la misma de `list_objects`) fresca, y entorno, opt-in y veto de la base.
+   **No pasa por `_data_gate`**: no exige la credencial de datos por base ni su opt-in; el control de acceso
+   es el scope más el kill switch.
+6. Índice de objetos: lo ausente va a `missing`.
+7. Auditoría de intención `mcp.get_definition` con `record_intent` **fail-closed**: si no se puede
+   escribir, no se lee ningún cuerpo y el error es `AUDIT_UNAVAILABLE` (503).
+8. Lectura por objeto, redacción, medición y huella. Al final, una fila de resultado con conteos por razón.
+
+**Motivos de no disponibilidad** (`unavailable_reason`, vocabulario cerrado; `not_found` no existe a
+propósito, eso es `missing`): `insufficient_privilege`, `engine_unsupported`, `scope_disabled`, `flag_off`,
+`too_large`. Un cuerpo NULL, vacío o en blanco, o que el saneado deja vacío, es `insufficient_privilege`:
+nunca `body_available=true` sin texto (el modelo lo valida al construirse).
+
+**Códigos de error**: `mcp.definitions_disabled` (403), `mcp.invalid_argument` (422), `AUDIT_UNAVAILABLE`
+(503), `mcp.scope_denied`, `mcp.not_found`, `mcp.environment_denies_agents` y los demás del gate de
+estructura; un timeout de la sesión es el código de sesión del MCP (504, "pedí menos objetos").
+
+##### Respuesta
+
+Envelope habitual (`notice`, `data`, `warnings`, `untrusted_fields`, `untrusted_content`, `source`,
+`database`). `data` es `{objects[], missing[]}`; cada objeto trae:
+
+`kind`, `name`, `routine_kind`, `identity_arguments` (PostgreSQL: una entrada por sobrecarga),
+`body_available`, `unavailable_reason`, `body`, `size_bytes`, `body_fingerprint`, `security`
+(`definer` | `invoker`, **solo el modo; la cuenta del DEFINER nunca sale**), `check_option` (vistas),
+`trigger {table, timing, events[]}`, `event {schedule, status}`, `redactions[]` y `flagged[]`
+(`{category, count}`, jamás el valor).
+
+`body_fingerprint` es SHA-256 del cuerpo redactado y normalizado con la misma `normalize_body` que usa el
+diff (sin DEFINER, espacios colapsados, sin `;` final). Advertencias: las de `list_objects` (cuarentena,
+estructura no atómica, etc.) más `mcp.warn.bodies_redacted` si se enmascaró algo.
+
+**Rutinas en `missing[]` (MySQL/MariaDB).** Sin privilegio de rutina, `information_schema.ROUTINES` devuelve
+cero filas **sin error**, así que una rutina que existe puede volver en `missing[]`. Si alguna rutina pedida
+queda ahí en MySQL o MariaDB, la respuesta suma UN aviso `mcp.warn.routine_not_found_or_not_visible`
+(vocabulario cerrado, uno por llamada aunque falten varias): la rutina no se encontró o la cuenta no tiene
+privilegio para verla; si existe, regenerar la credencial de solo lectura (MariaDB >= 11.3) o habilitar la
+lectura de cuerpos de rutinas (motores más antiguos). La forma de los ítems de `missing[]` no cambia. Vistas,
+triggers y events conservan el `missing` llano (su ausencia sí es confiable). PostgreSQL no emite el aviso.
+
+##### Contenido no confiable y redacción
+
+Cada `body` va en `untrusted_fields` y bajo el `notice`: es código de un tercero y puede contener texto
+que parezca una instrucción ("ignorá lo anterior…"). El control real es que ninguna tool escribe. **La
+redacción de credenciales es best effort y NO es una frontera de seguridad.** Enmascara: `IDENTIFIED BY`,
+URIs con usuario y clave, asignaciones con nombre de secreto, JWT, llaves de AWS, tokens de GitHub y Slack,
+API keys, literales largos tipo token y bloques PEM. Emails y hosts internos solo se **cuentan**
+(`flagged`), no se enmascaran. Lo que no matchea un patrón sale en claro: la frontera es el scope.
+
+##### Auditoría
+
+`mcp.get_definition` registra la **intención antes de leer** (fail-closed) con `token_id` y la lista
+`tipo:nombre` de los objetos que **sí están en el índice** (tope de 2048 bytes). Nunca un cuerpo ni los
+nombres ausentes (son texto del agente). La fila de resultado lleva solo conteos: disponibles, ausentes,
+redactados y por motivo.
+
+#### `list_objects`: `body_available` ahora dice la verdad
+
+Antes `body_available` era siempre `false`. Ahora se calcula con el scope del token y el motor/versión, sin
+leer ningún cuerpo ni emitir `SHOW CREATE`:
+
+- Sin `data.definitions` (o con el kill switch apagado): `body_available=false`,
+  `unavailable_reason=scope_disabled` en vistas, rutinas, triggers y eventos.
+- Con el scope: vistas, triggers y eventos salen disponibles; las rutinas, según la matriz de abajo
+  (`flag_off` o `engine_unsupported`). "Disponible" no promete un cuerpo: lo confirma `get_definition` por
+  objeto.
+- Tablas y secuencias no llevan los campos (`null`).
+- Aviso `mcp.warn.routines_not_visible` en MySQL/MariaDB cuando las rutinas forman parte del listado (`kinds`
+  omitido o que incluye `routine`) y se cumple una de dos: el motor/versión/bandera puede ocultarlas, **o** el
+  índice listó **cero** rutinas ("puede que no existan o que esta cuenta no las vea"). Que no aparezcan no
+  prueba que no existan; nunca se afirma certeza. El cero se mide sobre el índice completo, no sobre lo
+  filtrado por `name_prefix`. PostgreSQL no cambia.
+- **Nuevo tipo `event`** en `kinds` (MySQL y MariaDB; en PostgreSQL no existe y la lista es vacía).
+  `get_schema` conserva sus tipos y no lee eventos ni cuerpos.
+- Listar nombres de rutinas y triggers ya no hace un `SHOW CREATE` por objeto.
+
+#### `get_table_stats`
+
+| Tool | Argumentos | Qué hace |
+|---|---|---|
+| `get_table_stats` | `database_id`, `tables: [nombre]` | Estadísticas de almacenamiento de tablas pedidas por nombre |
+
+Scope **`databases.read`**, credencial de estructura, **sin kill switch propio** y sin SQL ni lectura de
+filas. Lee `information_schema.TABLES` (MySQL/MariaDB) o `pg_class` (PostgreSQL) con consultas
+parametrizadas, solo para nombres que están en el índice y acotadas a la base fijada. Hasta
+`MCP_MAX_OBJECTS_PER_CALL` tablas por llamada (más es `413 mcp.too_many_objects`, antes de conectar);
+`missing[]` para lo que no es una tabla del índice (incluida la contabilidad `_gw_v_`/`_gw_stg_`).
+
+Cada tabla trae `name`, `engine`, `collation`, `data_bytes`, `index_bytes`, `created_at`, `updated_at`.
+En PostgreSQL `engine`, `collation` y las fechas son `null` (el motor no los guarda).
+
+**`row_estimate` y `auto_increment` solo salen si el token también tiene `data.read` con
+`MCP_DATA_READ_ENABLED` encendido**, porque aproximan `count_rows` y `AUTO_INCREMENT` delata cuántas filas
+se insertaron. Para los demás **no existen como claves** (un `null` sería ambiguo con "el motor no lo
+sabe"), y el adapter ni siquiera selecciona esas columnas. La respuesta lo dice con
+`row_estimates_included` y `row_estimates_omitted_reason: "requires_data_read_scope"`. No exige la
+credencial de datos por base: el estimado se lee del catálogo con la de estructura.
+
+#### Credencial de estructura y matriz de motor/versión
+
+El código de una **rutina** necesita un privilegio que depende del motor. El aprovisionamiento de la
+credencial de estructura agrega, **solo en MariaDB 11.3 o superior** (versión leída en runtime), el
+privilegio **`SHOW CREATE ROUTINE` a nivel de base** (MDEV-29167); la sonda lo acepta solo en MariaDB y solo
+a nivel base (global o por tabla sigue siendo violación; `SELECT` sobre `mysql.*` sigue prohibido).
+
+| Motor / versión | Cuerpo de rutinas | `unavailable_reason` si falta |
+|---|---|---|
+| MariaDB 11.3+ | Con `SHOW CREATE ROUTINE` por base (otorgado al aprovisionar) | `insufficient_privilege` |
+| MariaDB < 11.3 | Solo con `SELECT ON mysql.proc` (alcance servidor, bandera `readonly_proc_grant`, ver S6) | `flag_off` |
+| MySQL 8.0.20+ | `SHOW_ROUTINE` global (ya existente) | `insufficient_privilege` |
+| MySQL 8.0.0 a 8.0.19 | No hay grant posible | `engine_unsupported` |
+| MySQL 5.7 | Solo con `SELECT ON mysql.proc` (bandera `readonly_proc_grant`, S6) | `flag_off` |
+| PostgreSQL | `pg_get_functiondef` y `pg_get_viewdef`, una lectura por sobrecarga; no tiene eventos | `engine_unsupported` (eventos) |
+
+Vistas, triggers y eventos se leen con los grants por base ya existentes (`SELECT`, `SHOW VIEW`,
+`TRIGGER`, `EVENT`).
+
+**Verificado en vivo solo en MariaDB 11.8.3** (staging): al regenerar la credencial de estructura, las
+rutinas pasaron a verse en `list_objects` y sus cuerpos se leyeron con `get_definition`. No se probó en
+otras versiones 11.3 a 11.7 ni se inspeccionó la salida de `SHOW GRANTS` posterior. El literal vive en una
+sola constante (`MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE`, `readonly_probe.py`). Una credencial ya
+aprovisionada no recibe el privilegio hasta que se regenera. Los tests de esta entrega usan un motor falso.
+
+#### `PUT /servers/{id}/readonly-credential/routine-bodies` (S6)
+
+Enciende o apaga `SELECT ON mysql.proc` para la credencial de solo lectura del MCP en **MariaDB < 11.3 y
+MySQL 5.7**, el único camino para leer el código de las rutinas ahí. **Es SERVER-WIDE**: `mysql.proc` no se
+puede acotar a una base, así que la credencial lee las rutinas de TODAS las bases del servidor, también las
+que están fuera del proyecto o excluidas; solo el filtrado del gateway lo contiene.
+
+| Aspecto | Comportamiento |
+|---|---|
+| Autorización | `servers.admin` (la dependencia `ServersAdmin`) con **step-up** (lo exige a todo `PUT`; sin él, `403 access.step_up_required`) |
+| Límite | `3/minute` por cliente (`429` al excederlo) |
+| Cuerpo | `{"enabled": bool, "acknowledgement": str \| null}`; `extra="forbid"` |
+| Acknowledgement | Al **habilitar** (`enabled=true`) tiene que ser igual, carácter por carácter y sin `strip`, a `READONLY_PROC_ACK_TEXT` (`app/services/server_catalog.py`). Al deshabilitar se ignora: cortar nunca pide más fricción que abrir |
+| Respuesta `200` | `{"server": ServerOut, "engine_grant": "converged" \| "not_alterable" \| "no_credential"}` |
+
+Texto de acknowledgement vigente (la SPA lo duplica literal; si cambia, cambia en los dos lados):
+
+> Entiendo que SELECT ON mysql.proc es server-wide: expone el código de las rutinas de TODAS las bases de
+> datos de este servidor, incluidas las que están fuera del proyecto o excluidas, y que solo el filtrado del
+> gateway lo contiene.
+
+**Errores (códigos cerrados en `public_context.code`).** La bandera no cambia en ninguno.
+
+| Estado | Código | Cuándo |
+|---|---|---|
+| `422` | `server.readonly_proc_grant.ack_mismatch` | `enabled=true` sin el texto exacto. No se toca el motor |
+| `422` | `server.readonly_proc_grant.engine_unsupported` | `enabled=true` en PostgreSQL, MySQL >= 8.0, MariaDB >= 11.3 o con versión ilegible (se lee con la pseudo-root, sin mutar) |
+| `409` | `readonly_provision.in_progress` | Hay un aprovisionamiento de este servidor en curso (el mismo lock por servidor, solo dentro del proceso) |
+
+**`engine_grant`: qué pasó en el motor.**
+
+| Valor | Significa |
+|---|---|
+| `converged` | La credencial es **propia** del gateway: se re-aprovisionó la cuenta (`REVOKE ALL` y re-grant, con `mysql.proc` solo si la bandera quedó encendida) y la sonda pasó. La bandera de la fila cambia **después** de que el motor confirmó y la sonda pasó |
+| `not_alterable` | La credencial se cargó **a mano** (`PUT /servers/{id}/readonly-credential`): el gateway no altera grants de un tercero. Se persiste la bandera y solo se re-corre la sonda. Si el DBA no ajustó los grants en el motor, la sonda falla **sin error HTTP** y el servidor queda sin verificar (`readonly_verified_at` nulo): el MCP cierra |
+| `no_credential` | El servidor no tiene credencial de solo lectura: solo cambia la bandera, que aplicará el próximo aprovisionamiento |
+
+**Revocar (`enabled=false`).** Con credencial propia re-converge la cuenta **sin** `mysql.proc`: el
+`REVOKE ALL` previo al re-grant lo quita. Re-aprovisionar des-verifica la credencial **antes** de tocar el
+motor, así que el corte es inmediato aunque el motor falle; en ese caso la bandera queda como estaba y el
+reintento revoca. Con credencial a mano el gateway no revoca nada: el DBA tiene que quitar el grant.
+
+**Sonda con conciencia de la bandera.** Con la bandera apagada, `SELECT ON mysql.proc` sigue siendo
+violación (`select_on_mysql_schema`) y la credencial no verifica; solo se tolera esa tabla (nunca
+`mysql.*` ni otra tabla de `mysql`) con la bandera encendida **y** un motor que la necesita.
+
+`ServerOut` agrega `readonly_proc_grant: bool` (default `false`). Es un dato de riesgo, no un secreto.
+
+**Migración** `f5b7d9e1a3c6` (`down_revision` `e4a6c8f0b2d5`): agrega `servers.readonly_proc_grant`, booleana
+`NOT NULL` con default falso. Idempotente.
+
+**Nota de despliegue — rompe a propósito.** Un servidor MariaDB < 11.3 o MySQL 5.7 cuya credencial de solo
+lectura se cargó a mano **con** `SELECT ON mysql.proc` ya otorgado **fallará la sonda después del deploy**
+(`select_on_mysql_schema`) y quedará fuera del MCP hasta que un administrador habilite la bandera con el
+acknowledgement, o el DBA quite el grant. Es lo buscado: un grant server-wide que nadie aceptó
+explícitamente no verifica.
+
+**Auditoría.** `server.readonly_proc_grant.set`, con intención fail-closed antes de tocar nada y registro
+final con `touched_engine`. El detalle no lleva el texto del acknowledgement ni credenciales.
+
+#### Frontend (S8)
+
+- `data.definitions` entra en el vocabulario de capacidades y en los scopes de datos del selector de
+  scopes de token, con el aviso de que los cuerpos son texto de terceros no confiable que puede contener
+  secretos. Es owner-only, sensible, con step-up del emisor, exactamente como `data.read` y `data.query`.
+- `ReadonlyCredentialPanel` muestra `readonly_proc_grant` y el control para habilitarlo o deshabilitarlo.
+  Como `ServerOut` no trae la versión del motor, lo ofrece a toda la familia MySQL/MariaDB y se apoya en
+  el `422 engine_unsupported` para el mensaje. Habilitar abre un diálogo con el texto de acknowledgement y
+  una casilla; `not_alterable` se muestra como aviso persistente.
+
+#### Estado de verificación
+
+Verificado en vivo en MariaDB 11.8.3 (vistas, triggers, rutinas y estadísticas de tablas).
+Sin verificar contra un motor real: MySQL, PostgreSQL, MariaDB 11.3 a 11.7 y la bandera de `mysql.proc`.
+
+Variable nueva: `MCP_SCHEMA_DEFINITIONS_ENABLED` (default `false`, documentada en `.env.example`).
+
+### 24.11 Tools de blueprints
+
+Relacionado con 24.10 y 24.5. **No hay rutas REST nuevas**: suma tres tools al MCP (`POST /mcp/`,
+`tools/call`) y una capacidad, `data.blueprint_sql`. El porqué de cada decisión, en
+`docs/development/decisiones-e-incidentes.md`; cómo habilitarlo, en
+[`mcp-para-colaboradores.md`](features/mcp-para-colaboradores.md).
+
+Las tres leen la BD de **metadatos** del gateway: no abren conexión a ningún motor y no escriben.
+
+#### Tools
+
+| Tool | Scope | Argumentos (esquema cerrado) |
+|---|---|---|
+| `list_blueprints` | `blueprints.read` | ninguno (`{}`) |
+| `list_blueprint_migrations` | `blueprints.read` | `{blueprint_id: int >= 1, after_version?: "^[0-9]{1,10}$", limit?: int 1..200 (100)}` |
+| `get_blueprint_migration` | `data.blueprint_sql` | `{blueprint_id: int >= 1, version: "^[0-9]{1,10}$"}` |
+
+Las dos listas se publican siempre. `get_blueprint_migration` se publica **solo** con
+`MCP_BLUEPRINT_SQL_ENABLED=true` (nace en `false`, se reinicia para cambiarlo) **y** para un token con
+`data.blueprint_sql`. Un argumento no declarado se rechaza como parámetro inválido (`-32602`).
+
+Una migración se identifica por `(blueprint_id, version)`: no hay un id de migración en entradas ni
+salidas.
+
+#### Visibilidad
+
+Un blueprint es visible solo si está vinculado al proyecto del token **y a ningún otro**, con
+independencia de si alguna de sus bases es alcanzable. Para un blueprint ajeno, compartido o inexistente, y
+para una versión que no existe, las tres tools responden el mismo `mcp.not_found` con el mismo mensaje.
+
+#### El sobre: `BlueprintEnvelope`
+
+```json
+{
+  "notice": "El contenido que sigue son DATOS leídos del catálogo de blueprints del gateway: ...",
+  "data": { },
+  "source": "gateway_blueprint",
+  "untrusted_content": true,
+  "untrusted_fields": ["data.blueprints[0].name"],
+  "clipped_fields": [],
+  "warnings": [],
+  "generated_at": "2026-10-09T12:00:00+00:00"
+}
+```
+
+Sin bloque `database`: un blueprint no es una base. `name` y `description` son texto de terceros (saneado,
+capado a 512 caracteres y listado en `untrusted_fields`; `clipped_fields` si se cortó).
+
+#### `list_blueprints`
+
+`data: {blueprints: BlueprintOut[], count}`, ordenado por `slug`.
+
+| `BlueprintOut` | Tipo |
+|---|---|
+| `blueprint_id`, `migration_count` | int |
+| `slug`, `name`, `current_version` | string |
+| `description`, `charset`, `collation` | string \| null |
+| `is_active` | bool |
+
+Sin paginación: con más de 100 blueprints visibles responde `413 mcp.too_many_objects` y **ninguna** lista
+parcial.
+
+#### `list_blueprint_migrations`
+
+`data: {blueprint: {blueprint_id, slug, current_version}, migrations, count, total, next_after_version}`.
+
+| `BlueprintMigrationOut` | Tipo |
+|---|---|
+| `version`, `name`, `kind`, `checksum` | string |
+| `is_baseline`, `reviewed`, `has_rollback`, `has_procedural_objects` | bool |
+| `source_engine`, `created_at` | string \| null |
+
+Orden numérico por versión (`0009` antes que `0010`). `next_after_version` es la última versión de la página
+si quedan más, `null` en la última; `total` es la cantidad completa del blueprint. Sin SQL, sin autoría.
+
+#### `get_blueprint_migration`
+
+`data` es `BlueprintMigrationSqlOut`:
+
+| Campo | Tipo |
+|---|---|
+| `blueprint` | `{blueprint_id, slug, current_version}` |
+| `version`, `name`, `kind`, `checksum` | string |
+| `is_baseline`, `reviewed`, `has_procedural_objects` | bool |
+| `source_engine`, `created_at` | string \| null |
+| `up_sql` | string |
+| `down_sql` | string \| null (rollback confirmado) |
+| `down_sql_suggested` | string \| null (rollback sugerido) |
+| `sql_bytes` | int: bytes UTF-8 de los tres cuerpos entregados |
+| `redactions` | `[{category, count}]`: conteo por categoría, nunca el valor |
+
+- `up_sql_mysql`, `up_sql_postgresql`, la traducción por motor y la autoría **no** se entregan.
+- Los tres cuerpos van en `untrusted_fields` (`data.up_sql`, `data.down_sql`, `data.down_sql_suggested`) y
+  **no se recortan**. La redacción de credenciales es **best effort y no una garantía**: ver
+  `mcp-para-colaboradores.md`.
+- `warnings`: `mcp.warn.blueprint_data_migration` si `kind = "data"` (puede llevar filas semilla de
+  terceros) y `mcp.warn.blueprint_sql_redacted` si se enmascaró algo.
+
+##### Errores nuevos
+
+Todos viajan como resultado de tool (`isError: true`), con el código en `structuredContent.error.code`.
+
+| Código | Cuándo |
+|---|---|
+| `mcp.blueprint_sql_disabled` (403) | El kill switch está apagado y la tool se invoca igual |
+| `mcp.blueprint_sql_too_large` (413) | La respuesta no entra en el tope de 512 KiB (`result_budget.MAX_RESULT_BYTES`) |
+| `mcp.too_many_objects` (413) | `list_blueprints` con más de 100 blueprints visibles |
+| `AUDIT_UNAVAILABLE` (503) | No se pudo escribir la intención de auditoría: no sale ningún SQL |
+| `mcp.not_found` (404) | Blueprint ajeno, compartido o inexistente, o versión inexistente |
+
+`mcp.blueprint_sql_too_large` trae `details` y ningún cuerpo:
+
+```json
+{ "error": { "code": "mcp.blueprint_sql_too_large", "message": "El SQL de la migración no entra en la respuesta ...",
+             "details": { "sql_bytes": 310000, "response_bytes": 640000, "max_response_bytes": 524288 } } }
+```
+
+`tool_error_result(code, message, details=None)` publica `details` solo si es un objeto; sin él, el error
+conserva la forma de siempre. `response_bytes` se mide con la misma fórmula que el despachador (el JSON del
+resultado, que va dos veces: bloque de texto y `structuredContent`), así que lo que la tool acepta no lo
+rechaza `mcp.result_too_large`.
+
+#### Capacidad `data.blueprint_sql`
+
+- Cuarto miembro de la excepción cerrada `AGENT_DATA_EXCEPTIONS` (`data.read`, `data.query`,
+  `data.definitions`, `data.blueprint_sql`); módulo `data`, divulga y no muta.
+- Solo `owner`; sensible (segundo aprobador al otorgarla suelta; las sensibles pasan de 15 a 16); el emisor de un
+  token con este scope necesita step-up fresco. Agente-grantable, **nunca** en los scopes por defecto
+  (`create_token` sigue en `["blueprints.read"]`).
+- Con `MCP_BLUEPRINT_SQL_ENABLED` apagado el scope es inerte: `parse_scopes` lo descarta, aunque siga
+  guardado y visible.
+- **No cambia el REST:** `blueprints.read` sigue bastando para leer el SQL de las migraciones por la API.
+  El scope nuevo solo gobierna lo que llega a un agente.
+- Auditoría: el despachador escribe `mcp.<tool>` como siempre; `get_blueprint_migration` suma antes una fila
+  de intención (`mcp.get_blueprint_migration`, `target_type = database_model`, token y versión, sin SQL).
+
+#### Registro
+
+El invariante 6 del registro de tools exigía que toda tool de datos abriera el motor. Se relaja de forma
+cerrada: `_METADATA_DATA_SCOPES = {data.blueprint_sql}` (subconjunto de `AGENT_DATA_EXCEPTIONS`) y, para una
+tool de datos, `touches_engine` es verdadero **si y solo si** su scope no está en ese conjunto. El tag
+`data` y el aviso de «contenido no confiable de terceros» siguen siendo obligatorios.
+
+### 24.12 `database.engine_version`
+
+Relacionado con 24.6 a 24.11. **No hay rutas REST nuevas**: cambia el contrato de las
+tools MCP que leen el catálogo de una base. Por qué se expone solo la versión numérica, en
+`docs/development/decisiones-e-incidentes.md`.
+
+#### El campo
+
+El bloque `database` del sobre de las tools suma un campo:
+
+```json
+"database": { "database_id": 7, "engine": "mariadb", "engine_version": "11.8.3" }
+```
+
+| Campo | Tipo | Valores |
+|---|---|---|
+| `engine_version` | `string \| null` | `mayor.menor.parche` (`11.8.3`), `mayor.menor` si el motor no trae parche (`16.3`), o `null` |
+
+El patrón es `^[0-9]+(\.[0-9]+){1,2}$`: el modelo de salida rechaza cualquier otro valor, así que una
+cadena de build no puede salir ni por descuido de un mapeador.
+
+#### Qué tools lo llevan
+
+Las que **ya abren la sesión de lectura** del motor y reusan ese façade (un `SELECT VERSION()` más
+sobre la sesión existente, nunca una conexión extra):
+
+`list_objects`, `get_schema`, `search_schema`, `check_freshness`, `get_table_stats`,
+`get_definition` y `diff_schemas`.
+
+- `diff_schemas` informa la versión del lado **origen** (`source_database_id`), que es el que
+  describe el bloque `database` de su sobre.
+- `get_definition` informa `null` cuando ningún objeto pedido está en el índice: esa llamada hace cero
+  lecturas al motor y la versión no justifica una.
+- `list_objects` lee `VERSION()` una sola vez y la comparte con la disponibilidad de cuerpos. Antes,
+  sin el scope `data.definitions`, no la leía; ahora sí, solo para este campo.
+- Las tools sin sesión de lectura (`list_databases`, `draft_query`, `list_environments`,
+  `list_exports`, `list_clones`, `list_catalogs`) no lo llevan. `sample_rows`, `distinct_values`,
+  `count_rows` y `run_select` usan la credencial de datos y su propio sobre: tampoco.
+
+#### Regla de parseo
+
+De la cadena cruda de `VERSION()` se toman los primeros `mayor.menor[.parche]` y se descarta todo lo
+demás. Función única: `readonly_probe.public_engine_version`.
+
+| Cadena cruda | `engine_version` |
+|---|---|
+| `11.8.3-MariaDB-0+deb13u1 from Debian` | `11.8.3` |
+| `5.5.5-10.11.6-MariaDB` | `10.11.6` (el prefijo `5.5.5-` es de compatibilidad de replicación de MariaDB: la versión real va después) |
+| `10.6.12-MariaDB-1:10.6.12+maria~ubu2004` | `10.6.12` |
+| `8.0.36-0ubuntu0.22.04.1` | `8.0.36` |
+| `5.7.44-log` | `5.7.44` |
+| `16.3 (Debian 16.3-1.pgdg120+1)` | `16.3` |
+| vacío, `null` o ilegible | `null` |
+
+#### Por qué solo dígitos
+
+La cadena de build (`-0+deb13u1 from Debian`, `~ubu2004`, `pgdg120+1`) revela la distribución y el
+nivel de parche del **paquete**: justo lo que un escáner de vulnerabilidades necesita para elegir qué
+probar. Un agente necesita saber si el motor es 11.8 o 10.6 para razonar sobre sintaxis y
+funciones, no cómo se compiló. Por eso la limpieza es por construcción (se toman dígitos, no se
+quitan sufijos conocidos) y el patrón del modelo es la segunda barrera.
+
+Sin cambios de autorización ni de capacidades.
+
+---
+
+*Generado a partir del código fuente del backend (rutas, schemas y DTOs). Para el detalle de cada
+feature a nivel backend, consulta `docs/features/`; para el roadmap, `docs/plans/`. Los addendums
+`api-reference-vN.md` ya no existen: ver la cabecera.*

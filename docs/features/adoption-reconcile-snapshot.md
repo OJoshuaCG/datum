@@ -8,7 +8,7 @@ apoya en la [gestión de servidores e introspección](server-management.md), la
 [migraciones de blueprints](model-migrations.md).
 
 > Diseño e historia: [`docs/plans/09-adopcion-reconciliacion-y-snapshot.md`](../plans/09-adopcion-reconciliacion-y-snapshot.md).
-> Guía detallada para frontend (escenarios, flujos, ejemplos y mockups): [`api-reference-v3.md`](../api-reference-v3.md).
+> Guía detallada para frontend (escenarios, flujos, ejemplos y mockups): `api-reference-v3.md`.
 
 ## Concepto: los dos planos
 

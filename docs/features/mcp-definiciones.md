@@ -1,7 +1,7 @@
 # MCP: definiciones de esquema y estadísticas de tablas
 
 Dos tools del MCP que le dan a un agente lo que antes tenía que adivinar o pedirle a un DBA. El contrato
-exacto está en [`api-reference-v39.md`](../api-reference-v39.md); el porqué de cada decisión, en
+exacto está en [`api-reference.md` §24.10](../api-reference.md); el porqué de cada decisión, en
 [`decisiones-e-incidentes.md`](../development/decisiones-e-incidentes.md).
 
 ## Qué le dan al agente

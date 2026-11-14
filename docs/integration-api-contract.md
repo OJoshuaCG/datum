@@ -3,7 +3,8 @@
 Contrato de la API REST con bearer (`/api/v1/integration/*`) para automatizar, desde el proyecto web de una
 persona, un conjunto **cerrado** de operaciones sobre las bases que administra el gateway. Esta guía es para quien
 **consume** la API. Para operarla y habilitarla, ver [`features/integration-api-tokens.md`](features/integration-api-tokens.md);
-para el detalle interno, [`api-reference-v45.md`](api-reference-v45.md).
+para el detalle interno, [`api-reference.md` §22](api-reference.md) y, para los canales de liberación,
+[`api-reference.md` §21](api-reference.md).
 
 > Los ejemplos de respuesta se armaron a partir de los schemas y no se capturaron contra un servidor real; los ids,
 > nombres y versiones son ilustrativos. El contrato sale del código.
@@ -455,8 +456,6 @@ Se rechazan **antes** de tocar nada, con `409` salvo indicación:
 | `integration.stamp_orphan_accounting` | 409 | Contabilidad de migraciones huérfana |
 | `release_channel.not_found` | 404 | El canal pedido no existe |
 | `release_channel.no_released_version` | 409 | El canal no tiene versión liberada para el blueprint de la base |
-| `release_channel.derived_no_scope` | 409 | Canal `derived` sin entorno enlazado o sin bases en una versión |
-| `release_channel.derived_unreadable` | 409 | No se pudo leer la versión de alguna base del entorno |
 | `release_channel.pointer_inconsistent` | 409 | El puntero apunta a una versión ajena al blueprint |
 | `integration.migration_target_not_forward` | 422 | `version` anterior a la actual |
 | *(validación)* | 422 | Campo desconocido, faltante o con formato inválido |

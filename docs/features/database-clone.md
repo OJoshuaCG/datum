@@ -569,7 +569,7 @@ los logs).
 
 ## Clonar VARIAS bases en un lote
 
-Contrato completo en [`api-reference-v19.md`](../api-reference-v19.md). Acá va lo operativo.
+Contrato completo en `api-reference-v19.md`. Acá va lo operativo.
 
 `POST /database-clone-batches` arma un lote: dos servidores, un perfil común y N filas
 (origen → destino). Una sola confirmación lo ejecuta, y **cada fila termina siendo un `CloneJob`

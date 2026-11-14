@@ -57,7 +57,7 @@ del camino es destructivo, rige la misma regla de aprobación, en dirección `do
 ### Aprobación de versiones destructivas
 
 El bloqueo ya no es absoluto para personas: una versión destructiva se ejecuta en un entorno protegido
-solo si **otra persona la aprobó** antes. Contrato completo en [api-reference-v47.md](../api-reference-v47.md).
+solo si **otra persona la aprobó** antes. Contrato completo en [`api-reference.md` §23](../api-reference.md).
 
 - **Dos capacidades, ambas solo de `owner`, sensibles y con step-up:** `blueprints.approve_destructive`
   (aprobar y revocar) y `blueprints.apply_destructive` (ejecutar lo aprobado). Aprobar solo escribe metadatos
@@ -262,7 +262,7 @@ Vocabulario cerrado en `app/services/environment_catalog.py`.
 | `environment.databases_outside_environment` (+ `database_ids_outside`) | 422 |
 | `environment.destructive_blocked` (+ `environment_slug`, `blocked_versions`, `direction`, `approved_versions`, `approval_status`) — `blocked_versions` son las que **no tienen aprobación vigente** | 409. En `apply-all` de una persona, 409 de **toda la petición**; el `error_code` del ítem queda para máquinas y carreras |
 
-Los códigos de la aprobación (`destructive_approval.*`) están en [api-reference-v47.md](../api-reference-v47.md).
+Los códigos de la aprobación (`destructive_approval.*`) están en [`api-reference.md` §23](../api-reference.md).
 
 ### El rechazo en `apply-all` va en el ítem, no en el `public_context` (salvo versiones destructivas sin aprobar)
 

@@ -6,7 +6,7 @@ asignarle perfiles, asignar un blueprint, aplicar migraciones hacia adelante y, 
 migraciones y marcar versiones (`rollback`/`stamp`). No es el MCP (que es para agentes
 de IA, de solo lectura) ni la sesión de la SPA: es una tercera credencial, con su propio vocabulario de scopes.
 
-Contrato de rutas, cuerpos y códigos: [`api-reference-v45.md`](../api-reference-v45.md). El porqué, en
+Contrato de rutas, cuerpos y códigos: [`api-reference.md` §22](../api-reference.md). El porqué, en
 [`decisiones-e-incidentes.md`](../development/decisiones-e-incidentes.md) (sección "Tokens de integración").
 
 Módulos: `app/core/integration_auth.py` (autenticación), `app/services/integration_scope_catalog.py`
@@ -45,7 +45,7 @@ de tokens por bearer.
 
 Doce scopes en tres niveles (lectura, escritura, destructivo). Los dos destructivos se evalúan contra
 `blueprints.apply` y viven con un sobre más estricto; el contrato completo está en
-[`api-reference-v45.md`](../api-reference-v45.md).
+[`api-reference.md` §22](../api-reference.md).
 
 - **Emisión**: agregar o editar un scope destructivo pide un **step-up propio** de la persona (`blueprints.apply`;
   la guarda de la ruta de gestión mira `access.admin`, no esa capacidad), allowlist de blueprints obligatoria y TTL

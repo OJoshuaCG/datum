@@ -15,9 +15,9 @@ con expresiones regulares sobre el texto en español, y su propio docstring expl
 efecto es que reescribir un mensaje —algo que nadie considera un cambio de contrato— degrada
 la UI en silencio.
 
-Ojo con la documentación vieja: ``docs/api-reference-v8.md`` §3.0 afirma como regla dura que
+Ojo con la documentación vieja: el addendum ``api-reference-v8`` §3.0 (eliminado, ver git) afirma como regla dura que
 *"en todo el resto del módulo no hay ``public_context``"* y *"nunca leas ``detail.context``"*.
-Estos códigos la superseden, y ``docs/api-reference-v14.md`` tiene que decirlo explícitamente
+Estos códigos la superseden, y ``docs/api-reference.md`` tiene que decirlo explícitamente
 o el frontend va a seguir el doc viejo. El parser del cliente no hay que tocarlo:
 ``errors.ts`` ya extrae ``public_context.code`` de forma genérica.
 

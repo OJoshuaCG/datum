@@ -2,7 +2,7 @@
 
 Un **canal** (`stable`, `development`…) es un nombre global que decide qué versión de un blueprint consumen las
 integraciones, el alta de bases y la aplicación en lote. Cada blueprint tiene, por canal, un **puntero** a una de
-sus versiones. Contrato completo en [`api-reference-v46.md`](../api-reference-v46.md).
+sus versiones. Contrato completo en [`api-reference.md` §21](../api-reference.md).
 
 Un canal **no toca ningún motor destino**: mover un puntero cambia qué versión recibirá la *próxima* base o la
 *próxima* aplicación que pida ese canal. Las bases ya migradas no se mueven solas.
@@ -95,7 +95,7 @@ plan ahora incluye los movimientos de canal. Hay que volver a pedir el plan.
 
 El modo de resolución inválido no tiene código propio: es el `422` estándar de Pydantic y, en producción, no trae
 detalle por campo (la SPA valida el modo antes de enviar). El resto de los códigos están en
-`app/services/release_channel_catalog.py` y en la tabla de `api-reference-v46.md`; se clasifican siempre por
+`app/services/release_channel_catalog.py` y en la tabla de `api-reference.md` §21.7; se clasifican siempre por
 `public_context.code`, nunca por el texto del mensaje.
 
 ## Operación
