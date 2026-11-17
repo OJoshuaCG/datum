@@ -5426,6 +5426,11 @@ Paginado con `?page=&size=` (como el resto), **las más nuevas primero** por `id
 
 `from >= to` → `422 audit.invalid_range`.
 
+**`pagination.total` está acotado a 10.000.** Si hay más entradas, `total` vale el tope (la
+página pedida y la siguiente siempre se cuentan), así que se lee como «10.000 o más» y `pages`
+sale de ese valor. `has_next` y `has_prev` son siempre exactos: para recorrer el log hay que
+paginar con `has_next`, no con `pages`.
+
 ```json
 {
   "data": [

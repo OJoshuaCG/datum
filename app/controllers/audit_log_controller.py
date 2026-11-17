@@ -59,6 +59,10 @@ from app.services.db_admin import sql_masking
 if TYPE_CHECKING:
     from app.core.actor import Actor
 
+# Upper bound for the ``total`` of ``GET /audit-log``. Above it the API reports this value,
+# meaning "at least this many". Exact counting of a large audit table costs seconds per page.
+AUDIT_LOG_COUNT_CAP = 10_000
+
 CODE_NOT_FOUND = "audit.not_found"
 CODE_INVALID_RANGE = "audit.invalid_range"
 
@@ -262,9 +266,15 @@ class AuditLogController:
             # ``COUNT(id)`` directo y no ``q.count()``: este último envuelve la consulta en un
             # ``SELECT count(*) FROM (SELECT <todas las columnas> ...)``, mientras que el directo
             # se resuelve recorriendo un índice (el compuesto del filtro, si lo hay).
-            total = (
-                self._filtered(session.query(func.count(AuditLog.id)), filters).scalar() or 0
+            # The count is bounded: on an unfiltered, ever-growing audit_log an exact COUNT walks
+            # the whole index on every page. Counting at most ``count_cap`` ids keeps it cheap,
+            # and ``offset + limit + 1`` guarantees the page after the current one is always
+            # inside the count, so ``has_next`` stays exact even past the cap.
+            count_cap = max(AUDIT_LOG_COUNT_CAP, offset + limit + 1)
+            bounded_ids = (
+                self._filtered(session.query(AuditLog.id), filters).limit(count_cap).subquery()
             )
+            total = session.query(func.count()).select_from(bounded_ids).scalar() or 0
             filas = q.order_by(AuditLog.id.desc()).limit(limit).offset(offset).all()
             entries = [self._serialize(f) for f in filas]
         finally:

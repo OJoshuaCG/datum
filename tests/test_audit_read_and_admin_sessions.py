@@ -141,6 +141,42 @@ def test_audit_pagination_is_stable_and_disjoint(so_client):
     assert (meta["total"], meta["pages"], meta["has_next"]) == (5, 3, True)
 
 
+def test_audit_total_is_capped_but_has_next_stays_exact(so_client, monkeypatch):
+    # The count reads at most max(cap, offset + size + 1) rows: an unbounded COUNT over an
+    # append-only table that is never purged grows with every page view.
+    from app.controllers import audit_log_controller
+
+    monkeypatch.setattr(audit_log_controller, "AUDIT_LOG_COUNT_CAP", 3)
+    ids = _seed_set()
+
+    first_page = _get(so_client, page=1, size=2)
+    assert _ids(first_page) == sorted(ids.values(), reverse=True)[:2]
+    meta = first_page.json()["pagination"]
+    assert (meta["total"], meta["pages"], meta["has_next"]) == (3, 2, True)
+
+    # A page past the cap still counts far enough to know whether another page exists.
+    last_page = _get(so_client, page=3, size=2)
+    assert _ids(last_page) == sorted(ids.values(), reverse=True)[4:]
+    meta = last_page.json()["pagination"]
+    assert (meta["total"], meta["pages"], meta["has_next"], meta["has_prev"]) == (
+        5,
+        3,
+        False,
+        True,
+    )
+
+
+def test_audit_total_is_exact_below_the_cap(so_client, monkeypatch):
+    from app.controllers import audit_log_controller
+
+    monkeypatch.setattr(audit_log_controller, "AUDIT_LOG_COUNT_CAP", 3)
+    _seed_set()
+
+    meta = _get(so_client, admin_username="ana", page=1, size=1).json()["pagination"]
+
+    assert (meta["total"], meta["pages"], meta["has_next"]) == (2, 2, True)
+
+
 def test_audit_detail_is_parsed_when_json(so_client):
     ids = _seed_set()
     a1 = so_client.get(f"{AUDIT}/{ids['a1']}").json()["data"]
