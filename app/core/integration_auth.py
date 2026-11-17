@@ -355,12 +355,6 @@ def _authenticate_token(request: Request) -> _AuthenticatedToken:
         if row.expires_at is not None and row.expires_at <= now:
             raise _reject(request, REASON_EXPIRED, public_id=bearer_parts.public_id)
 
-        # The token delegates to its issuer, who is re-read on EVERY request: deactivating or
-        # demoting the issuer takes effect on the next call.
-        issuer = _load_issuer(row.created_by_admin_id)
-        if issuer is None:
-            raise _reject(request, REASON_ISSUER_INACTIVE, public_id=bearer_parts.public_id)
-
         allowed_server_ids = frozenset(
             server_id
             for (server_id,) in session.query(IntegrationTokenServer.server_id).filter(
@@ -373,20 +367,33 @@ def _authenticate_token(request: Request) -> _AuthenticatedToken:
                 IntegrationTokenBlueprint.token_pk == row.id
             )
         )
-        authenticated = _AuthenticatedToken(
-            token_pk=row.id,
-            public_id=row.token_id,
-            name=row.name,
-            stored_scopes=tuple(parse_stored_integration_scopes(row.scopes)),
-            issuer=issuer,
-            allowed_server_ids=allowed_server_ids,
-            allowed_blueprint_ids=allowed_blueprint_ids,
-        )
+        token_pk = row.id
+        token_public_id = row.token_id
+        token_name = row.name
+        stored_scopes = tuple(parse_stored_integration_scopes(row.scopes))
+        issuer_admin_id = row.created_by_admin_id
     finally:
         session.close()
 
-    # Conditional UPDATE in its own transaction (see ``app.core.token_usage``), AFTER the read
-    # session is closed: holding both would take two pooled connections per authentication.
+    # The token delegates to its issuer, who is re-read on EVERY request: deactivating or demoting
+    # the issuer takes effect on the next call. Loaded AFTER the read session is closed, because
+    # ``_load_issuer`` checks out its own pooled connection.
+    issuer = _load_issuer(issuer_admin_id)
+    if issuer is None:
+        raise _reject(request, REASON_ISSUER_INACTIVE, public_id=bearer_parts.public_id)
+
+    authenticated = _AuthenticatedToken(
+        token_pk=token_pk,
+        public_id=token_public_id,
+        name=token_name,
+        stored_scopes=stored_scopes,
+        issuer=issuer,
+        allowed_server_ids=allowed_server_ids,
+        allowed_blueprint_ids=allowed_blueprint_ids,
+    )
+
+    # Conditional UPDATE in its own transaction (see ``app.core.token_usage``), also after the
+    # read session is closed, so an authentication never holds two pooled connections at once.
     record_last_used(_session, IntegrationToken, authenticated.token_pk, now, LAST_USED_RESOLUTION)
     return authenticated
 

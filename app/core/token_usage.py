@@ -36,6 +36,10 @@ def record_last_used(
     ``resolution`` de antigüedad. El throttle vive en el ``WHERE``: no hace falta haber leído la
     fila. Nunca lanza por un error de la BD (incluido el pool agotado): el token ya se validó y
     perder un refresco no puede convertir una autenticación correcta en un 500.
+
+    ``last_used_at`` es solo informativo. Si algún día gobierna una expiración por inactividad,
+    esta captura amplia falla ABIERTO (con la BD caída, el token seguiría vigente) y deja de
+    servir: ese control tendría que fallar cerrado.
     """
     threshold = now - resolution
     statement = (
