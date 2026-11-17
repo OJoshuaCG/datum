@@ -35,9 +35,11 @@ Reglas
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
+from collections import OrderedDict
 
 import sqlglot
 from sqlglot import exp
@@ -201,16 +203,87 @@ def _literal_prefix_len(out: list[str]) -> int:
     return len(w) if w.lower() in {"x", "b", "e", "n", "u"} or w.startswith("_") else 0
 
 
+# Tope del caché de resultados enmascarados, en bytes UTF-8 del texto guardado.
+MASK_CACHE_MAX_BYTES = 8 * 1024 * 1024
+
+
+class _MaskCache:
+    """
+    LRU de textos YA enmascarados, acotado por BYTES y no por cantidad de entradas.
+
+    POR QUÉ: el historial se enmascara al LEER (ver cabecera), así que cada página re-parsea con
+    sqlglot hasta 200 filas de hasta 16 KB, aunque sean las mismas filas que la página anterior.
+    Un ``functools.lru_cache`` acota por cantidad de entradas, y con filas de tamaño tan variable
+    la memoria quedaría sin techo real. La clave es ``sha256(sql)`` + dialecto: el SQL CRUDO
+    nunca queda retenido en memoria, solo su hash y la salida enmascarada, que es lo que de todos
+    modos se le entrega a un ``viewer``. Es seguro entre hilos porque las rutas síncronas corren
+    en un pool.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._entries: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._used_bytes = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def key(sql: str, dialect: str) -> tuple[str, str]:
+        return (hashlib.sha256(sql.encode("utf-8")).hexdigest(), dialect)
+
+    def get(self, key: tuple[str, str]) -> str | None:
+        with self._lock:
+            masked = self._entries.get(key)
+            if masked is not None:
+                self._entries.move_to_end(key)
+            return masked
+
+    def put(self, key: tuple[str, str], masked: str) -> None:
+        entry_bytes = len(masked.encode("utf-8"))
+        if entry_bytes > self._max_bytes:
+            return
+        with self._lock:
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._used_bytes -= len(previous.encode("utf-8"))
+            self._entries[key] = masked
+            self._used_bytes += entry_bytes
+            while self._used_bytes > self._max_bytes:
+                _, evicted = self._entries.popitem(last=False)
+                self._used_bytes -= len(evicted.encode("utf-8"))
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._used_bytes = 0
+
+    @property
+    def used_bytes(self) -> int:
+        return self._used_bytes
+
+
+_CACHE = _MaskCache(MASK_CACHE_MAX_BYTES)
+
+
 def mask_literals(sql: str | None, engine: str) -> str:
     """
     El SQL con cada literal reemplazado por ``?`` y sin comentarios. No lanza nunca.
 
     ``engine`` es el valor de negocio (``mysql``/``mariadb``/``postgresql``); uno desconocido se
-    trata como MySQL, igual que ``query_policy``.
+    trata como MySQL, igual que ``query_policy``. El resultado se memoiza en ``_CACHE``.
     """
     if not sql:
         return sql or ""
     dialect = _SQLGLOT_DIALECT.get(engine, "mysql")
+    cache_key = _MaskCache.key(sql, dialect)
+    cached = _CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    masked = _mask_uncached(sql, dialect)
+    _CACHE.put(cache_key, masked)
+    return masked
+
+
+def _mask_uncached(sql: str, dialect: str) -> str:
     postgres = dialect == "postgres"
     try:
         _MUTE._local.active = True

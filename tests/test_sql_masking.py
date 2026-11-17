@@ -13,6 +13,14 @@ from app.services.db_admin import sql_masking
 from app.services.db_admin.sql_masking import _scan_mask, mask_literals
 
 
+@pytest.fixture(autouse=True)
+def _empty_mask_cache():
+    """Cada test arranca con el caché vacío: un acierto de otro test ocultaría el caso."""
+    sql_masking._CACHE.clear()
+    yield
+    sql_masking._CACHE.clear()
+
+
 @pytest.mark.parametrize("engine", ["mysql", "mariadb", "postgresql"])
 def test_insert_values_con_email_enmascara_cada_valor(engine):
     out = mask_literals(
@@ -151,3 +159,72 @@ def test_no_loguea_la_sentencia_al_enmascarar(caplog):
 def test_vacio():
     assert mask_literals("", "mysql") == ""
     assert mask_literals(None, "mysql") == ""
+
+
+# --------------------------------------------------------------------------- #
+# Caché de resultados enmascarados                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_el_mismo_sql_se_enmascara_una_sola_vez(monkeypatch):
+    calls: list[str] = []
+    real_mask = sql_masking._mask_uncached
+
+    def _counting(sql, dialect):
+        calls.append(sql)
+        return real_mask(sql, dialect)
+
+    monkeypatch.setattr(sql_masking, "_mask_uncached", _counting)
+    sql = "SELECT * FROM t WHERE email = 'alice@x.com'"
+
+    first = mask_literals(sql, "mysql")
+    second = mask_literals(sql, "mariadb")
+
+    assert first == second == "SELECT * FROM t WHERE email = ?"
+    assert len(calls) == 1
+
+
+def test_el_cache_separa_por_dialecto():
+    # En MySQL las comillas dobles son strings; en PostgreSQL, identificadores.
+    sql = 'SELECT "Col1" FROM t'
+
+    assert mask_literals(sql, "mysql") != mask_literals(sql, "postgresql")
+    assert mask_literals(sql, "postgresql") == 'SELECT "Col1" FROM t'
+
+
+def test_el_cache_no_retiene_el_sql_crudo():
+    mask_literals("SELECT 'alice@x.com'", "mysql")
+
+    retained = repr(list(sql_masking._CACHE._entries.items()))
+    assert "alice" not in retained
+
+
+def test_el_cache_desaloja_lo_menos_usado_al_superar_el_tope_de_bytes():
+    cache = sql_masking._MaskCache(max_bytes=10)
+    cache.put(("a", "mysql"), "12345")
+    cache.put(("b", "mysql"), "12345")
+    assert cache.get(("a", "mysql")) == "12345"  # "a" pasa a ser la más reciente
+
+    cache.put(("c", "mysql"), "12345")
+
+    assert cache.get(("b", "mysql")) is None
+    assert cache.get(("a", "mysql")) == "12345"
+    assert cache.get(("c", "mysql")) == "12345"
+    assert cache.used_bytes == 10
+
+
+def test_el_cache_cuenta_bytes_utf8_y_no_caracteres():
+    cache = sql_masking._MaskCache(max_bytes=4)
+    cache.put(("a", "mysql"), "ññ")  # 2 caracteres, 4 bytes
+    cache.put(("b", "mysql"), "x")
+
+    assert cache.get(("a", "mysql")) is None
+    assert cache.used_bytes == 1
+
+
+def test_una_entrada_mayor_al_tope_no_se_guarda():
+    cache = sql_masking._MaskCache(max_bytes=4)
+    cache.put(("a", "mysql"), "12345")
+
+    assert cache.get(("a", "mysql")) is None
+    assert cache.used_bytes == 0
