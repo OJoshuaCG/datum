@@ -49,6 +49,7 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 11 | [Organización lógica (proyectos/entornos), copia de datos, releases y acceso para agentes (MCP)](11-organizacion-copia-de-datos-releases-y-mcp.md) | 01, 02, 05 | 📋 Propuesta parcial — features 1 (entornos) y 2 (proyectos) **ya implementadas**; la 3 parcialmente en el módulo de clon; **el §6 (MCP) está SUPERADO por el plan 12** |
 | 12 | [Servidor MCP de contexto de esquema para agentes de IA](12-mcp-contexto-de-esquema.md) | 11 (features 1 y 2, ya hechas) | 🟡 MCP v1 parcial: tokens, `POST /mcp`, gate por base y techo de solo lectura. Faltan las tools que leen el catálogo del motor (bloqueadas por Docker). Reemplaza al §6 del plan 11. Los 3 bugs previos que lista su §3 no se reverificaron en esta actualización |
 | 13 | [Usuarios y autorización del gateway](13-usuarios-y-autorizacion-del-gateway.md) | — (lo fuerza el 12) | ✅ Implementado y extendido (C1–C4, step-up, auditoría). El documento es histórico: el modelo vigente está en [`docs/features/authorization.md`](../features/authorization.md) |
+| 14 | [Aplicar migraciones sin cola global y `apply-all` en background](14-fan-out-de-migraciones.md) | 06 §2 (jobs) | 📋 Propuesta — es el fan-out que el plan 06 dejó pendiente |
 
 ## Diagrama de dependencias
 
