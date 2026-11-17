@@ -68,6 +68,11 @@ from app.services.destructive_approval_policy import (
     load_approval_rows,
     person_id,
 )
+from app.services.destructive_verdicts import (
+    load_verdict_rows,
+    store_verdict,
+    stored_reasons_if_current,
+)
 from app.services.db_admin.migration_integrity import version_sort_key
 
 logger = get_logger(__name__)
@@ -86,6 +91,32 @@ def _utcnow() -> datetime:
 
 def _actor_ref(admin_id: int | None, username: str | None) -> dict:
     return {"admin_id": admin_id, "username": username}
+
+
+def refresh_destructive_verdicts_safely(
+    session, model_id: int | None, version: str | None = None
+) -> None:
+    """
+    Gancho para los flujos que crean o editan versiones: precalcula el veredicto de destructividad
+    para que el próximo listado no tenga que analizar. Con ``version`` solo esa; sin ella, todas
+    las del blueprint (alta desde snapshot).
+
+    Nunca rompe la operación que lo llama. El veredicto es un dato derivado y el listado lo
+    recalcula si falta o si su huella no coincide, así que fallar acá solo deja una lectura lenta,
+    mientras que tumbar el alta o la edición de una versión por esto sería peor. Hace su propio
+    ``commit``; llamarlo DESPUÉS del commit de la operación, nunca dentro de su transacción.
+    """
+    if model_id is None:
+        return
+    try:
+        specs = ManagedMigrationController._load_specs(session, model_id, only_version=version)
+        DestructiveApprovalController().refresh_verdicts(session, specs)
+        session.commit()
+    except Exception:  # noqa: BLE001 — ver docstring
+        session.rollback()
+        logger.exception(
+            "No se pudieron precalcular los veredictos destructivos del blueprint %s", model_id
+        )
 
 
 class DestructiveApprovalController:
@@ -251,6 +282,24 @@ class DestructiveApprovalController:
             if reasons:
                 reasons_by_engine[engine.value] = reasons
         return reasons_by_engine
+
+    def refresh_verdicts(self, session, specs: list[MigrationSpec]) -> int:
+        """
+        Recalcula y guarda el veredicto de cada dirección de esas versiones. NO hace ``commit``:
+        lo decide el llamador, que sabe qué más viaja en esa transacción. Devuelve cuántos
+        veredictos escribió.
+
+        Guarda también los NO destructivos (``{}``): sin esa fila, "no destructiva" y "nunca
+        analizada" serían indistinguibles y el listado volvería a parsear toda versión limpia.
+        """
+        written_count = 0
+        for spec in specs:
+            for direction in DESTRUCTIVE_APPROVAL_DIRECTIONS:
+                if direction == DIRECTION_DOWN and not spec.down_sql:
+                    continue
+                store_verdict(session, spec, direction, self._reasons_by_engine(spec, direction))
+                written_count += 1
+        return written_count
 
     @staticmethod
     def _summary_of(reasons_by_engine: dict[str, tuple[str, ...]]) -> str:
@@ -687,7 +736,12 @@ class DestructiveApprovalController:
 
         Con ``managed_database_id`` el estado se evalúa para ESA base (cuentan las aprobaciones de
         su alcance y las del blueprint); sin ella, solo las de alcance blueprint. "Destructiva" se
-        decide sobre TODOS los motores. Cuesta un análisis por versión y motor, memoizado por SQL.
+        decide sobre TODOS los motores.
+
+        El veredicto sale de ``model_migration_destructive_verdicts`` cuando la fila existe y su
+        huella coincide con la de HOY (ver ``destructive_verdicts``); si no, se analiza en vivo
+        (un parseo por versión y motor) y se guarda para la próxima lectura. Una fila vieja o
+        ausente solo cuesta tiempo, nunca da un veredicto desactualizado.
         """
         session = self._session()
         try:
@@ -718,6 +772,9 @@ class DestructiveApprovalController:
                 for direction in DESTRUCTIVE_APPROVAL_DIRECTIONS
             }
 
+            stored_verdict_rows = load_verdict_rows(session, migration_ids)
+            analyzed_live: list[tuple[MigrationSpec, str, dict[str, tuple[str, ...]]]] = []
+
             items: list[dict] = []
             for spec in specs:
                 authorship = authorship_by_migration_id[spec.id]
@@ -728,7 +785,14 @@ class DestructiveApprovalController:
                 for direction in DESTRUCTIVE_APPROVAL_DIRECTIONS:
                     if direction == DIRECTION_DOWN and not spec.down_sql:
                         continue
-                    reasons_by_engine = self._reasons_by_engine(spec, direction)
+                    stored_reasons = stored_reasons_if_current(
+                        stored_verdict_rows, spec, direction
+                    )
+                    if stored_reasons is not None:
+                        reasons_by_engine = stored_reasons
+                    else:
+                        reasons_by_engine = self._reasons_by_engine(spec, direction)
+                        analyzed_live.append((spec, direction, reasons_by_engine))
                     if not reasons_by_engine:
                         continue
                     approvals = approvals_by_direction[direction][spec.id]
@@ -766,6 +830,30 @@ class DestructiveApprovalController:
                             ],
                         }
                     )
+            self._persist_live_verdicts(session, model_id, analyzed_live)
             return items
         finally:
             session.close()
+
+    @staticmethod
+    def _persist_live_verdicts(
+        session,
+        model_id: int,
+        analyzed_live: list[tuple[MigrationSpec, str, dict[str, tuple[str, ...]]]],
+    ) -> None:
+        """
+        Guarda lo que el listado tuvo que analizar en vivo, para que la próxima lectura no lo
+        repita. Es una optimización: si falla (carrera, BD de solo lectura), se registra y la
+        respuesta ya calculada sale igual. Un GET nunca puede fallar por no poder cachear.
+        """
+        if not analyzed_live:
+            return
+        try:
+            for spec, direction, reasons_by_engine in analyzed_live:
+                store_verdict(session, spec, direction, reasons_by_engine)
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception(
+                "No se pudieron guardar los veredictos destructivos del blueprint %s", model_id
+            )

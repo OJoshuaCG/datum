@@ -17,9 +17,11 @@ Integridad: antes de tocar el motor se re-valida el ``checksum`` de cada migraci
 import hashlib
 import json
 import re
+from collections.abc import Callable, Collection
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from sqlalchemy import or_ as sa_or
 from sqlalchemy import update as sa_update
@@ -101,6 +103,13 @@ from app.services.destructive_approval_policy import (
 
 
 logger = get_logger(__name__)
+
+
+class _VersionRow(NamedTuple):
+    """``(id, version)`` de una migración: lo único que ``status`` necesita de cada una."""
+
+    id: int
+    version: str
 
 
 @dataclass
@@ -244,17 +253,42 @@ class ManagedMigrationController:
         )
 
     @staticmethod
+    def _load_versions(session, model_id: int) -> list[_VersionRow]:
+        """
+        Solo ``(id, version)`` de las versiones del blueprint, en orden numérico.
+
+        ``status`` únicamente necesita saber QUÉ versiones existen para calcular las
+        pendientes. ``_load_specs`` trae además cinco columnas ``LONGTEXT`` de SQL y el
+        manifiesto de sentencias, y ``status`` es de las lecturas que más se piden.
+        """
+        rows = (
+            session.query(ModelMigration.id, ModelMigration.version)
+            .filter(ModelMigration.model_id == model_id)
+            .all()
+        )
+        version_rows = [_VersionRow(id=row.id, version=row.version) for row in rows]
+        version_rows.sort(key=lambda version_row: version_sort_key(version_row.version))
+        return version_rows
+
+    @staticmethod
     def _load_specs(
-        session, model_id: int, *, only_version: str | None = None
+        session,
+        model_id: int,
+        *,
+        only_version: str | None = None,
+        only_ids: Collection[int] | None = None,
     ) -> list[MigrationSpec]:
         """
         Las versiones del blueprint como datos planos. ``only_version`` carga UNA sola: lo usa
         el controller de aprobaciones destructivas, que no necesita (ni debe pagar el SQL de)
-        todas las versiones de un blueprint para aprobar una.
+        todas las versiones de un blueprint para aprobar una. ``only_ids`` carga solo esas
+        filas: lo usa ``status`` para las aplicaciones parciales.
         """
         rows_query = session.query(ModelMigration).filter(ModelMigration.model_id == model_id)
         if only_version is not None:
             rows_query = rows_query.filter(ModelMigration.version == only_version)
+        if only_ids is not None:
+            rows_query = rows_query.filter(ModelMigration.id.in_(list(only_ids)))
         rows = rows_query.all()
         # MANIFIESTO de sentencias por migración (una sola consulta para todas). Es
         # OPCIONAL: las migraciones escritas a mano no lo tienen y siguen funcionando por
@@ -327,7 +361,7 @@ class ManagedMigrationController:
         session = self._session()
         try:
             md, server, model = self._load_context(session, db_id)
-            specs = self._load_specs(session, model.id)
+            version_rows = self._load_versions(session, model.id)
             slug = model.slug
             db_name, model_id = md.name, model.id
             cached_version = md.model_version
@@ -342,8 +376,10 @@ class ManagedMigrationController:
         # operador necesita para decidir (pendientes, slug, blueprint — todo computable sin el
         # motor) y dejaría a la SPA pintando un ErrorState sin lugar donde poner el CTA.
         current, database_exists = self._read_current_version_tolerant(target, db_name, slug)
-        latest = specs[-1].version if specs else None
-        pending = self.runner.compute_pending(current, specs)
+        latest = version_rows[-1].version if version_rows else None
+        # ``compute_pending`` solo lee ``.version``: la regla de orden/corte sigue siendo la
+        # única del runner, sin pagar el SQL de cada versión para saber cuáles faltan.
+        pending = self.runner.compute_pending(current, version_rows)
         # Aplicación PARCIAL pendiente: ``current_version`` NO la refleja (Alembic no
         # alcanzó a registrarla), así que sin este campo el estado se lee como sano y el
         # admin descubre el problema recién cuando el rollback se niega.
@@ -374,7 +410,19 @@ class ManagedMigrationController:
                 # que es la llamada con la que el operador decide qué hacer.
                 orphan_tables = []
 
-        by_id = {s.id: s for s in specs}
+        # El SQL completo solo hace falta para planear la reconciliación de las filas que
+        # quedaron a medias, que es el caso raro.
+        partial_ids = {row["model_migration_id"] for row in incomplete}
+        by_id: dict[int, MigrationSpec] = {}
+        if partial_ids:
+            partial_session = self._session()
+            try:
+                by_id = {
+                    spec.id: spec
+                    for spec in self._load_specs(partial_session, model_id, only_ids=partial_ids)
+                }
+            finally:
+                partial_session.close()
         return {
             "managed_database_id": db_id,
             "model_id": model_id,
@@ -954,7 +1002,9 @@ class ManagedMigrationController:
             return self._dry_run_plan(
                 db_id, db_name, server_id, target, slug, specs, up_to_version,
                 env_policy=env_policy,
-                destructive=self._destructive_versions(specs, engine) if env_policy else None,
+                destructive_for=lambda pending_specs: self._destructive_versions(
+                    pending_specs, engine
+                ),
                 admin=admin,
             )
 
@@ -1291,12 +1341,17 @@ class ManagedMigrationController:
         self, db_id, db_name, server_id, target, slug, specs, up_to_version,
         *,
         env_policy: tuple[bool, str] | None = None,
-        destructive: dict[str, tuple[str, ...]] | None = None,
+        destructive_for: Callable[[list[MigrationSpec]], dict[str, tuple[str, ...]]] | None = None,
         admin: "dict | Actor | None" = None,
         issue_token: bool = True,
     ) -> dict:
         """
         Calcula el plan (pendientes) SIN tocar el motor más que para leer la versión.
+
+        ``destructive_for`` recibe las versiones PENDIENTES y devuelve cuáles son destructivas. Es
+        una función y no un dict precalculado porque qué está pendiente solo se sabe después de
+        leer la versión de la BD, y analizar con sqlglot todo el blueprint para quedarse con las
+        pendientes era el costo dominante del dry-run.
 
         ``destructive_plan`` informa el estado de aprobación de cada versión destructiva pendiente y
         emite el ``confirm_token`` (ver ``_build_destructive_plan``). ``apply_all`` pasa
@@ -1328,6 +1383,9 @@ class ManagedMigrationController:
         pending_versions = [s.version for s in pending]
         blocked_by: list[str] = []
         destructive_plan: dict | None = None
+        destructive = (
+            destructive_for(pending) if destructive_for and env_policy and env_policy[0] else None
+        )
         if env_policy and env_policy[0] and destructive:
             hits = [spec for spec in pending if spec.version in destructive]
             if database_exists:
@@ -1556,7 +1614,7 @@ class ManagedMigrationController:
             destructive = (
                 destructive_versions
                 if destructive_versions is not None
-                else self._destructive_versions(specs, engine)
+                else self._destructive_versions(pending, engine)
             )
             destructive_hits = [spec for spec in pending if spec.version in destructive]
             consumed_approvals = self._consume_check(
@@ -2667,7 +2725,7 @@ class ManagedMigrationController:
         try:
             for db_id, _name, server_id, _status in protected:
                 _target, engine = targets[server_id]
-                destructive = destructive_by_engine(engine)
+                destructive = destructive_by_engine(engine, up_to_target)
                 hits = [spec for spec in up_to_target if spec.version in destructive]
                 if not hits:
                     continue
@@ -2718,11 +2776,12 @@ class ManagedMigrationController:
         if not protected:
             return _BatchPreflight()
         is_human = self._is_human_actor(admin)
+        up_to_target_specs = self.runner.compute_pending(None, specs, target_version)
 
         pending_hits_by_db: dict[int, list[MigrationSpec]] = {}
         for db_id, name, server_id, status in protected:
             target, engine = targets[server_id]
-            destructive = destructive_by_engine(engine)
+            destructive = destructive_by_engine(engine, up_to_target_specs)
             if not destructive:
                 continue
             if status == ProvisionStatus.error and not force and not dry_run:
@@ -3059,12 +3118,32 @@ class ManagedMigrationController:
         # El set de versiones destructivas depende del MOTOR (por los overrides por motor), y
         # un lote puede ser heterogéneo. Se memoiza por motor para no re-analizar el mismo SQL
         # por cada BD; ``migration_facts.analyze`` ya cachea, esto además evita rearmar el dict.
-        _destructive_cache: dict[EngineType, dict[str, tuple[str, ...]]] = {}
+        #
+        # Se memoiza por (motor, versión) y se analiza solo el ALCANCE pedido: lo pendiente de
+        # una base es siempre un subconjunto de lo que hay hasta el destino, así que nada de lo
+        # que queda fuera puede ejecutarse en este lote. Sin alcance se analiza todo el blueprint.
+        _destructive_reasons_cache: dict[tuple[EngineType, str], tuple[str, ...]] = {}
 
-        def destructive_by_engine(eng: EngineType) -> dict[str, tuple[str, ...]]:
-            if eng not in _destructive_cache:
-                _destructive_cache[eng] = self._destructive_versions(specs, eng)
-            return _destructive_cache[eng]
+        def destructive_by_engine(
+            eng: EngineType, scope: list[MigrationSpec] | None = None
+        ) -> dict[str, tuple[str, ...]]:
+            scoped_specs = specs if scope is None else scope
+            not_analyzed_yet = [
+                spec for spec in scoped_specs if (eng, spec.version) not in _destructive_reasons_cache
+            ]
+            if not_analyzed_yet:
+                analyzed = self._destructive_versions(not_analyzed_yet, eng)
+                for spec in not_analyzed_yet:
+                    _destructive_reasons_cache[(eng, spec.version)] = analyzed.get(
+                        spec.version, ()
+                    )
+            return {
+                spec.version: _destructive_reasons_cache[(eng, spec.version)]
+                for spec in scoped_specs
+                if _destructive_reasons_cache[(eng, spec.version)]
+            }
+
+        up_to_target_specs = self.runner.compute_pending(None, specs, target_version)
 
         # Todo-o-nada ANTES de la primera base: si falla, no se ejecutó nada.
         preflight = self._preflight_destructive_batch(
@@ -3098,7 +3177,9 @@ class ManagedMigrationController:
                     plan = self._dry_run_plan(
                         db_id, name, server_id, target, slug, specs, target_version,
                         env_policy=policy,
-                        destructive=destructive_by_engine(engine) if policy else None,
+                        destructive_for=lambda pending_specs, eng=engine: destructive_by_engine(
+                            eng, pending_specs
+                        ),
                         admin=admin,
                         issue_token=False,
                     )
@@ -3117,7 +3198,9 @@ class ManagedMigrationController:
                         env_blocks_destructive=bool(policy and policy[0]),
                         env_slug=policy[1] if policy else None,
                         destructive_versions=(
-                            destructive_by_engine(engine) if policy and policy[0] else None
+                            destructive_by_engine(engine, up_to_target_specs)
+                            if policy and policy[0]
+                            else None
                         ),
                         batch_confirmed=preflight.confirmed,
                     )

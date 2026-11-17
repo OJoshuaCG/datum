@@ -3033,3 +3033,37 @@ el clon. Si el destino no tiene la collation, se cae al default y no se falla.
 La reposición de sesión durante un clon completo contra servidores reales: solo se leyó el snapshot en MariaDB 11.4
 (las cuatro clases de objeto devuelven su collation). Los tests de la ejecución usan runners simulados.
 
+
+## El listado de versiones por aprobar parseaba todo el blueprint en cada lectura
+
+**Síntoma.** `GET /database-models/{id}/destructive-versions` tardaba segundos en un blueprint de ~140 versiones.
+
+**Causa.** Decidir si una versión es destructiva cuesta un análisis sqlglot por versión, dirección y motor
+(`migration_facts.analyze`). El listado lo repetía en cada lectura: ~250 SQL distintos contra una `lru_cache` de 128
+entradas, así que la caché nunca acertaba. Medido con un microbenchmark sobre el corpus `.sql` del repo (no contra el
+endpoint real): 494 fallos y 0 aciertos al repetir la petición, 5–7 s por pasada.
+
+**Decisión.** Se guarda el veredicto (`model_migration_destructive_verdicts`, una fila por versión y dirección) al
+crear o editar la versión, y la lectura lo consulta. Es un dato **derivado**, no una fuente de verdad: la fila trae
+una huella (`verdict_fingerprint`) de todo lo que alimenta el veredicto y solo se usa si coincide con la de hoy; si
+no, o si falta, o si está ilegible, el listado analiza en vivo y la guarda. Por eso la corrección no depende de haber
+enganchado todos los puntos de escritura: un camino que se escape solo deja la lectura lenta, nunca equivocada.
+
+**Por qué no `approval_hash` como clave.** Cubre el SQL fuente, no la traducción a PostgreSQL, ni el flag
+`destructive` del manifiesto, ni las reglas del analizador. Una misma huella podría dar veredictos distintos.
+`ANALYSIS_VERSION` (subirla al cambiar `migration_facts`, `destructive_reasons` o `effective_down_sql`) y
+`sqlglot.__version__` entran en la huella.
+
+**Lo que NO cambia.** El guard de `apply`/`rollback` y `approve` siguen analizando el SQL vigente y no leen la
+tabla: un veredicto guardado desactualizado jamás puede dejar pasar una ejecución. Renumerar no invalida (ni la
+versión ni el checksum entran en la huella). Los ganchos (`refresh_destructive_verdicts_safely`) no rompen el alta
+ni la edición si fallan, igual que los de punteros de canal.
+
+**Precarga opcional.** `scripts/backfill_destructive_verdicts.py` (con `--dry-run` y `--model-id`); no hace falta
+para que sea correcto, solo evita que la primera lectura de cada blueprint sea lenta.
+
+### Lo que NO se verificó
+
+Los tiempos reales del endpoint antes y después (no se midió contra el servidor), el costo de la traducción a
+PostgreSQL y la consulta de las aprobaciones. Los tests nuevos (`tests/test_destructive_verdicts.py`) se escribieron
+pero no se ejecutaron en esta sesión.
