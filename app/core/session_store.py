@@ -47,10 +47,10 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
 
-from sqlalchemy import delete, update
+from sqlalchemy import update
 from sqlalchemy.exc import OperationalError
 
-from app.core.database import Database
+from app.core.database import Database, delete_in_batches
 from app.core.environments import (
     DB_HOST,
     DB_NAME,
@@ -397,15 +397,17 @@ def purge_stale(retention_days: int) -> int:
 
     ``retention_days <= 0`` desactiva la purga. Nunca lanza: lo invocan el arranque y una tarea
     periódica, y un fallo de una pasada no puede tumbar el proceso. Una sola sentencia sin
-    lectura previa (ver el docstring del módulo).
+    lectura previa EN LA MISMA TRANSACCIÓN: borra por lotes con ``delete_in_batches``, que lee
+    las claves y borra en transacciones separadas y repite el filtro, así que una sesión que se
+    refresca en el medio se conserva. Sin lotes, un ``DELETE`` grande podía pasar el tope de
+    sentencia y deshacerse entero en cada pasada.
     """
     if retention_days <= 0:
         return 0
     cutoff = _utcnow() - timedelta(days=retention_days)
     try:
-        deleted = _write(
-            delete(GatewaySession).where(GatewaySession.last_seen_at < cutoff),
-            best_effort=True,
+        deleted = delete_in_batches(
+            _session, GatewaySession.sid, GatewaySession.last_seen_at < cutoff
         )
     except Exception:  # noqa: BLE001 — la retención no puede romper el arranque
         logger.warning("No se pudo purgar las sesiones vencidas", exc_info=True)

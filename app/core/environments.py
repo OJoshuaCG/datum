@@ -50,6 +50,9 @@ DOCS_PASSWORD = os.getenv("DOCS_PASSWORD", "")
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "100/minute")
 RATE_LIMIT_REDIS_ENABLED = os.getenv("RATE_LIMIT_REDIS_ENABLED", "False").lower() == "true"
 RATE_LIMIT_REDIS_URL = os.getenv("RATE_LIMIT_REDIS_URL", "redis://localhost:6379")
+# Segundos que el limitador espera a Redis (conexión y cada operación) antes de fallar el request.
+# El chequeo corre síncrono en el event loop: sin tope, un Redis colgado frena todo el proceso.
+RATE_LIMIT_REDIS_SOCKET_TIMEOUT_S = float(os.getenv("RATE_LIMIT_REDIS_SOCKET_TIMEOUT_S", "1.0"))
 # Tope de intentos de login POR CUENTA, independiente de la IP: es lo único que frena un ataque
 # distribuido contra una cuenta concreta (cada IP del atacante tiene su propio cupo por IP).
 # El costo es un DoS de bloqueo: quien conozca un username puede gastarle el cupo y dejar a su
@@ -91,6 +94,14 @@ DB_PASS = os.getenv("DB_PASS", "password")
 DB_NAME = os.getenv("DB_NAME", "database")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_ENGINE = os.getenv("DB_ENGINE", "sqlite")
+# Timeouts de la BD de METADATOS (no de los servidores remotos). El tope real de sentencia lo
+# aplica el motor (max_statement_time / statement_timeout); los de socket son una red de
+# seguridad del cliente y tienen que ser mayores. 0 en el de sentencia lo desactiva.
+DB_CONNECT_TIMEOUT_S = int(os.getenv("DB_CONNECT_TIMEOUT_S", "10"))
+DB_STATEMENT_TIMEOUT_S = int(os.getenv("DB_STATEMENT_TIMEOUT_S", "30"))
+DB_READ_TIMEOUT_S = int(os.getenv("DB_READ_TIMEOUT_S", "60"))
+DB_WRITE_TIMEOUT_S = int(os.getenv("DB_WRITE_TIMEOUT_S", "60"))
+DB_POOL_TIMEOUT_S = int(os.getenv("DB_POOL_TIMEOUT_S", "10"))
 
 # ======= Crypto variables ======= #
 # Sal NO secreta usada para derivar la clave Fernet desde SECRET_KEY (HKDF).

@@ -47,6 +47,7 @@ from app.core.environments import (
     MCP_RATE_LIMIT,
     RATE_LIMIT_DEFAULT,
     RATE_LIMIT_REDIS_ENABLED,
+    RATE_LIMIT_REDIS_SOCKET_TIMEOUT_S,
     RATE_LIMIT_REDIS_URL,
 )
 
@@ -82,10 +83,30 @@ def client_address(request: Request) -> str:
     return f"ip:{get_remote_address(request)}"
 
 
+def storage_options() -> dict[str, float]:
+    """
+    Timeouts del cliente Redis del limitador, o nada con el storage en memoria.
+
+    SlowAPI consulta el storage de forma SÍNCRONA dentro de un middleware ``async``: sin timeout,
+    un Redis colgado (failover, red partida) frena el event loop entero hasta que el kernel corte
+    el socket, minutos después, y con él cada request del proceso. Con timeout, el request que lo
+    sufre falla rápido y el resto sigue. El storage en memoria no acepta estas opciones.
+    """
+    if not RATE_LIMIT_REDIS_ENABLED:
+        return {}
+    return {
+        "socket_timeout": RATE_LIMIT_REDIS_SOCKET_TIMEOUT_S,
+        "socket_connect_timeout": RATE_LIMIT_REDIS_SOCKET_TIMEOUT_S,
+    }
+
+
+_STORAGE_URI = RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://"
+
 limiter = Limiter(
     key_func=session_or_address,
     default_limits=[RATE_LIMIT_DEFAULT],
-    storage_uri=RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://",
+    storage_uri=_STORAGE_URI,
+    storage_options=storage_options(),
 )
 
 
@@ -250,7 +271,8 @@ def agent_token_key(request) -> str:
 mcp_limiter = Limiter(
     key_func=agent_token_key,
     default_limits=[MCP_RATE_LIMIT],
-    storage_uri=RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://",
+    storage_uri=_STORAGE_URI,
+    storage_options=storage_options(),
 )
 
 
@@ -291,5 +313,6 @@ INTEGRATION_BUCKET_DESTRUCTIVE = "destructive"
 integration_limiter = Limiter(
     key_func=integration_token_key,
     default_limits=[INTEGRATION_RATE_LIMIT],
-    storage_uri=RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://",
+    storage_uri=_STORAGE_URI,
+    storage_options=storage_options(),
 )

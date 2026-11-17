@@ -359,3 +359,21 @@ def test_purge_stale_is_disabled_with_a_non_positive_retention(client):
     _envejecer("last_seen_at", timedelta(days=400))
     assert session_store.purge_stale(0) == 0
     assert len(_filas()) == 1
+
+
+def test_purge_stale_deletes_in_batches_until_nothing_is_left(client, monkeypatch):
+    """
+    La purga borra por lotes y sigue hasta vaciar: con un lote de 2 y 3 sesiones vencidas
+    tienen que irse las 3. Un DELETE sin lotes podía pasar el tope de sentencia del motor.
+    """
+    import app.core.database as database_mod
+    from app.core import session_store
+
+    monkeypatch.setattr(database_mod, "PURGE_BATCH_SIZE", 2)
+    for _ in range(3):
+        _login(client)
+    assert len(_filas()) == 3
+
+    _envejecer("last_seen_at", timedelta(days=31))
+    assert session_store.purge_stale(30) == 3
+    assert _filas() == []

@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from app.core import crypto
-from app.core.database import Database
+from app.core.database import Database, delete_in_batches
 from app.core.environments import (
     DB_HOST,
     DB_NAME,
@@ -694,22 +694,17 @@ def purge_expired(ttl_hours: int) -> int:
         return 0
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=ttl_hours)
     try:
-        session = _session()
-        try:
-            deleted = (
-                session.query(MigrationSelectResult)
-                .filter(MigrationSelectResult.captured_at < cutoff)
-                .delete(synchronize_session=False)
+        # Por lotes: un DELETE único sobre muchas capturas podía pasar el tope de sentencia,
+        # deshacerse entero y no avanzar nunca (ver ``delete_in_batches``).
+        deleted = delete_in_batches(
+            _session, MigrationSelectResult.id, MigrationSelectResult.captured_at < cutoff
+        )
+        if deleted:
+            logger.info(
+                "Purga por TTL: %d captura(s) de SELECT de migraciones eliminadas.",
+                deleted,
             )
-            session.commit()
-            if deleted:
-                logger.info(
-                    "Purga por TTL: %d captura(s) de SELECT de migraciones eliminadas.",
-                    deleted,
-                )
-            return int(deleted or 0)
-        finally:
-            session.close()
+        return deleted
     except Exception:  # noqa: BLE001 — la purga no puede romper el arranque
         logger.warning("No se pudo purgar las capturas expiradas", exc_info=True)
         return 0

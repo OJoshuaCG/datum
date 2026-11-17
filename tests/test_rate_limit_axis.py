@@ -222,3 +222,26 @@ def test_login_is_limited_per_ip_across_usernames(client, con_limitador, monkeyp
     codigos = [_intento(client, f"usuario{i}").status_code for i in range(tope + 1)]
     assert codigos[:tope] == [401] * tope
     assert codigos[tope] == 429
+
+
+def test_redis_storage_gets_socket_timeouts(monkeypatch):
+    """
+    Con Redis, el limitador recibe timeouts de socket: SlowAPI lo consulta síncrono dentro del
+    event loop, y un Redis colgado sin timeout frenaría todo el proceso.
+    """
+    import app.core.limiter as limiter_mod
+
+    monkeypatch.setattr(limiter_mod, "RATE_LIMIT_REDIS_ENABLED", True)
+    monkeypatch.setattr(limiter_mod, "RATE_LIMIT_REDIS_SOCKET_TIMEOUT_S", 0.5)
+    assert limiter_mod.storage_options() == {
+        "socket_timeout": 0.5,
+        "socket_connect_timeout": 0.5,
+    }
+
+
+def test_memory_storage_gets_no_redis_options(monkeypatch):
+    """El storage en memoria no acepta opciones de Redis: pasárselas rompería el arranque."""
+    import app.core.limiter as limiter_mod
+
+    monkeypatch.setattr(limiter_mod, "RATE_LIMIT_REDIS_ENABLED", False)
+    assert limiter_mod.storage_options() == {}

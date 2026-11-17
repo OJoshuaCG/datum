@@ -1,9 +1,21 @@
 from contextlib import contextmanager
 
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import URL, create_engine, delete, event, select, text
 from sqlalchemy.orm import sessionmaker
 
-from app.core.environments import DB_ENGINE, DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.environments import (
+    DB_CONNECT_TIMEOUT_S,
+    DB_ENGINE,
+    DB_HOST,
+    DB_NAME,
+    DB_PASS,
+    DB_POOL_TIMEOUT_S,
+    DB_PORT,
+    DB_READ_TIMEOUT_S,
+    DB_STATEMENT_TIMEOUT_S,
+    DB_USER,
+    DB_WRITE_TIMEOUT_S,
+)
 from app.exceptions.AppHttpException import AppHttpException
 from app.utils import dict_utils
 
@@ -25,6 +37,9 @@ def _get_engine_kwargs(engine_prefix: str) -> dict:
         "max_overflow": 20,
         "pool_recycle": 1800,   # recicla conexiones cada 30 min
         "pool_pre_ping": True,  # verifica la conexión antes de usarla (evita stale connections)
+        # Con el pool agotado, el request falla a los N segundos en vez de esperar los 30 por
+        # defecto de SQLAlchemy: una espera de 30 s ya es una página colgada para el operador.
+        "pool_timeout": DB_POOL_TIMEOUT_S,
     }
 
     # La SESIÓN se fija en UTC en los dos motores, y no es preferencia de formato: en la
@@ -44,13 +59,97 @@ def _get_engine_kwargs(engine_prefix: str) -> dict:
             "init_command": (
                 "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, time_zone = '+00:00'"
             ),
+            # Red de seguridad del CLIENTE, por encima del tope del motor (ver
+            # ``_apply_server_statement_timeout``): si el socket no responde, pymysql corta y el
+            # pool descarta la conexión. NO cancela la consulta en el servidor, por eso el límite
+            # real es ``max_statement_time`` y este valor tiene que ser mayor.
+            "connect_timeout": DB_CONNECT_TIMEOUT_S,
+            "read_timeout": DB_READ_TIMEOUT_S,
+            "write_timeout": DB_WRITE_TIMEOUT_S,
         }
     elif engine_prefix == "postgresql":
-        base["connect_args"] = {"connect_timeout": 10, "options": "-c timezone=UTC"}
+        options = "-c timezone=UTC"
+        if DB_STATEMENT_TIMEOUT_S > 0:
+            # El motor cancela la sentencia y libera sus locks; la conexión sigue usable.
+            options += f" -c statement_timeout={DB_STATEMENT_TIMEOUT_S * 1000}"
+        base["connect_args"] = {"connect_timeout": DB_CONNECT_TIMEOUT_S, "options": options}
     elif engine_prefix == "sqlite":
         base["connect_args"] = {"check_same_thread": False}
 
     return base
+
+
+def _apply_server_statement_timeout(dbapi_connection, _connection_record) -> None:
+    """
+    Fija en la SESIÓN el tope de duración de sentencia que hace cumplir el propio motor.
+
+    Va en un listener ``connect`` y no en ``init_command`` porque el mismo driver
+    ``mysql+pymysql`` puede apuntar a MariaDB o a MySQL, y la variable cambia: en MariaDB es
+    ``max_statement_time`` (segundos, cualquier sentencia) y en MySQL ``max_execution_time``
+    (milisegundos, solo SELECT). Un ``SET`` de la variable equivocada fallaría en CADA conexión
+    y tiraría el gateway entero. ``get_server_info()`` no hace una consulta: lo trae el handshake.
+
+    No llega a Alembic: ``alembic/env.py`` arma su propio engine, así que una migración larga de
+    la BD de metadatos no queda cortada por este tope.
+    """
+    if DB_STATEMENT_TIMEOUT_S <= 0:
+        return
+    server_version = dbapi_connection.get_server_info() or ""
+    if "mariadb" in server_version.lower():
+        statement = f"SET SESSION max_statement_time = {int(DB_STATEMENT_TIMEOUT_S)}"
+    else:
+        statement = f"SET SESSION max_execution_time = {int(DB_STATEMENT_TIMEOUT_S * 1000)}"
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute(statement)
+    finally:
+        cursor.close()
+
+
+#: Filas por lote de las purgas. Un ``DELETE`` sin lotes sobre una tabla grande puede pasar el
+#: tope de sentencia: el motor lo deshace entero y la purga no avanza NUNCA, pasada tras pasada.
+PURGE_BATCH_SIZE = 1000
+
+
+def delete_in_batches(session_factory, key_column, *criteria) -> int:
+    """
+    Borra las filas que cumplen ``criteria`` en lotes de ``PURGE_BATCH_SIZE``, cada uno en su
+    propia transacción. Devuelve el total borrado.
+
+    Cada lote lee las claves, CIERRA esa transacción y recién después borra en otra, repitiendo
+    ``criteria`` en el ``WHERE``. Leer y escribir en la misma transacción es el patrón que en
+    MariaDB 11.8 dispara el error 1020 si alguien toca la fila en el medio. Repetir el criterio
+    hace que una fila que cambió entre la lectura y el borrado (por ejemplo una sesión que se
+    refrescó) se conserve.
+
+    Sin ``ORDER BY`` a propósito: a una purga le da igual qué lote sale primero, y ordenar
+    obligaría al motor a ordenar todo el conjunto que cumple el filtro.
+    """
+    model = key_column.class_
+    total_deleted = 0
+    while True:
+        session = session_factory()
+        try:
+            keys = list(
+                session.execute(select(key_column).where(*criteria).limit(PURGE_BATCH_SIZE))
+                .scalars()
+            )
+            # Termina la transacción de lectura antes de escribir (ver el docstring).
+            session.rollback()
+            if not keys:
+                return total_deleted
+            deleted = session.execute(
+                delete(model).where(key_column.in_(keys), *criteria),
+                execution_options={"synchronize_session": False},
+            ).rowcount
+            session.commit()
+        finally:
+            session.close()
+        total_deleted += deleted
+        # Lote incompleto: no queda nada. Lote vacío pese a haber claves: alguien más las
+        # borró o cambió; cortar evita un bucle si el borrado no avanza.
+        if len(keys) < PURGE_BATCH_SIZE or deleted == 0:
+            return total_deleted
 
 
 class Database:
@@ -114,6 +213,8 @@ class Database:
         engine_kwargs = _get_engine_kwargs(engine_prefix)
 
         self.engine = create_engine(DB_URL, **engine_kwargs)
+        if engine_prefix in ("mysql", "mariadb"):
+            event.listen(self.engine, "connect", _apply_server_statement_timeout)
         self.SessionLocal = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
         self._initialized = True
 
