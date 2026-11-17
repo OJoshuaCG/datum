@@ -466,7 +466,9 @@ class UserModel:
                 {"username": username, "capability": capability},
             )
 
-    def find_access_context(self, user_id: int, *, include_inert: bool = False) -> dict:
+    def find_access_context(
+        self, user_id: int, *, include_inert: bool = False, user_row: dict | None = None
+    ) -> dict:
         """
         Lo que hace falta para acuñar un ``Actor``: rol base, overrides por alcance y globales.
 
@@ -494,10 +496,18 @@ class UserModel:
         ``include_inert=True`` es SOLO para la vista de acceso efectivo: trae también las
         capacidades puntuales de un usuario desactivado, que ``explain`` marca ``inert``. La
         autenticación nunca lo usa, así que un usuario inactivo no gana nada.
+
+        ``user_row`` es la fila de ``users`` que quien llama YA leyó en este mismo request (la
+        autenticación la lee para chequear ``is_active``). Con ella se ahorra releer
+        ``gateway_role`` de la misma fila: no es una caché, porque tiene la misma frescura que la
+        lectura que se evita. Tiene que ser la fila de ``user_id``; si no coincide, se ignora.
         """
-        row = self.db.execute_query(
-            "SELECT gateway_role FROM users WHERE id = :id", {"id": user_id}, fetchone=True
-        )
+        if user_row is not None and user_row.get("id") == user_id:
+            row = user_row
+        else:
+            row = self.db.execute_query(
+                "SELECT gateway_role FROM users WHERE id = :id", {"id": user_id}, fetchone=True
+            )
         grants = (
             self.db.execute_query(
                 """

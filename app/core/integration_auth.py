@@ -86,6 +86,7 @@ from app.core.limiter import (
 # integration token has exactly the same issuer semantics as an MCP token.
 from app.core.mcp_auth import _load_issuer
 from app.core.scope import ScopeTarget, assert_layer2, resolve_points
+from app.core.token_usage import record_last_used
 from app.exceptions import AppHttpException
 from app.models.integration_token import (
     IntegrationToken,
@@ -360,9 +361,9 @@ def _authenticate_token(request: Request) -> _AuthenticatedToken:
         if issuer is None:
             raise _reject(request, REASON_ISSUER_INACTIVE, public_id=bearer_parts.public_id)
 
-        if row.last_used_at is None or now - row.last_used_at >= LAST_USED_RESOLUTION:
-            row.last_used_at = now
-            session.commit()
+        # Conditional UPDATE in its own transaction (see ``app.core.token_usage``): committing
+        # here used to expire ``row`` and re-SELECT it for every attribute read below.
+        record_last_used(_session, IntegrationToken, row.id, now, LAST_USED_RESOLUTION)
 
         allowed_server_ids = frozenset(
             server_id

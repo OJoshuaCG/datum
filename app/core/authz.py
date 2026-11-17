@@ -78,7 +78,8 @@ def get_current_actor(request: Request) -> Actor:
     from app.core.auth import authenticated_session
 
     user, sesion = authenticated_session(request)
-    ctx = UserModel().find_access_context(user["id"])
+    # La fila ya leída por la autenticación: evita releer el rol (ver `find_access_context`).
+    ctx = UserModel().find_access_context(user["id"], user_row=user)
     parsed = parse_access_context(ctx)
     actor = _actor_from_parsed(
         user["id"], user["username"], parsed, step_up_until=window_until(sesion.step_up_at)

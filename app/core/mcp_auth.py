@@ -94,6 +94,7 @@ from app.core.crypto import api_token_pepper
 from app.core.environments import MCP_AUTH_FAILURE_RATE_LIMIT, MCP_ENABLED
 from app.core.limiter import hit_or_429, mcp_limiter
 from app.core.mcp_token_format import ACCEPTED_TOKEN_PREFIXES, TOKEN_PREFIX
+from app.core.token_usage import record_last_used
 from app.exceptions import AppHttpException
 from app.models.api_token import ApiToken
 from app.models.user_model import UserModel
@@ -254,7 +255,9 @@ def _load_issuer(created_by_admin_id: int | None) -> Actor | None:
     if not usuario or not usuario.get("is_active"):
         return None
     return actor_from_access_context(
-        usuario["id"], usuario["username"], modelo.find_access_context(usuario["id"])
+        usuario["id"],
+        usuario["username"],
+        modelo.find_access_context(usuario["id"], user_row=usuario),
     )
 
 
@@ -297,58 +300,61 @@ def authenticate_agent(request: Request) -> Actor:
     _, token_id, secreto = partes
 
     ahora = _utcnow()
+    # La sesión vive solo lo que dura la lectura: antes quedaba abierta (con su transacción)
+    # durante el HMAC, la carga del emisor y la auditoría, ocupando una conexión del pool.
+    # Los atributos ya cargados siguen legibles con la sesión cerrada.
     session = _session()
     try:
         fila = (
             session.query(ApiToken).filter(ApiToken.token_id == token_id).one_or_none()
         )
-        if fila is None:
-            # Se paga el HMAC igual: achica la señal de tiempo. El argumento de seguridad, sin
-            # embargo, es la entropía del identificador — ver el docstring del módulo.
-            token_hmac(secreto)
-            raise _reject(request, "inexistente", token_id=token_id)
-
-        if not compare_digest(fila.secret_hmac, token_hmac(secreto)):
-            raise _reject(request, "hmac", token_id=token_id)
-        if fila.revoked_at is not None:
-            raise _reject(request, "revocado", token_id=token_id)
-        if fila.expires_at <= ahora:
-            raise _reject(request, "expirado", token_id=token_id)
-
-        # El token delega a su emisor: se relee en CADA request (igual que ``is_active`` en la
-        # sesión humana), así que desactivar o degradar al emisor surte efecto de inmediato.
-        emisor = _load_issuer(fila.created_by_admin_id)
-        if emisor is None:
-            raise _reject(request, "emisor_inactivo", token_id=token_id)
-
-        if fila.last_used_at is None or ahora - fila.last_used_at >= _LAST_USED_RESOLUTION:
-            fila.last_used_at = ahora
-            session.commit()
-
-        from app.services import audit
-
-        # El USO también se audita, no solo el fallo. Sin esto, un token robado podía enumerar
-        # toda la superficie de tools (`initialize`, `tools/list`, `ping`) sin aparecer nunca en
-        # el registro: el `_audit` del dispatch solo cubre `tools/call`.
-        actor = token_actor(
-            token_pk=fila.id,
-            token_id=fila.token_id,
-            name=fila.name,
-            scopes=fila.scopes,
-            project_id=fila.project_id,
-            issuer=emisor,
-        )
-        # Con el actor YA resuelto: la fila queda ``actor_type='api_token'`` y
-        # ``api_token_id=<pk>``. Con ``admin=None`` (la versión anterior) el filtro forense
-        # ``actor_type='api_token'`` no veía ninguna autenticación de agente.
-        audit.record(
-            "mcp.auth",
-            admin=actor,
-            target_type="api_token",
-            target_id=fila.id,
-            touched_engine=False,
-            detail=f"token={fila.token_id} proyecto={fila.project_id}",
-        )
-        return actor
     finally:
         session.close()
+
+    if fila is None:
+        # Se paga el HMAC igual: achica la señal de tiempo. El argumento de seguridad, sin
+        # embargo, es la entropía del identificador — ver el docstring del módulo.
+        token_hmac(secreto)
+        raise _reject(request, "inexistente", token_id=token_id)
+
+    if not compare_digest(fila.secret_hmac, token_hmac(secreto)):
+        raise _reject(request, "hmac", token_id=token_id)
+    if fila.revoked_at is not None:
+        raise _reject(request, "revocado", token_id=token_id)
+    if fila.expires_at <= ahora:
+        raise _reject(request, "expirado", token_id=token_id)
+
+    # El token delega a su emisor: se relee en CADA request (igual que ``is_active`` en la
+    # sesión humana), así que desactivar o degradar al emisor surte efecto de inmediato.
+    emisor = _load_issuer(fila.created_by_admin_id)
+    if emisor is None:
+        raise _reject(request, "emisor_inactivo", token_id=token_id)
+
+    # UPDATE condicional en transacción propia: ver ``app.core.token_usage``.
+    record_last_used(_session, ApiToken, fila.id, ahora, _LAST_USED_RESOLUTION)
+
+    from app.services import audit
+
+    # El USO también se audita, no solo el fallo. Sin esto, un token robado podía enumerar
+    # toda la superficie de tools (`initialize`, `tools/list`, `ping`) sin aparecer nunca en
+    # el registro: el `_audit` del dispatch solo cubre `tools/call`.
+    actor = token_actor(
+        token_pk=fila.id,
+        token_id=fila.token_id,
+        name=fila.name,
+        scopes=fila.scopes,
+        project_id=fila.project_id,
+        issuer=emisor,
+    )
+    # Con el actor YA resuelto: la fila queda ``actor_type='api_token'`` y
+    # ``api_token_id=<pk>``. Con ``admin=None`` (la versión anterior) el filtro forense
+    # ``actor_type='api_token'`` no veía ninguna autenticación de agente.
+    audit.record(
+        "mcp.auth",
+        admin=actor,
+        target_type="api_token",
+        target_id=fila.id,
+        touched_engine=False,
+        detail=f"token={fila.token_id} proyecto={fila.project_id}",
+    )
+    return actor

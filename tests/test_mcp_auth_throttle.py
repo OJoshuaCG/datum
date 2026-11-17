@@ -145,3 +145,45 @@ def test_the_aggregator_memory_is_bounded():
     for i in range(10):
         assert agg.admit(f"2001:db8::{i}") == 0
     assert len(agg) == 3
+
+
+def _last_used_at(token_id: str):
+    from app.models.api_token import ApiToken
+
+    s = Database().get_declarative_base_session()
+    try:
+        return s.query(ApiToken).filter(ApiToken.token_id == token_id).one().last_used_at
+    finally:
+        s.close()
+
+
+def test_last_used_at_is_written_on_first_use_and_throttled_to_one_write_per_minute(
+    client, admin_client, mcp_on
+):
+    """
+    ``last_used_at`` se escribe con un UPDATE condicional en transacción propia (sin leer y
+    escribir en la misma, que en MariaDB 11.8 dispara el 1020) y conserva el throttle de 60 s.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import text
+
+    bearer = _token_valido(admin_client)
+    token_id = bearer.split(".")[1]
+    assert _last_used_at(token_id) is None
+
+    assert _rpc(client, bearer).status_code == 200
+    first_use = _last_used_at(token_id)
+    assert first_use is not None
+
+    assert _rpc(client, bearer).status_code == 200
+    assert _last_used_at(token_id) == first_use
+
+    stale_use = first_use - timedelta(minutes=2)
+    with Database().engine.begin() as connection:
+        connection.execute(
+            text("UPDATE api_tokens SET last_used_at = :t WHERE token_id = :tid"),
+            {"t": stale_use, "tid": token_id},
+        )
+    assert _rpc(client, bearer).status_code == 200
+    assert _last_used_at(token_id) > stale_use
