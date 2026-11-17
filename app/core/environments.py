@@ -352,6 +352,16 @@ MIGRATION_MIRROR_ENABLED = (
     os.getenv("MIGRATION_MIRROR_ENABLED", "True").lower() == "true"
 )
 
+# ======= Espera de metadata lock al aplicar migraciones (MySQL/MariaDB) ======= #
+# Segundos que una sentencia de migración espera un METADATA LOCK antes de fallar con 1205
+# (``engine.lock_timeout``). El default del motor es de UN AÑO en MySQL y un día en MariaDB:
+# con una transacción abierta sobre la tabla, el ALTER quedaba encolado hasta el timeout de
+# socket (``REMOTE_BULK_STATEMENT_TIMEOUT_MS``, 1 h) y bloqueaba detrás de él cada consulta
+# nueva a esa tabla en la base del tercero. NO limita cuánto TRABAJA el ALTER, solo cuánto
+# ESPERA para empezar. 0 = no se fija (queda el default del motor). PostgreSQL ya tiene su
+# ``lock_timeout`` en ``remote_engine._connect_args``.
+MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS = int(os.getenv("MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS", "60"))
+
 # ======= Captura de resultados de SELECT en migraciones de blueprint ======= #
 # KILL SWITCH global. False = ninguna migración captura resultados, ni con
 # capture_selects=true en la versión (el SQL se ejecuta exactamente igual que hoy: la

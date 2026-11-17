@@ -41,7 +41,10 @@ from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Connection, inspect
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.core.environments import MIGRATION_CAPTURE_ENABLED
+from app.core.environments import (
+    MIGRATION_CAPTURE_ENABLED,
+    MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS,
+)
 from app.core.logger import get_logger
 from app.core.remote_engine import (
     ServerTarget,
@@ -909,6 +912,38 @@ class MigrationRunner:
         conn.exec_driver_sql("SET collation_connection = @@collation_database")
         logger.debug("Collation de sesión alineada a %s para la BD %s", collation, db_name)
 
+    @staticmethod
+    def _bound_metadata_lock_wait(
+        conn, engine: EngineType, timeout_seconds: int | None = None
+    ) -> None:
+        """
+        Acota cuánto ESPERA cada sentencia de la migración un metadata lock (MySQL/MariaDB).
+
+        Sin esto rige el default del motor: un AÑO en MySQL, un día en MariaDB. Una transacción
+        abierta sobre la tabla dejaba el ALTER encolado hasta el timeout de socket (1 h), y
+        detrás de ese ALTER se encola toda consulta nueva a la tabla en la base del tercero.
+        Con el tope, la sentencia falla con 1205 (``engine.lock_timeout``) y sigue el camino de
+        fallo de siempre (checkpoint intacto: ``record_statement`` corre solo tras un éxito).
+
+        Solo ``lock_wait_timeout``: NO ``max_statement_time`` (abortaría un ALTER largo que
+        está trabajando, no esperando) ni ``innodb_lock_wait_timeout`` (locks de fila, ya
+        acotado a 50 s por el motor). PostgreSQL ya tiene ``lock_timeout`` en la conexión.
+        Best-effort, como ``statement_limits.apply_session_timeouts``.
+        """
+        if engine not in (EngineType.mysql, EngineType.mariadb):
+            return
+        seconds = (
+            MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        )
+        if seconds <= 0:
+            return
+        # Entero de configuración, nunca texto de usuario: interpolarlo es seguro.
+        statement = f"SET SESSION lock_wait_timeout = {int(seconds)}"
+        try:
+            conn.exec_driver_sql(statement)
+        except SQLAlchemyError:
+            logger.warning("El motor no admite «%s»; la migración sigue sin tope.", statement)
+
     def _acquire_lock(self, conn, engine: EngineType, lock_key: int) -> None:
         """
         Advisory lock por BD con semántica HOMOGÉNEA entre motores: si no se obtiene
@@ -1051,6 +1086,7 @@ class MigrationRunner:
                     with database_connection(target, db_name, bulk=bulk) as conn:
                         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                         self._align_session_collation(conn, engine, db_name)
+                        self._bound_metadata_lock_wait(conn, engine)
                         self._acquire_lock(conn, engine, managed_db_id)
                         try:
                             version_table = modernize_accounting(conn, slug, engine)
@@ -1387,6 +1423,7 @@ class MigrationRunner:
             # que puede permitirse dejar la BD a mitad de camino.
             with database_connection(target, db_name, bulk=True) as conn:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                self._bound_metadata_lock_wait(conn, engine)
                 self._acquire_lock(conn, engine, managed_db_id)
                 try:
                     aborted = False

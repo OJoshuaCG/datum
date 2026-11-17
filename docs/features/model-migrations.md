@@ -1115,6 +1115,14 @@ datos de la BD destino**, no del texto de la sentencia. La misma versión es ins
 hermana chica y tarda minutos en una grande, y una que hoy tarda dos segundos va a tardar cinco
 cuando la tabla crezca. Una marca por versión codificaría una propiedad que la versión no tiene.
 
+**La espera de un lock sí tiene tope propio.** En MySQL/MariaDB, `apply`, `rollback`, `stamp` y la
+reconciliación fijan `lock_wait_timeout` en su sesión (`MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS`, 60 s
+por default; `0` = default del motor, un año en MySQL y un día en MariaDB). Si la tabla tiene una
+transacción abierta en la base del tercero, la sentencia falla con `engine.lock_timeout` en vez de
+quedar encolada hasta el timeout de volcado bloqueando toda consulta nueva a esa tabla. No limita
+lo que **trabaja** el `ALTER`, solo lo que **espera** para empezar. PostgreSQL ya lleva
+`lock_timeout` en la conexión.
+
 **Por qué los 15 s no eran una protección.** El reflejo es que subir el timeout deja pasar una
 migración descontrolada. Con *ese* timeout no era así: en MySQL/MariaDB son
 `read_timeout`/`write_timeout` **de socket, del CLIENTE**, y **no cancelan nada en el motor**. Lo

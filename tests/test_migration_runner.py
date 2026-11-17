@@ -197,6 +197,46 @@ def test_align_session_collation_is_a_noop_on_postgresql():
     assert conn.executed == []
 
 
+@pytest.mark.parametrize("engine", [EngineType.mysql, EngineType.mariadb])
+def test_bound_metadata_lock_wait_sets_only_lock_wait_timeout(engine):
+    """
+    Sin tope, un ALTER espera un metadata lock hasta UN AÑO (MySQL) y encola detrás toda la
+    tabla. Solo se acota la ESPERA: ni ``max_statement_time`` ni ``max_execution_time``, que
+    abortarían un ALTER largo que está trabajando.
+    """
+    conn = _RecordingConn()
+    MigrationRunner._bound_metadata_lock_wait(conn, engine, timeout_seconds=60)
+    assert conn.executed == ["SET SESSION lock_wait_timeout = 60"]
+
+
+def test_bound_metadata_lock_wait_uses_the_configured_default(monkeypatch):
+    from app.services.db_admin import migrations as mig
+
+    monkeypatch.setattr(mig, "MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS", 45)
+    conn = _RecordingConn()
+    MigrationRunner._bound_metadata_lock_wait(conn, EngineType.mysql)
+    assert conn.executed == ["SET SESSION lock_wait_timeout = 45"]
+
+
+def test_bound_metadata_lock_wait_zero_keeps_the_engine_default():
+    conn = _RecordingConn()
+    MigrationRunner._bound_metadata_lock_wait(conn, EngineType.mysql, timeout_seconds=0)
+    assert conn.executed == []
+
+
+def test_bound_metadata_lock_wait_is_a_noop_on_postgresql():
+    """PostgreSQL ya lleva ``lock_timeout`` en los parámetros de conexión."""
+    conn = _RecordingConn()
+    MigrationRunner._bound_metadata_lock_wait(conn, EngineType.postgresql, timeout_seconds=60)
+    assert conn.executed == []
+
+
+def test_bound_metadata_lock_wait_is_best_effort():
+    conn = _RecordingConn(fail_on="lock_wait_timeout")
+    MigrationRunner._bound_metadata_lock_wait(conn, EngineType.mysql, timeout_seconds=60)
+    assert conn.executed == ["SET SESSION lock_wait_timeout = 60"]
+
+
 def test_toggle_fk_checks_is_best_effort():
     """Si el SET falla (motor sin soporte, o el pseudo-root sin permiso), se ignora."""
     conn = _RecordingConn(fail_on="FOREIGN_KEY_CHECKS")
