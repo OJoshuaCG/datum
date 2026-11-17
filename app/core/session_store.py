@@ -47,7 +47,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
 
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlalchemy.exc import OperationalError
 
 from app.core.database import Database
@@ -384,6 +384,35 @@ def revoke_unexpired_for_user(user_id: int, reason: str) -> int:
         .values(revoked_at=ahora, revoked_reason=reason),
         best_effort=False,
     )
+
+
+def purge_stale(retention_days: int) -> int:
+    """
+    Borra las sesiones cuyo ``last_seen_at`` es más viejo que la retención. Devuelve cuántas.
+
+    Es seguro por construcción: ``last_seen_at`` es el último request visto, así que una fila con
+    más retención que ``SESSION_ABSOLUTE_MAX_HOURS`` ya no puede autenticar a nadie (vencida o
+    revocada). El borrado es el cierre del ciclo de ``revoked_at``: se conserva el rastro durante
+    la retención y después se libera la tabla.
+
+    ``retention_days <= 0`` desactiva la purga. Nunca lanza: lo invocan el arranque y una tarea
+    periódica, y un fallo de una pasada no puede tumbar el proceso. Una sola sentencia sin
+    lectura previa (ver el docstring del módulo).
+    """
+    if retention_days <= 0:
+        return 0
+    cutoff = _utcnow() - timedelta(days=retention_days)
+    try:
+        deleted = _write(
+            delete(GatewaySession).where(GatewaySession.last_seen_at < cutoff),
+            best_effort=True,
+        )
+    except Exception:  # noqa: BLE001 — la retención no puede romper el arranque
+        logger.warning("No se pudo purgar las sesiones vencidas", exc_info=True)
+        return 0
+    if deleted:
+        logger.info("Purga por retención: %d sesión(es) de administrador eliminadas.", deleted)
+    return deleted
 
 
 def list_unexpired_for_user(user_id: int) -> list[dict]:

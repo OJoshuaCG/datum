@@ -331,3 +331,31 @@ def test_a_revocation_is_never_silently_dropped(monkeypatch):
     _patch_sessions(monkeypatch, fallas=2)
     with pytest.raises(OperationalError):
         session_store._write(object(), best_effort=False)
+
+
+# --------------------------------------------------------------------------- #
+# Purga por retención                                                          #
+# --------------------------------------------------------------------------- #
+def test_purge_stale_deletes_only_sessions_past_the_retention(client):
+    from app.core import session_store
+
+    _login(client)
+    assert len(_filas()) == 1
+
+    # Dentro de la retención: se conserva aunque ya esté vencida por inactividad.
+    _envejecer("last_seen_at", timedelta(days=29))
+    assert session_store.purge_stale(30) == 0
+    assert len(_filas()) == 1
+
+    _envejecer("last_seen_at", timedelta(days=31))
+    assert session_store.purge_stale(30) == 1
+    assert _filas() == []
+
+
+def test_purge_stale_is_disabled_with_a_non_positive_retention(client):
+    from app.core import session_store
+
+    _login(client)
+    _envejecer("last_seen_at", timedelta(days=400))
+    assert session_store.purge_stale(0) == 0
+    assert len(_filas()) == 1

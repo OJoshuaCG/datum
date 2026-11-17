@@ -33,7 +33,7 @@ cambio de password" es exactamente la pregunta que se hace después de un incide
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -41,7 +41,12 @@ from app.models.base import Base
 
 class GatewaySession(Base):
     __tablename__ = "gateway_sessions"
-    __table_args__ = ({"comment": "Sesiones de administrador, con vida absoluta y revocación"},)
+    __table_args__ = (
+        # La purga por retención filtra solo por ``last_seen_at``; sin índice sería un barrido
+        # completo de la tabla en cada pasada.
+        Index("ix_gs_last_seen_at", "last_seen_at"),
+        {"comment": "Sesiones de administrador, con vida absoluta y revocación"},
+    )
 
     # Sin `TimestampMixin` a propósito: su `updated_at` se toca en cada UPDATE y acá el UPDATE
     # frecuente es el de `last_seen_at`, así que serían dos columnas diciendo lo mismo. Y

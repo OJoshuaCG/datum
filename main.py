@@ -3,13 +3,15 @@ from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
-from app.core import remote_engine
+from app.core import remote_engine, session_store
 from app.core.auth import bootstrap_admin
 from app.core.environments import (
     CORS_ORIGINS,
     EXPORT_PURGE_INTERVAL_MINUTES,
     MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES,
     MIGRATION_CAPTURE_TTL_HOURS,
+    SESSION_PURGE_INTERVAL_MINUTES,
+    SESSION_RETENTION_DAYS,
 )
 from app.core.logger import get_logger
 from app.core.versioned_app import (
@@ -55,6 +57,24 @@ async def _purge_captures_periodically(ttl_hours: int, interval_seconds: int) ->
             logger.warning(
                 "Falló una pasada de la purga periódica de capturas de SELECT", exc_info=True
             )
+
+
+async def _purge_sessions_periodically(retention_days: int, interval_seconds: int) -> None:
+    """
+    Repite la purga por retención de ``gateway_sessions`` mientras el proceso viva.
+
+    MISMA plantilla que ``_purge_captures_periodically``: la del arranque sola no cumple la
+    retención en un gateway que corre semanas. ``purge_stale`` es I/O SÍNCRONO, así que va a un
+    hilo con ``asyncio.to_thread``; un fallo de una pasada no mata el bucle.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await asyncio.to_thread(session_store.purge_stale, retention_days)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — la retención no puede tumbar el proceso
+            logger.warning("Falló una pasada de la purga periódica de sesiones", exc_info=True)
 
 
 async def _purge_export_artifacts_periodically(interval_seconds: int) -> None:
@@ -189,6 +209,16 @@ async def lifespan(app: FastAPI):
             ),
             name="migration-capture-purge",
         )
+    # Sesiones de administrador ya muertas: se borran pasada la retención (SESSION_RETENTION_DAYS).
+    session_store.purge_stale(SESSION_RETENTION_DAYS)
+    session_purge_task: asyncio.Task | None = None
+    if SESSION_RETENTION_DAYS > 0 and SESSION_PURGE_INTERVAL_MINUTES > 0:
+        session_purge_task = asyncio.create_task(
+            _purge_sessions_periodically(
+                SESSION_RETENTION_DAYS, SESSION_PURGE_INTERVAL_MINUTES * 60
+            ),
+            name="session-purge",
+        )
     export_purge_task: asyncio.Task | None = None
     if EXPORT_PURGE_INTERVAL_MINUTES > 0:
         export_purge_task = asyncio.create_task(
@@ -205,7 +235,7 @@ async def lifespan(app: FastAPI):
         #
         # Cancelar la tarea periódica y ESPERARLA: sin el await, el intérprete cierra el loop
         # con la tarea todavía pendiente.
-        for task in (purge_task, export_purge_task):
+        for task in (purge_task, export_purge_task, session_purge_task):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):

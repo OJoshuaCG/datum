@@ -413,6 +413,13 @@ SESSION_ABSOLUTE_MAX_HOURS = int(os.getenv("SESSION_ABSOLUTE_MAX_HOURS", "12"))
 # Timeout de INACTIVIDAD, contra `last_seen_at`. 60 min y no las 8 h históricas: es una
 # herramienta con credenciales pseudo-root sobre bases de terceros y se usa a ráfagas.
 SESSION_IDLE_MINUTES = int(os.getenv("SESSION_IDLE_MINUTES", "60"))
+# Retención (días) de las filas de ``gateway_sessions`` ya muertas, contada desde
+# ``last_seen_at``. Una sesión deja de autenticar a las 12 h (absoluto) o a los 60 min (inactividad),
+# así que 30 días solo conservan el rastro de cuándo y por qué se cerró para investigar un
+# incidente reciente. `0` desactiva la purga (retención indefinida).
+SESSION_RETENTION_DAYS = int(os.getenv("SESSION_RETENTION_DAYS", "30"))
+# Cada cuánto se repite la purga mientras el proceso vive. `0` deja solo la del arranque.
+SESSION_PURGE_INTERVAL_MINUTES = int(os.getenv("SESSION_PURGE_INTERVAL_MINUTES", "360"))
 # Flag `Secure` de la cookie de sesión. Por defecto sigue a APP_ENV=="production"
 # (comportamiento histórico). Se puede fijar explícitamente (True/False) para
 # desacoplarlo de APP_ENV, p. ej. mientras se termina de configurar TLS delante del
