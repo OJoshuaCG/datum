@@ -1861,8 +1861,15 @@ class SchemaComparisonController:
         """Persiste el resultado por sentencia en ``schema_comparison_items``."""
         session = self._session()
         try:
+            # Una sola consulta con ``IN`` en vez de un ``get`` por sentencia.
+            items_by_id = {
+                item.id: item
+                for item in session.query(SchemaComparisonItem)
+                .filter(SchemaComparisonItem.id.in_([d["id"] for d in resolved]))
+                .all()
+            }
             for k, d in enumerate(resolved):
-                item = session.get(SchemaComparisonItem, d["id"])
+                item = items_by_id.get(d["id"])
                 if item is None:
                     continue
                 if k < len(results):

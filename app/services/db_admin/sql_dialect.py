@@ -574,6 +574,19 @@ _PG_BLOCKERS: tuple[tuple[re.Pattern, str], ...] = (
 )
 
 
+# Por encima de este tamaño el transpilado no se cachea. Con 256 entradas de hasta 256 KB de
+# ``up_sql`` (más el resultado) la caché podía retener decenas de MB; el mismo techo que
+# ``migration_facts._CACHE_MAX_SQL_BYTES``. Esos scripts enormes son justo los que casi no se repiten.
+_TRANSPILE_CACHE_MAX_SQL_BYTES = 64 * 1024
+
+
+def _transpile_uncached(sql: str, read: str, write: str) -> tuple[str, ...] | None:
+    try:
+        return tuple(sqlglot.transpile(sql, read=read, write=write))
+    except sqlglot.errors.SqlglotError:
+        return None
+
+
 @lru_cache(maxsize=256)
 def _transpile_cached(sql: str, read: str, write: str) -> tuple[str, ...] | None:
     """
@@ -584,12 +597,15 @@ def _transpile_cached(sql: str, read: str, write: str) -> tuple[str, ...] | None
     sentencias, otra en el guard de traducibilidad. El ``up_sql`` de una migración es
     inmutable (cualquier cambio pasa por un ``PATCH`` que recalcula el checksum), así que
     cachear por (sql, dialectos) es seguro. Acotado a 256 entradas para no crecer sin
-    límite con scripts grandes.
+    límite con scripts grandes; los muy grandes ni entran (ver ``_transpile``).
     """
-    try:
-        return tuple(sqlglot.transpile(sql, read=read, write=write))
-    except sqlglot.errors.SqlglotError:
-        return None
+    return _transpile_uncached(sql, read, write)
+
+
+def _transpile(sql: str, read: str, write: str) -> tuple[str, ...] | None:
+    if len(sql.encode("utf-8")) > _TRANSPILE_CACHE_MAX_SQL_BYTES:
+        return _transpile_uncached(sql, read, write)
+    return _transpile_cached(sql, read, write)
 
 
 class SqlTranslator:
@@ -611,7 +627,7 @@ class SqlTranslator:
         write = _SQLGLOT_DIALECT.get(to_engine)
         if write is None:
             return None
-        parts = _transpile_cached(sql, _REFERENCE_DIALECT, write)
+        parts = _transpile(sql, _REFERENCE_DIALECT, write)
         if not parts:
             return None
         cleaned = [p.strip() for p in parts if p.strip()]

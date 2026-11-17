@@ -179,7 +179,6 @@ class MigrationFacts:
     gateway_internal_tables: tuple[str, ...]
     requires_existing_tables: tuple[str, ...]
     creates_tables: tuple[str, ...]
-    postgresql_blockers: tuple[str, ...]
     resumable: bool
 
 
@@ -370,12 +369,6 @@ def _analyze_uncached(sql: str, kind: str, has_non_portable: bool) -> MigrationF
         gateway_internal_tables=tuple(references_gateway_internal_table(sql)),
         requires_existing_tables=tuple(required),
         creates_tables=tuple(created),
-        # SIEMPRE contra PostgreSQL: es la única dirección donde la traducción puede fallar
-        # (el up_sql se escribe en estilo MySQL). Es el 422 que hoy solo aparece al aplicar
-        # contra una BD PostgreSQL concreta.
-        postgresql_blockers=tuple(
-            SqlTranslator().translation_blockers(sql, EngineType.postgresql)
-        ),
         resumable=is_resumable(
             sql, statements, kind=kind, has_non_portable=has_non_portable
         ),
@@ -408,6 +401,27 @@ def analyze(
     if len(sql.encode("utf-8")) > _CACHE_MAX_SQL_BYTES:
         return _analyze_uncached(sql, kind, has_non_portable)
     return _analyze_cached(sql, kind, has_non_portable)
+
+
+@lru_cache(maxsize=128)
+def _postgresql_blockers_cached(sql: str) -> tuple[str, ...]:
+    return tuple(SqlTranslator().translation_blockers(sql, EngineType.postgresql))
+
+
+def postgresql_blockers(sql: str) -> tuple[str, ...]:
+    """
+    Qué del SQL no se puede traducir a PostgreSQL. SIEMPRE contra PostgreSQL: es la única
+    dirección donde la traducción puede fallar (el ``up_sql`` se escribe en estilo MySQL). Es el
+    422 que de otro modo solo aparece al aplicar contra una BD PostgreSQL concreta.
+
+    Vive aparte de ``analyze`` a propósito: costaba un transpile completo por cada análisis, y el
+    único consumidor es el validador del formulario. Los análisis que solo deciden si algo es
+    destructivo (el guard de apply, el listado de versiones por aprobar) lo pagaban sin leerlo.
+    Mismo tope de bytes que ``analyze``.
+    """
+    if len(sql.encode("utf-8")) > _CACHE_MAX_SQL_BYTES:
+        return tuple(SqlTranslator().translation_blockers(sql, EngineType.postgresql))
+    return _postgresql_blockers_cached(sql)
 
 
 def _quick_facts_uncached(sql: str) -> QuickFacts:

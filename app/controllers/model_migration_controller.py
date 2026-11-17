@@ -65,6 +65,20 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
+def _refresh_destructive_verdicts(session, model_id: int | None, version: str | None = None) -> None:
+    """
+    Precalcula el veredicto de destructividad de la versión (ver
+    ``refresh_destructive_verdicts_safely``). Import diferido: ``destructive_approval_controller``
+    llega a este módulo por ``blueprint_channel_controller``, y uno de nivel superior cierra el ciclo.
+    """
+    from app.controllers.destructive_approval_controller import (
+        refresh_destructive_verdicts_safely,
+    )
+
+    refresh_destructive_verdicts_safely(session, model_id, version)
+
+
 # Orden NUMÉRICO de versión en SQL: (longitud, valor) equivale al orden entero para
 # strings de solo dígitos (incl. con ceros a la izquierda), evitando el bug del orden
 # lexicográfico ("9999" > "10000"). Cross-engine (length() existe en los 4 motores).
@@ -906,8 +920,15 @@ class ModelMigrationController:
             self._model_or_404(session, model_id)
             q = session.query(ModelMigration).filter(ModelMigration.model_id == model_id)
             total = q.count()
-            tip = q.order_by(*_VERSION_ORDER_DESC).first()
-            tip_version = tip.version if tip else None
+            # Solo la columna ``version``: la fila completa arrastra cinco ``LONGTEXT`` de SQL
+            # que acá se descartan.
+            tip_row = (
+                session.query(ModelMigration.version)
+                .filter(ModelMigration.model_id == model_id)
+                .order_by(*_VERSION_ORDER_DESC)
+                .first()
+            )
+            tip_version = tip_row.version if tip_row else None
             sort = _VERSION_ORDER_DESC if order == "desc" else _VERSION_ORDER_ASC
             rows = q.order_by(*sort).limit(limit).offset(offset).all()
             # La punta se busca sobre TODAS las versiones, no sobre la página: con paginación,
@@ -1264,6 +1285,7 @@ class ModelMigrationController:
                     session.commit()  # inserción + current_version en un único commit
                     # Una versión creada ya revisada pasa a ser candidata a punta de ``latest``.
                     sync_automatic_pointers_safely(session, model_id)
+                    _refresh_destructive_verdicts(session, model_id, version)
                     break
                 except IntegrityError as exc:
                     session.rollback()
@@ -1657,6 +1679,7 @@ class ModelMigrationController:
                     }
                 )
             session.commit()
+            _refresh_destructive_verdicts(session, model.id)
             session.refresh(model)
             return model.id, self._serialize_model(model), summaries
         finally:
@@ -1939,6 +1962,8 @@ class ModelMigrationController:
             session.commit()
             # Aprobar (o revocar) una versión cambia a qué puede apuntar un canal automático.
             sync_automatic_pointers_safely(session, model_id)
+            if sql_fields_changing or down_sql_changing:
+                _refresh_destructive_verdicts(session, model_id, m.version)
             session.refresh(m)
             result = self._serialize(m, self._policy_for(session, m))
         finally:
@@ -3154,7 +3179,7 @@ class ModelMigrationController:
             "destructive_statements": list(facts.destructive_statements),
             "parse_errors": [{"seq": seq, "message": msg} for seq, msg in facts.parse_errors],
             "gateway_internal_tables": list(facts.gateway_internal_tables),
-            "postgresql_blockers": list(facts.postgresql_blockers),
+            "postgresql_blockers": list(migration_facts.postgresql_blockers(up_sql)),
             "resumable": facts.resumable,
             "referenced_tables": list(facts.requires_existing_tables),
             "pending_before": pending_before,

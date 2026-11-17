@@ -48,42 +48,59 @@ class _SystemActor:
 SYSTEM_ACTOR = _SystemActor()
 
 
-def _latest_reviewed_migration(session, model_id: int) -> ModelMigration | None:
-    reviewed_rows = (
-        session.query(ModelMigration)
-        .filter(ModelMigration.model_id == model_id, ModelMigration.reviewed.is_(True))
-        .all()
-    )
-    if not reviewed_rows:
-        return None
-    return max(reviewed_rows, key=lambda row: version_sort_key(row.version))
+class _MigrationIndex:
+    """
+    Las versiones de UN blueprint, cargadas UNA vez por pasada y solo con las tres columnas que
+    hacen falta (``id``, ``version``, ``reviewed``).
+
+    ``ModelMigration`` trae cinco columnas de SQL en ``LONGTEXT``. Antes cada canal automático
+    volvía a cargar todas las filas completas del blueprint solo para quedarse con un número de
+    versión, y eso corría en cada alta/edición de versión y, para todos los blueprints, en el
+    arranque y en cada alta de canal. La fila completa se pide únicamente para el ganador.
+    """
+
+    def __init__(self, session, model_id: int) -> None:
+        rows = (
+            session.query(ModelMigration.id, ModelMigration.version, ModelMigration.reviewed)
+            .filter(ModelMigration.model_id == model_id)
+            .all()
+        )
+        self.id_by_version: dict[str, int] = {row.version: row.id for row in rows}
+        self.reviewed_by_id: dict[int, bool] = {row.id: bool(row.reviewed) for row in rows}
+        reviewed_rows = [row for row in rows if row.reviewed]
+        # El orden es el numérico de ``version_sort_key``, no el lexicográfico del texto.
+        self.latest_reviewed_id: int | None = (
+            max(reviewed_rows, key=lambda row: version_sort_key(row.version)).id
+            if reviewed_rows
+            else None
+        )
 
 
-def _derived_minimum_migration(
-    session, model_id: int, channel: ReleaseChannel
-) -> ModelMigration | None:
+def _derived_minimum_migration_id(
+    session, model_id: int, channel: ReleaseChannel, index: _MigrationIndex
+) -> int | None:
     if channel.environment_id is None:
         return None
     # Import perezoso: el controller importa este módulo desde sus ganchos.
     from app.controllers.blueprint_channel_controller import BlueprintChannelController
 
     states = BlueprintChannelController._cached_states(session, model_id, channel.environment_id)
-    migrations = session.query(ModelMigration).filter(ModelMigration.model_id == model_id).all()
-    migration_by_version = {row.version: row for row in migrations}
-    outcome = evaluate_derived(states, {row.version: row.id for row in migrations})
+    outcome = evaluate_derived(states, index.id_by_version)
     if outcome.error_code is not None or outcome.version is None:
         return None
-    return migration_by_version.get(outcome.version)
+    return index.id_by_version.get(outcome.version)
 
 
-def _automatic_target(session, model_id: int, channel: ReleaseChannel) -> ModelMigration | None:
+def _automatic_target(
+    session, model_id: int, channel: ReleaseChannel, index: _MigrationIndex
+) -> ModelMigration | None:
     if channel.resolution_mode == channel_codes.MODE_LATEST:
-        candidate = _latest_reviewed_migration(session, model_id)
+        candidate_id = index.latest_reviewed_id
     else:
-        candidate = _derived_minimum_migration(session, model_id, channel)
-    if candidate is None or not candidate.reviewed:
+        candidate_id = _derived_minimum_migration_id(session, model_id, channel, index)
+    if candidate_id is None or not index.reviewed_by_id.get(candidate_id, False):
         return None
-    return candidate
+    return session.get(ModelMigration, candidate_id)
 
 
 def sync_automatic_pointers(session, model_id: int) -> list[dict]:
@@ -102,9 +119,12 @@ def sync_automatic_pointers(session, model_id: int) -> list[dict]:
         .order_by(ReleaseChannel.id.asc())
         .all()
     )
+    if not automatic_channels:
+        return []
+    migration_index = _MigrationIndex(session, model_id)
     moves: list[dict] = []
     for channel in automatic_channels:
-        target = _automatic_target(session, model_id, channel)
+        target = _automatic_target(session, model_id, channel, migration_index)
         if target is None:
             continue
         pointer = session.get(

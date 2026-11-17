@@ -265,14 +265,18 @@ class AuthzController:
                 or 0
             )
 
+            # Dos consultas fijas en vez de tres por servidor: todas las (servidor, entorno) de
+            # las bases y el mapa de entornos, que es una tabla chica.
+            environment_ids_by_server: dict[int, list[int | None]] = {}
+            for server_id, environment_id in session.query(
+                ManagedDatabase.server_id, ManagedDatabase.environment_id
+            ).all():
+                environment_ids_by_server.setdefault(server_id, []).append(environment_id)
+            environment_by_id = {env.id: env for env in session.query(Environment).all()}
+
             por_servidor = []
             for srv in session.query(Server).order_by(Server.name).all():
-                filas = (
-                    session.query(ManagedDatabase.environment_id)
-                    .filter(ManagedDatabase.server_id == srv.id)
-                    .all()
-                )
-                ids = [f[0] for f in filas]
+                ids = environment_ids_by_server.get(srv.id, [])
                 faltantes = sum(1 for i in ids if i is None)
                 # La MISMA regla que `resolve_environment_id`, no una segunda implementación:
                 # sin bases o con al menos una sin clasificar, el servidor entero cae en el
@@ -281,14 +285,18 @@ class AuthzController:
                 if not ids or faltantes:
                     derivado_id = most_protected_environment_id()
                 else:
-                    peor = (
-                        session.query(Environment)
-                        .filter(Environment.id.in_(ids))
-                        .order_by(Environment.rank.desc(), Environment.id.desc())
-                        .first()
+                    # Mismo desempate que la consulta original: mayor rank y, a igual rank,
+                    # mayor id.
+                    known_environments = [
+                        environment_by_id[i] for i in set(ids) if i in environment_by_id
+                    ]
+                    peor = max(
+                        known_environments,
+                        key=lambda environment: (environment.rank, environment.id),
+                        default=None,
                     )
                     derivado_id = peor.id if peor else None
-                derivado = session.get(Environment, derivado_id) if derivado_id else None
+                derivado = environment_by_id.get(derivado_id) if derivado_id else None
                 por_servidor.append(
                     {
                         "server_id": srv.id,
@@ -302,7 +310,7 @@ class AuthzController:
                 )
 
             protegido = most_protected_environment_id()
-            env = session.get(Environment, protegido) if protegido else None
+            env = environment_by_id.get(protegido) if protegido else None
             return {
                 "total_databases": total,
                 "unclassified_databases": sin_clasificar,

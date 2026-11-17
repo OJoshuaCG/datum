@@ -134,8 +134,8 @@ def test_blockers_se_calculan_siempre_hacia_postgresql():
     fallar es hacia PostgreSQL. Pasar el motor del destino devolvería lista vacía al validar
     desde el formulario, que es justo cuando más sirve saberlo.
     """
-    facts = _facts("ALTER TABLE t MODIFY COLUMN c VARCHAR(20)")
-    assert isinstance(facts.postgresql_blockers, tuple)
+    blockers = mf.postgresql_blockers("ALTER TABLE t MODIFY COLUMN c VARCHAR(20)")
+    assert isinstance(blockers, tuple)
 
 
 def test_tabla_interna_del_gateway_se_detecta():
