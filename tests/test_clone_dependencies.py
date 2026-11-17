@@ -170,3 +170,42 @@ def test_build_graph_returns_authoritative_and_advisory():
     auth, advisory = cd.build_graph(snap)
     assert any(e.reason == "foreign_key" for e in auth)
     assert any(e.reason == "body_reference" for e in advisory)
+
+
+# =========================================================================== #
+# Escaneo de cuerpos tokenizado: mismo resultado que la regex por par          #
+# =========================================================================== #
+def _advisory_targets(definition, *table_names):
+    v = ViewInfo(name="v_scan", definition=definition)
+    snap = _snap(tables=[_tbl(n) for n in table_names], views=[v])
+    _auth, advisory = cd.build_graph(snap)
+    return {e.to_name for e in advisory}
+
+
+def test_body_scan_is_case_insensitive():
+    assert _advisory_targets("select * from USERS", "users") == {"users"}
+
+
+def test_body_scan_treats_dollar_as_a_word_boundary_like_the_regex():
+    # Para ``\b``, ``$`` no es carácter de palabra: ``a`` aparece como palabra en ``a$b``.
+    assert _advisory_targets("SELECT * FROM a$b", "a", "a$b") == {"a", "a$b"}
+
+
+def test_body_scan_matches_non_ascii_names():
+    assert _advisory_targets("SELECT * FROM año_fiscal", "año_fiscal") == {"año_fiscal"}
+
+
+def test_body_scan_keeps_regex_case_folding_for_kelvin_sign():
+    # ``re.IGNORECASE`` hace coincidir el signo Kelvin (U+212A) con ``k``.
+    assert _advisory_targets("SELECT * FROM K", "k") == {"k"}
+
+
+def test_authoritative_edges_match_build_graph_without_body_scan():
+    parent = _tbl("parent")
+    child = _tbl("child", fks=[_fk("parent")])
+    v = ViewInfo(name="v", definition="SELECT 1 FROM parent")
+    snap = _snap(tables=[parent, child], views=[v])
+
+    auth, _advisory = cd.build_graph(snap)
+
+    assert cd.authoritative_edges(snap) == auth

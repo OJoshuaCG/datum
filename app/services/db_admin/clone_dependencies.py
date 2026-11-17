@@ -147,6 +147,34 @@ _ADVISORY_TARGET_TYPES = ("table", "view", "materialized_view", "routine", "sequ
 _ADVISORY_SOURCE_TYPES = ("view", "materialized_view", "routine", "trigger", "event")
 
 
+# Una corrida máxima de caracteres de palabra: exactamente lo que delimita ``\b`` en un patrón
+# ``str``. Ojo: ``$`` NO es carácter de palabra para ``\b``.
+_WORD_RUN = re.compile(r"\w+")
+_ASCII_WORD_NAME = re.compile(r"[A-Za-z0-9_]+")
+# Caracteres no ASCII que ``re.IGNORECASE`` hace coincidir con una letra ASCII (``İ``→``i``,
+# ``ı``→``i``, ``ſ``→``s``, ``K``→``k``) pero que ``str.lower()`` no lleva a ese ASCII.
+_ASCII_CASE_FOLD_TRAPS = frozenset("İıſK")
+
+
+def _body_mentions(
+    body: str, name: str, pattern: re.Pattern, tokens: set[str] | None
+) -> bool:
+    """
+    ¿El cuerpo menciona ``name`` como palabra completa (sin distinguir mayúsculas)?
+
+    POR QUÉ HAY DOS CAMINOS: antes se corría ``pattern.search(body)`` por cada par (cuerpo,
+    candidato), y con cientos de objetos eso es O(cuerpos × candidatos × largo del cuerpo) por
+    request. Para un nombre ASCII de solo caracteres de palabra, ``\\bname\\b`` coincide si y
+    solo si alguna corrida máxima de ``\\w`` del cuerpo es igual al nombre, así que alcanza con
+    tokenizar el cuerpo UNA vez y buscar en un set. Los nombres con ``$``, no ASCII o con otros
+    caracteres, y los cuerpos con trampas de case-folding, siguen por la regex original: el
+    resultado es idéntico al de antes en todos los casos.
+    """
+    if tokens is not None and _ASCII_WORD_NAME.fullmatch(name):
+        return name.lower() in tokens
+    return pattern.search(body) is not None
+
+
 def _advisory_edges(
     snap: SchemaSnapshot, idx: dict[tuple[str, str], object]
 ) -> list[DependencyEdge]:
@@ -158,8 +186,7 @@ def _advisory_edges(
     candidates: list[tuple[str, str, re.Pattern]] = []
     for (otype, name), _obj in idx.items():
         if otype in _ADVISORY_TARGET_TYPES and name:
-            # \b no funciona bien con nombres que empiezan/terminan en no-alfanum; los
-            # nombres SQL válidos son [A-Za-z0-9_$], así que \b sirve. Case-insensitive.
+            # Patrón de referencia y fallback de ``_body_mentions``. Case-insensitive.
             candidates.append((otype, name, re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)))
 
     edges: list[DependencyEdge] = []
@@ -169,16 +196,27 @@ def _advisory_edges(
         body = _body_of(obj, otype)
         if not body:
             continue
+        has_case_fold_trap = not _ASCII_CASE_FOLD_TRAPS.isdisjoint(body)
+        tokens = (
+            None
+            if has_case_fold_trap
+            else {token.lower() for token in _WORD_RUN.findall(body)}
+        )
         for cand_type, cand_name, pat in candidates:
             if cand_type == otype and cand_name == name:
                 continue  # no auto-referencia
-            if pat.search(body):
+            if _body_mentions(body, cand_name, pat, tokens):
                 edges.append(DependencyEdge(
                     from_type=otype, from_name=name,
                     to_type=cand_type, to_name=cand_name,
                     reason="body_reference", authoritative=False,
                 ))
     return edges
+
+
+def authoritative_edges(snap: SchemaSnapshot) -> list[DependencyEdge]:
+    """Solo las aristas autoritativas (FK y trigger→tabla), sin el escaneo de cuerpos."""
+    return _authoritative_edges(snap)
 
 
 def build_graph(snap: SchemaSnapshot) -> tuple[list[DependencyEdge], list[DependencyEdge]]:

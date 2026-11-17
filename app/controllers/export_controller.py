@@ -2785,7 +2785,8 @@ def _prune_unsatisfied(
     Se itera hasta punto fijo porque la poda es contagiosa: sacar una tabla puede dejar
     huérfano al trigger que vive sobre ella, y a la tabla que la referencia por FK.
     """
-    edges, _advisory = cdeps.build_graph(snapshot)
+    # Solo importan las aristas autoritativas: el escaneo advisory de cuerpos es la parte cara.
+    edges = cdeps.authoritative_edges(snapshot)
     kept = set(selected)
     pruned: set[tuple[str, str]] = set()
     changed = True
