@@ -29,6 +29,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import defer
 
 from app.controllers.clone_controller import _snapshot_fingerprint
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -401,14 +402,18 @@ class ExportController:
         finally:
             session.close()
 
+    @staticmethod
+    def _job_not_found(job_id: int) -> AppHttpException:
+        return AppHttpException(
+            message="Job de exportación no encontrado.",
+            status_code=404,
+            context={"export_job_id": job_id},
+        )
+
     def _job_or_404(self, session, job_id: int) -> ExportJob:
         job = session.get(ExportJob, job_id)
         if job is None:
-            raise AppHttpException(
-                message="Job de exportación no encontrado.",
-                status_code=404,
-                context={"export_job_id": job_id},
-            )
+            raise self._job_not_found(job_id)
         return job
 
     @staticmethod
@@ -533,8 +538,16 @@ class ExportController:
     def _spec_json(cls, spec: espec.ExportSpec) -> str:
         return json.dumps(cls._spec_dict(spec), sort_keys=True, separators=(",", ":"))
 
-    def _serialize_summary(self, job: ExportJob) -> dict:
+    def _serialize_summary(
+        self, job: ExportJob, *, has_resolved_selection: bool | None = None
+    ) -> dict:
+        """
+        ``has_resolved_selection`` lo pasa quien ya lo calculó en SQL sin cargar la columna
+        (``get_job``); si no viene, se mira el atributo.
+        """
         spec = json.loads(job.spec) if job.spec else {}
+        if has_resolved_selection is None:
+            has_resolved_selection = job.resolved_selection is not None
         return {
             "id": job.id,
             "server_id": job.server_id,
@@ -548,7 +561,7 @@ class ExportController:
             "error": job.error,
             "expired": job.expires_at < _utcnow(),
             "structure_drift_detected": job.structure_drift_detected,
-            "has_resolved_selection": job.resolved_selection is not None,
+            "has_resolved_selection": has_resolved_selection,
             "idempotency_key": job.idempotency_key,
             "created_at": job.created_at,
             "expires_at": job.expires_at,
@@ -1692,7 +1705,21 @@ class ExportController:
         """Cabecera + estado del job (lo que consume el polling)."""
         session = self._session()
         try:
-            return self._serialize_summary(self._job_or_404(session, job_id))
+            # Es lo que golpea el polling cada pocos segundos: ``resolved_selection`` (LONGTEXT,
+            # el cierre resuelto de una BD con miles de objetos) no se carga, solo se pregunta
+            # en SQL si existe.
+            row = (
+                session.query(ExportJob, ExportJob.resolved_selection.isnot(None))
+                .options(defer(ExportJob.resolved_selection))
+                .filter(ExportJob.id == job_id)
+                .one_or_none()
+            )
+            if row is None:
+                raise self._job_not_found(job_id)
+            job, has_resolved_selection = row
+            return self._serialize_summary(
+                job, has_resolved_selection=bool(has_resolved_selection)
+            )
         finally:
             session.close()
 

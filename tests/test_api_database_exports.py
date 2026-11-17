@@ -1689,3 +1689,40 @@ def test_una_codificacion_de_archivo_con_estado_se_rechaza(admin_client, monkeyp
     pub = _public(r)
     assert pub["code"] == "export.incompatible_option"
     assert "output.file_encoding" in pub["fields"], pub
+
+
+# =========================================================================== #
+# Polling: no se carga el cierre resuelto (LONGTEXT) en cada GET              #
+# =========================================================================== #
+def test_polling_reports_resolved_selection_without_loading_it(admin_client, monkeypatch):
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    _install(monkeypatch)
+    sid = _server(admin_client, 3756)
+    job = _plan(admin_client, sid)
+    # The non-dry-run preview is what freezes ``resolved_selection``; resolve-selection does not.
+    r = admin_client.post(f"/api/v1/database-exports/{job}/preview", json={})
+    assert r.status_code == 200, r.text
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        r = admin_client.get(f"/api/v1/database-exports/{job}")
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["has_resolved_selection"] is True
+    job_selects = [s for s in statements if "FROM export_jobs" in s]
+    assert job_selects
+    assert all("export_jobs.resolved_selection AS" not in s for s in job_selects)
+
+
+def test_polling_unknown_job_is_404(admin_client, monkeypatch):
+    _install(monkeypatch)
+    assert admin_client.get("/api/v1/database-exports/987654").status_code == 404

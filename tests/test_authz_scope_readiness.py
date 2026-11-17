@@ -54,3 +54,49 @@ def test_the_flag_is_the_only_new_top_level_field(admin_client):
         "servers",
         "server_resolution_inventory_only",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Per-server resolution (``AuthzController.scope_readiness`` in               #
+# app/controllers/authz_controller.py loads environments once, not per server) #
+# --------------------------------------------------------------------------- #
+def _create_server(admin_client, server_payload) -> int:
+    response = admin_client.post("/api/v1/servers", json=server_payload())
+    assert response.status_code == 201, response.text
+    return response.json()["data"]["id"]
+
+
+def _server_row(datos: dict, server_id: int) -> dict:
+    return next(row for row in datos["servers"] if row["server_id"] == server_id)
+
+
+def test_a_fully_classified_server_resolves_to_its_most_protected_database(
+    admin_client, server_payload
+):
+    server_id = _create_server(admin_client, server_payload)
+    sembrar_bd(server_id=server_id, environment_id=env_id("development"), name="bd_dev")
+    sembrar_bd(server_id=server_id, environment_id=env_id("production"), name="bd_prod")
+
+    row = _server_row(admin_client.get(_URL).json()["data"], server_id)
+
+    assert row["databases"] == 2
+    assert row["unclassified"] == 0
+    assert row["derived_from_gap"] is False
+    assert row["derived_environment_slug"] == "production"
+
+
+def test_a_server_with_an_unclassified_database_falls_back_to_the_most_protected(
+    admin_client, server_payload
+):
+    server_id = _create_server(admin_client, server_payload)
+    sembrar_bd(server_id=server_id, environment_id=env_id("development"), name="bd_dev")
+    sembrar_bd(server_id=server_id, environment_id=None, name="bd_sin_entorno")
+
+    datos = admin_client.get(_URL).json()["data"]
+    row = _server_row(datos, server_id)
+
+    assert row["databases"] == 2
+    assert row["unclassified"] == 1
+    assert row["derived_from_gap"] is True
+    assert row["derived_environment_slug"] == datos["fallback_environment_slug"]
+    assert row["derived_environment_slug"] is not None

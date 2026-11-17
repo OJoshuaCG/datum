@@ -454,13 +454,16 @@ class AccessRequestController:
         rows = self.requests.list_pending()
         out = self._serialize_many(rows)
         requesters: dict = {}
+        # Un mismo usuario destino suele tener varias solicitudes pendientes: se lee una vez.
+        targets: dict = {}
         for raw, ser in zip(rows, out):
             rid = raw["requested_by"]
             if rid not in requesters:
                 requesters[rid] = self._requester_ok(rid)
-            reason = self._block_reason(
-                actor, raw, self.users.find_by_id(raw["target_user_id"]), requesters[rid]
-            )
+            target_id = raw["target_user_id"]
+            if target_id not in targets:
+                targets[target_id] = self.users.find_by_id(target_id)
+            reason = self._block_reason(actor, raw, targets[target_id], requesters[rid])
             ser["can_decide"] = reason is None
             ser["blocked_reason"] = reason
         return out

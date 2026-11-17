@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import defer
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.schema_comparison_controller import _synthetic_lock_key
@@ -1981,6 +1982,9 @@ class CloneController:
                     CloneBatchItem.seq.label("batch_seq"),
                 )
                 .outerjoin(CloneBatchItem, CloneBatchItem.clone_job_id == CloneJob.id)
+                # El historial no expone la selección: sus JSON (LONGTEXT, con miles de objetos
+                # en una BD grande) se dejan sin cargar en cada fila de la página.
+                .options(defer(CloneJob.selection), defer(CloneJob.data_selection))
             )
 
             if statuses:

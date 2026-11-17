@@ -32,6 +32,9 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import func
+from sqlalchemy.orm import load_only
+
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.services.db_admin.database_scope import assert_database_in_scope
 from app.core.database import Database
@@ -636,8 +639,19 @@ class SchemaComparisonController:
         session = self._session()
         try:
             comp = self._comparison_or_404(session, comparison_id)
+            # El resumen solo cuenta y mira ``risk_flags``: no se cargan ``sql``/``down_sql``
+            # (LONGTEXT), que en una comparación grande son la mayor parte de los bytes.
             items = (
                 session.query(SchemaComparisonItem)
+                .options(
+                    load_only(
+                        SchemaComparisonItem.id,
+                        SchemaComparisonItem.object_type,
+                        SchemaComparisonItem.object_name,
+                        SchemaComparisonItem.change_type,
+                        SchemaComparisonItem.risk_flags,
+                    )
+                )
                 .filter(SchemaComparisonItem.comparison_id == comparison_id)
                 .all()
             )
@@ -735,13 +749,17 @@ class SchemaComparisonController:
             if change_type is not None:
                 q = q.filter(SchemaComparisonItem.change_type == change_type)
             total_in_comparison = (
-                session.query(SchemaComparisonItem)
+                session.query(func.count(SchemaComparisonItem.id))
                 .filter(SchemaComparisonItem.comparison_id == comparison_id)
-                .count()
+                .scalar()
+                or 0
             )
+            if item_ids is not None:
+                # Se filtra en SQL: traer TODOS los ítems (con sus LONGTEXT) para descartar
+                # los no seleccionados en Python era el costo dominante de una descarga parcial.
+                q = q.filter(SchemaComparisonItem.id.in_(item_ids))
             rows = q.order_by(SchemaComparisonItem.seq.asc()).all()
             if item_ids is not None:
-                idset = set(item_ids)
                 found = {r.id for r in rows}
                 missing = [i for i in item_ids if i not in found]
                 if missing:
@@ -756,7 +774,6 @@ class SchemaComparisonController:
                             "missing_item_ids": missing,
                         },
                     )
-                rows = [r for r in rows if r.id in idset]
             # Datos planos ANTES de cerrar la sesión.
             selected = [
                 {

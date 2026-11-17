@@ -12,6 +12,8 @@ monkeypatchea con un fake que registra llamadas (sin depender de `caplog`, ya qu
 logger real tiene `propagate = False`).
 """
 
+import inspect
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -128,3 +130,56 @@ def test_errors_only_suppresses_successful_request_logs(monkeypatch):
         resp = c.get("/ok")
     assert resp.status_code == 200
     assert fake.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Lectura del body: solo cuando se va a loguear                                #
+# --------------------------------------------------------------------------- #
+def _post_client() -> TestClient:
+    app = FastAPI()
+    app.add_middleware(LoggerMiddleware)
+
+    @app.post("/echo")
+    def _echo(payload: dict):
+        return payload
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _count_json_reads(monkeypatch) -> list[str]:
+    from starlette.requests import Request
+
+    reads: list[str] = []
+    real_json = Request.json
+
+    async def _spy(self):
+        caller = inspect.stack()[1].filename
+        if caller.endswith("LoggerMiddleware.py"):
+            reads.append(self.url.path)
+        return await real_json(self)
+
+    monkeypatch.setattr(Request, "json", _spy)
+    return reads
+
+
+def test_body_is_not_read_when_show_body_is_off(monkeypatch):
+    fake = _setup(monkeypatch)
+    reads = _count_json_reads(monkeypatch)
+    with _post_client() as c:
+        resp = c.post("/echo", json={"password": "s3cret", "name": "x"})
+    assert resp.status_code == 200
+    assert resp.json() == {"password": "s3cret", "name": "x"}
+    assert reads == []
+    assert all("Body:" not in msg for _, msg in fake.calls)
+
+
+def test_body_is_logged_sanitized_when_show_body_is_on(monkeypatch):
+    fake = _setup(monkeypatch)
+    monkeypatch.setattr(LM, "LOGGER_MIDDLEWARE_SHOW_BODY", True)
+    with _post_client() as c:
+        resp = c.post("/echo", json={"password": "s3cret", "name": "x"})
+    assert resp.status_code == 200
+    request_line = fake.calls[0][1]
+    assert "Body:" in request_line
+    assert "'name': 'x'" in request_line
+    assert "s3cret" not in request_line

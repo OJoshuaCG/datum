@@ -31,10 +31,14 @@ class LoggerMiddleware(BaseHTTPMiddleware):
         headers = dict(request.headers)
         client_ip = request.client.host if request.client else "unknown"
 
-        try:
-            body = await request.json()
-        except Exception:
-            body = "<no body>"
+        # El body solo se lee si se va a loguear. Leerlo siempre bufferizaba en memoria y
+        # parseaba como JSON cada request (incluidas las subidas grandes) para descartarlo.
+        body = "<no body>"
+        if LOGGER_MIDDLEWARE_SHOW_BODY and path not in _SENSITIVE_PATHS:
+            try:
+                body = await request.json()
+            except Exception:
+                body = "<no body>"
 
         def _display_path() -> str:
             if LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS:
