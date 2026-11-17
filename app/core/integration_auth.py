@@ -361,10 +361,6 @@ def _authenticate_token(request: Request) -> _AuthenticatedToken:
         if issuer is None:
             raise _reject(request, REASON_ISSUER_INACTIVE, public_id=bearer_parts.public_id)
 
-        # Conditional UPDATE in its own transaction (see ``app.core.token_usage``): committing
-        # here used to expire ``row`` and re-SELECT it for every attribute read below.
-        record_last_used(_session, IntegrationToken, row.id, now, LAST_USED_RESOLUTION)
-
         allowed_server_ids = frozenset(
             server_id
             for (server_id,) in session.query(IntegrationTokenServer.server_id).filter(
@@ -377,7 +373,7 @@ def _authenticate_token(request: Request) -> _AuthenticatedToken:
                 IntegrationTokenBlueprint.token_pk == row.id
             )
         )
-        return _AuthenticatedToken(
+        authenticated = _AuthenticatedToken(
             token_pk=row.id,
             public_id=row.token_id,
             name=row.name,
@@ -388,6 +384,11 @@ def _authenticate_token(request: Request) -> _AuthenticatedToken:
         )
     finally:
         session.close()
+
+    # Conditional UPDATE in its own transaction (see ``app.core.token_usage``), AFTER the read
+    # session is closed: holding both would take two pooled connections per authentication.
+    record_last_used(_session, IntegrationToken, authenticated.token_pk, now, LAST_USED_RESOLUTION)
+    return authenticated
 
 
 def _server_not_allowed() -> AppHttpException:

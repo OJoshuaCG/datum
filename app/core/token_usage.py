@@ -21,7 +21,7 @@ menos grave que rechazar a un agente legítimo.
 from datetime import datetime, timedelta
 
 from sqlalchemy import or_, update
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.logger import get_logger
 
@@ -34,7 +34,8 @@ def record_last_used(
     """
     Escribe ``last_used_at = now`` en la fila ``token_pk`` si está vacía o tiene más de
     ``resolution`` de antigüedad. El throttle vive en el ``WHERE``: no hace falta haber leído la
-    fila. Nunca lanza por un error operativo de la BD.
+    fila. Nunca lanza por un error de la BD (incluido el pool agotado): el token ya se validó y
+    perder un refresco no puede convertir una autenticación correcta en un 500.
     """
     threshold = now - resolution
     statement = (
@@ -49,7 +50,7 @@ def record_last_used(
     try:
         session.execute(statement, execution_options={"synchronize_session": False})
         session.commit()
-    except OperationalError:
+    except SQLAlchemyError:
         session.rollback()
         logger.warning("No se pudo registrar last_used_at del token %s", token_pk, exc_info=True)
     finally:
