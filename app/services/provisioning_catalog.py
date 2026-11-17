@@ -36,6 +36,11 @@ CODE_QUARANTINED_NOT_MISSING = "managed_database.quarantined_not_missing"
 #: ``apply``/``rollback``/``stamp``/``reconcile-partial``.
 CODE_NOT_PROVISIONED = "managed_database.not_provisioned"
 
+#: Entre la lectura de la versión y la toma del lock de migración otra operación movió la BD, y las
+#: versiones pendientes de ahora incluyen alguna que el guard destructivo no analizó. Nada se
+#: aplicó. Salida: reintentar, que vuelve a leer la versión y a analizar.
+CODE_PENDING_VERSIONS_CHANGED = "managed_database.pending_versions_changed"
+
 ERROR_CODES = frozenset(
     {
         CODE_EXISTS_IN_ENGINE,
@@ -43,6 +48,7 @@ ERROR_CODES = frozenset(
         CODE_ARCHIVED,
         CODE_QUARANTINED_NOT_MISSING,
         CODE_NOT_PROVISIONED,
+        CODE_PENDING_VERSIONS_CHANGED,
     }
 )
 

@@ -3067,3 +3067,29 @@ para que sea correcto, solo evita que la primera lectura de cada blueprint sea l
 Los tiempos reales del endpoint antes y después (no se midió contra el servidor), el costo de la traducción a
 PostgreSQL y la consulta de las aprobaciones. Los tests nuevos (`tests/test_destructive_verdicts.py`) se escribieron
 pero no se ejecutaron en esta sesión.
+
+## El guard destructivo analiza solo las versiones pendientes, y el runner comprueba que no cambiaron
+
+**Síntoma.** `apply`, dry-run y `apply_all` volvían a analizar con sqlglot TODAS las versiones del blueprint en cada
+llamada, en entornos que bloquean migraciones destructivas, aunque la BD solo tuviera pendientes unas pocas.
+
+**Decisión.** El guard analiza únicamente las versiones pendientes de esa BD (`destructive_for`, con memo por
+`(motor, versión)` dentro de `apply_all`). Sigue sin leer `model_migration_destructive_verdicts`: la huella no cubre
+`sql_dialect` y la tabla es escribible, así que un veredicto viejo podría dejar pasar un DROP.
+
+**La ventana que eso abrió, y su cierre.** Las pendientes se calculan con una lectura de la versión hecha ANTES de
+tomar el advisory lock; el runner la relee CON el lock. Si un rollback termina entre las dos, las pendientes de ahora
+incluyen versiones que el guard no vio, y antes (cuando analizaba todo el blueprint) sí estaban cubiertas.
+`MigrationRunner.apply(analyzed_versions=...)` compara las pendientes bajo el lock contra las analizadas y aborta con
+409 `managed_database.pending_versions_changed` ANTES de ejecutar nada. Que la BD avance en medio es inofensivo
+(las pendientes son un subconjunto); solo el retroceso aborta. Con `None` no comprueba: es el caso de un entorno que
+no bloquea y no aplicó guard.
+
+**No se cachea el snapshot estructural entre pasos.** El plan, el preview, la ejecución, el worker y la deriva al
+cerrar un export re-snapshotean a propósito: el segundo snapshot compara la huella del plan contra la estructura VIVA.
+Reutilizarlo dentro de ese flujo anula el guard anti-TOCTOU (ver `export_controller`).
+
+### Lo que NO se verificó
+
+El abort bajo lock se probó con un runner sin motor (`_prepared` y `_read_current` sustituidos); no se reprodujo la
+carrera real contra MySQL/PostgreSQL.

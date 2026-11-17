@@ -1651,6 +1651,10 @@ class ManagedMigrationController:
             results = self.runner.apply(
                 target, db_name=db_name, slug=slug, engine=engine,
                 managed_db_id=db_id, specs=specs, up_to_version=up_to_version,
+                # Solo hay guard (y por tanto algo que proteger) en entornos que bloquean.
+                analyzed_versions=(
+                    frozenset(spec.version for spec in pending) if env_blocks_destructive else None
+                ),
             )
         except AppHttpException as exc:
             # Fallo ANTES de aplicar ninguna migración (conexión/lock): no hay

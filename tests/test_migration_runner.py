@@ -10,6 +10,7 @@ ejecutando el mismo ``env.py`` y ``command.*`` que usa el runner, sobre SQLite.
 
 import tempfile
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -508,3 +509,88 @@ def test_reading_the_current_version_keeps_the_interactive_timeout(monkeypatch):
 
     assert len(calls) == 1, calls
     assert all(c["bulk"] is False for c in calls), calls
+
+
+# --------------------------------------------------------------------------- #
+# Guard destructivo: las pendientes bajo el lock deben ser las que se analizaron #
+# --------------------------------------------------------------------------- #
+def _runner_with_version_under_lock(monkeypatch, current_version):
+    """
+    Un runner sin motor: ``_prepared`` cede una conexión vacía y ``_read_current`` devuelve la
+    versión que la BD tiene "bajo el lock". Devuelve el runner y la lista de versiones que
+    ``_apply_one`` llegó a ejecutar, que es lo que importa: ejecutar o no.
+    """
+    from app.services.db_admin.migrations import MigrationResult
+
+    executed: list[str] = []
+
+    @contextmanager
+    def fake_prepared(*args, **kwargs):
+        yield (None, None, "version_table")
+
+    def fake_apply_one(self, cfg, spec, **kwargs):
+        executed.append(spec.version)
+        return MigrationResult(
+            migration_id=spec.id, version=spec.version, status="applied", error=None,
+            execution_ms=0, applied_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(MigrationRunner, "_prepared", fake_prepared)
+    monkeypatch.setattr(MigrationRunner, "_read_current", lambda self, conn, table: current_version)
+    monkeypatch.setattr(MigrationRunner, "_apply_one", fake_apply_one)
+    return MigrationRunner(), executed
+
+
+def _apply_with_analyzed(runner, specs, analyzed_versions):
+    from app.core.remote_engine import ServerTarget
+
+    target = ServerTarget(
+        server_id=1, dialect="mysql", host="10.0.0.5", port=3306,
+        admin_user="root", admin_password="pw",
+    )
+    return runner.apply(
+        target, db_name="db", slug="s", engine=EngineType.mysql,
+        managed_db_id=_NO_MANAGED_DB, specs=specs, analyzed_versions=analyzed_versions,
+    )
+
+
+def test_apply_aborta_si_bajo_el_lock_aparece_una_pendiente_sin_analizar(monkeypatch):
+    """
+    El guard analizó ["0002", "0003"] con la versión leída ANTES del lock (0001). Un rollback
+    terminó en medio y bajo el lock la BD está en None: ahora 0001 también está pendiente y
+    nadie la analizó. Debe abortar con 409 ANTES de ejecutar cualquier versión.
+    """
+    from app.exceptions import AppHttpException
+    from app.services import provisioning_catalog
+
+    runner, executed = _runner_with_version_under_lock(monkeypatch, current_version=None)
+    specs = [_spec("0001", "SELECT 1"), _spec("0002", "SELECT 1"), _spec("0003", "SELECT 1")]
+
+    with pytest.raises(AppHttpException) as raised:
+        _apply_with_analyzed(runner, specs, frozenset({"0002", "0003"}))
+
+    assert raised.value.status_code == 409
+    assert (
+        raised.value.public_context["code"] == provisioning_catalog.CODE_PENDING_VERSIONS_CHANGED
+    )
+    assert executed == []
+
+
+def test_apply_ejecuta_si_las_pendientes_bajo_el_lock_ya_estaban_analizadas(monkeypatch):
+    """Si otra operación AVANZÓ la BD, las pendientes son un subconjunto de lo analizado."""
+    runner, executed = _runner_with_version_under_lock(monkeypatch, current_version="0001")
+    specs = [_spec("0001", "SELECT 1"), _spec("0002", "SELECT 1"), _spec("0003", "SELECT 1")]
+
+    _apply_with_analyzed(runner, specs, frozenset({"0001", "0002", "0003"}))
+
+    assert executed == ["0002", "0003"]
+
+
+def test_apply_sin_analyzed_versions_no_comprueba_nada(monkeypatch):
+    """``None`` = el llamador no aplicó guard destructivo: el comportamiento previo se conserva."""
+    runner, executed = _runner_with_version_under_lock(monkeypatch, current_version=None)
+    specs = [_spec("0001", "SELECT 1"), _spec("0002", "SELECT 1")]
+
+    _apply_with_analyzed(runner, specs, None)
+
+    assert executed == ["0001", "0002"]

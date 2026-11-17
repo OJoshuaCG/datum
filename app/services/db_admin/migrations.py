@@ -51,7 +51,7 @@ from app.core.remote_engine import (
 )
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
-from app.services import engine_error_catalog
+from app.services import engine_error_catalog, provisioning_catalog
 from app.services.db_admin import migration_progress, migration_results
 from app.services.db_admin.identifiers import (
     GATEWAY_TABLE_PREFIXES,
@@ -1068,10 +1068,18 @@ class MigrationRunner:
         managed_db_id: int,
         specs: list[MigrationSpec],
         up_to_version: str | None = None,
+        analyzed_versions: frozenset[str] | None = None,
     ) -> list[MigrationResult]:
         """
         Aplica las migraciones pendientes en orden. Se detiene en la primera que
         falle (la BD queda en la última versión aplicada con éxito).
+
+        ``analyzed_versions`` son las versiones que el guard destructivo del llamador YA analizó,
+        calculadas con una lectura de la versión hecha ANTES de tomar el lock. Acá la versión se
+        relee con el lock tomado: si otra operación la retrocedió en medio (un rollback que
+        terminó), las pendientes de ahora pueden incluir una versión que nadie analizó, y
+        ejecutarla se saltaría el guard. En ese caso se aborta ANTES de mutar. ``None`` desactiva
+        la comprobación (el llamador no aplicó guard destructivo).
         """
         results: list[MigrationResult] = []
         # MISMO criterio que ``_prepared`` (función determinística): decide si el DDL corre
@@ -1084,6 +1092,25 @@ class MigrationRunner:
         ) as (conn, cfg, version_table):
             current = self._read_current(conn, version_table)
             pending = self.compute_pending(current, specs, up_to_version)
+            if analyzed_versions is not None:
+                unanalyzed_versions = [
+                    spec.version for spec in pending if spec.version not in analyzed_versions
+                ]
+                if unanalyzed_versions:
+                    logger.warning(
+                        "Las pendientes de la BD %s cambiaron bajo el lock: %s no se analizaron.",
+                        managed_db_id,
+                        ", ".join(unanalyzed_versions),
+                    )
+                    raise AppHttpException(
+                        message=(
+                            "La versión de la base cambió mientras se preparaba el apply y hay "
+                            "versiones pendientes que no se revisaron. No se aplicó nada: "
+                            "reintente."
+                        ),
+                        status_code=409,
+                        public_context={"code": provisioning_catalog.CODE_PENDING_VERSIONS_CHANGED},
+                    )
             for spec in pending:
                 # MISMA lista que vio el codegen (ver statement_lists): si el conteo
                 # difiere, _resolve_resume_offset dispara un 409 espurio.
