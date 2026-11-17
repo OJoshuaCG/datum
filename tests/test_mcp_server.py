@@ -532,3 +532,40 @@ def test_the_dispatcher_enforces_the_tool_scope_before_the_handler(client, monke
         assert "mcp.scope_denied" in (fila.detail or "")
     finally:
         s.close()
+
+
+# --------------------------------------------------------------------------- #
+# El dispatcher no corre en el event loop                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_dispatcher_runs_off_the_event_loop(client, admin_client, mcp_on, monkeypatch):
+    """
+    ``handle`` es síncrono y bloqueante (BD del gateway, auditoría, conexiones remotas). Si
+    corriera dentro del event loop, una tool lenta congelaría TODO el proceso: health, logins y
+    cada request en vuelo. Dentro del threadpool no hay loop corriendo en el hilo, así que
+    ``asyncio.get_running_loop()`` tiene que fallar.
+    """
+    import asyncio
+
+    import app.mcp.app_factory as factory_mod
+
+    original_handle = factory_mod.handle
+    observed: dict[str, bool] = {}
+
+    def spying_handle(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            observed["inside_event_loop"] = True
+        except RuntimeError:
+            observed["inside_event_loop"] = False
+        return original_handle(*args, **kwargs)
+
+    monkeypatch.setattr(factory_mod, "handle", spying_handle)
+    pid = _proyecto(admin_client)
+    token = _crear_token(admin_client, project_id=pid)["token"]
+
+    r = _rpc(client, token, "initialize")
+
+    assert r.status_code == 200, r.text
+    assert observed == {"inside_event_loop": False}

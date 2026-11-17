@@ -37,6 +37,7 @@ los bearers inválidos los frena el tope de rechazos POR IP de ``mcp_auth.authen
 """
 
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from app.core.actor import Actor
@@ -137,7 +138,12 @@ def create_mcp_app() -> FastAPI:
                 ),
             )
 
-        r = handle(payload, actor, dict(request.headers))
+        # ``handle`` es SÍNCRONO y bloqueante: consulta la BD del gateway, escribe auditoría y
+        # abre conexiones a servidores remotos. Llamado directo desde este ``async def`` frenaba
+        # el event loop entero mientras durara la tool (health, logins y toda request en vuelo).
+        # En el threadpool solo ocupa un hilo; anyio copia el contexto, así que el Request ID
+        # y demás ``contextvars`` siguen viéndose dentro.
+        r = await run_in_threadpool(handle, payload, actor, dict(request.headers))
         if r.body is None:
             # 202 sin cuerpo, que es lo que la spec pide para una notificación aceptada.
             return Response(status_code=r.status)
