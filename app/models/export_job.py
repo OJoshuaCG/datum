@@ -34,7 +34,7 @@ llegan en F3/F4.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -238,6 +238,8 @@ class ExportJob(Base, TimestampMixin):
 class ExportJobItem(Base, TimestampMixin):
     __tablename__ = "export_job_items"
     __table_args__ = (
+        # Los ítems se leen por job en orden de ``seq``; el índice simple de la FK se conserva.
+        Index("ix_export_job_items_job_seq", "job_id", "seq"),
         {"comment": "Resultado por objeto de una exportación (reporte de incidencias)"},
     )
 

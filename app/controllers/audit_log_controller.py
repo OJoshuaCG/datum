@@ -44,6 +44,8 @@ import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from sqlalchemy import func
+
 from app.controllers.common import engine_value
 from app.core.database import Database
 from app.core.scope import can_at
@@ -257,7 +259,12 @@ class AuditLogController:
         session = self._session()
         try:
             q = self._filtered(session.query(AuditLog), filters)
-            total = q.count()
+            # ``COUNT(id)`` directo y no ``q.count()``: este último envuelve la consulta en un
+            # ``SELECT count(*) FROM (SELECT <todas las columnas> ...)``, mientras que el directo
+            # se resuelve recorriendo un índice (el compuesto del filtro, si lo hay).
+            total = (
+                self._filtered(session.query(func.count(AuditLog.id)), filters).scalar() or 0
+            )
             filas = q.order_by(AuditLog.id.desc()).limit(limit).offset(offset).all()
             entries = [self._serialize(f) for f in filas]
         finally:

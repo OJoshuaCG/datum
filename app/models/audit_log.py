@@ -22,6 +22,11 @@ class AuditLog(Base, TimestampMixin):
         Index("ix_audit_log_created_at", "created_at"),
         Index("ix_audit_log_admin_id", "admin_id"),
         Index("ix_audit_log_target", "target_type", "target_id"),
+        # Los filtros de igualdad de ``GET /audit-log`` que listan ``ORDER BY id DESC``: con
+        # ``(col, id)`` el motor filtra y ordena recorriendo el índice, sin filesort.
+        Index("ix_audit_log_status_id", "status", "id"),
+        Index("ix_audit_log_actor_type_id", "actor_type", "id"),
+        Index("ix_audit_log_admin_username_id", "admin_username", "id"),
         {"comment": "Auditoría de operaciones sensibles del gateway"},
     )
 

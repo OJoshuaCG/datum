@@ -23,7 +23,7 @@ ordenado por fase 1..9). Adopt/execute ordenan e iteran por ``seq``.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,6 +37,8 @@ _SQL_TEXT = Text().with_variant(LONGTEXT(), "mysql", "mariadb")
 class SchemaComparisonItem(Base, TimestampMixin):
     __tablename__ = "schema_comparison_items"
     __table_args__ = (
+        # Los ítems se leen por comparación en orden de ``seq``; el índice de la FK se conserva.
+        Index("ix_schema_comparison_items_cmp_seq", "comparison_id", "seq"),
         {"comment": "Sentencia DDL derivada de una comparación (una fila por sentencia)"},
     )
 

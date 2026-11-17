@@ -20,7 +20,7 @@ sentencias/objetos y su resultado por paso viven en ``CloneJobItem``.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -78,6 +78,8 @@ _SQL_TEXT = Text().with_variant(LONGTEXT(), "mysql", "mariadb")
 class CloneJob(Base, TimestampMixin):
     __tablename__ = "clone_jobs"
     __table_args__ = (
+        # El historial lista por ``created_at`` (y desempata por ``id``).
+        Index("ix_clone_jobs_created_at_id", "created_at", "id"),
         {"comment": "Cabecera + estado de una operación de clonación de BD"},
     )
 
@@ -273,6 +275,9 @@ class CloneJob(Base, TimestampMixin):
 class CloneJobItem(Base, TimestampMixin):
     __tablename__ = "clone_job_items"
     __table_args__ = (
+        # Los ítems se leen por job en orden de ``seq``; el índice simple de ``job_id`` (que usa
+        # la FK) se conserva.
+        Index("ix_clone_job_items_job_seq", "job_id", "seq"),
         {"comment": "Paso individual de un job de clonación (limpieza/estructura/datos/adopt)"},
     )
 
