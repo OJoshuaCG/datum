@@ -14,7 +14,7 @@ efímera por naturaleza: una fila existe solo mientras una migración está A MI
 camino en una dirección; se borra al completarse con éxito.
 """
 
-from sqlalchemy import ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -27,6 +27,9 @@ class MigrationStatementProgress(Base, TimestampMixin):
             "managed_database_id", "model_migration_id", "direction",
             name="uq_msp_db_migration_direction",
         ),
+        # La UNIQUE empieza por ``managed_database_id``: buscar por versión (y el CASCADE desde
+        # ``model_migrations``) necesita su propio índice.
+        Index("ix_msp_migration_direction", "model_migration_id", "direction"),
         {
             "comment": (
                 "Checkpoint de sentencias SQL ejecutadas dentro de UNA migración "

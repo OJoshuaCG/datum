@@ -20,7 +20,7 @@ QUÉ NO SE GUARDA
 - **La credencial usada**: se guarda el NOMBRE del usuario del motor, nunca su clave.
 """
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,7 +37,13 @@ STATUS_PREVIEW = "preview"   # solo se analizó/estimó impacto, sin ejecutar
 
 class QueryExecution(Base, TimestampMixin):
     __tablename__ = "query_executions"
-    __table_args__ = ({"comment": "Historial de ejecuciones de la consola SQL"},)
+    __table_args__ = (
+        # Nombre explícito: la convención solo usa la primera columna y chocaría con
+        # ``ix_query_executions_server_id``. Sirve al historial por servidor y base paginado
+        # por ``id`` descendente.
+        Index("ix_qe_server_db_id", "server_id", "database_name", "id"),
+        {"comment": "Historial de ejecuciones de la consola SQL"},
+    )
 
     id: Mapped[int] = mapped_column(
         primary_key=True, autoincrement=True, comment="ID único de la ejecución"
