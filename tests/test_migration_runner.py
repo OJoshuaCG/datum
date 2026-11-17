@@ -48,13 +48,14 @@ def _no_checkpoint():
     Neutraliza el checkpoint de sentencia, que vive en la BD de METADATOS del gateway.
 
     Sin esto, estos tests —que no tocan ningún motor remoto y corren contra SQLite— exigen
-    una conexión viva a la BD del gateway: ``_write_revision_files`` consulta el checkpoint
-    (``get_progress``) y el código generado llama a ``record_statement`` en cada sentencia.
-    Se stubean ambos: ``get_progress`` a None (no hay aplicación parcial previa, el codegen
-    sale completo) y ``record_statement`` a un no-op.
+    una conexión viva a la BD del gateway: ``_write_revision_files`` consulta los checkpoints
+    (``load_database_progress``), ``_apply_one`` el de cada migración (``get_progress``) y el
+    código generado llama a ``record_statement`` en cada sentencia. Se stubean los tres: sin
+    aplicación parcial previa (el codegen sale completo) y ``record_statement`` a un no-op.
     """
     with (
         mock.patch.object(migration_progress, "get_progress", return_value=None),
+        mock.patch.object(migration_progress, "load_database_progress", return_value={}),
         mock.patch.object(migration_progress, "record_statement", lambda *a, **k: None),
     ):
         yield
@@ -243,6 +244,94 @@ def test_write_revision_files_chains_down_revision():
         assert "op.get_bind().exec_driver_sql('ALTER TABLE a DROP COLUMN b')" in rev2
 
 
+def _resumable_history():
+    """Tres migraciones reanudables (schema, sin estado de sesión) en MySQL."""
+    return [
+        _spec("0001", "CREATE TABLE a (id INT)"),
+        _spec("0002", "CREATE TABLE b (id INT);\nCREATE TABLE c (id INT)"),
+        _spec("0003", "CREATE TABLE d (id INT)"),
+    ]
+
+
+def test_write_revision_files_reads_all_checkpoints_with_one_query(monkeypatch):
+    """
+    Antes se consultaba ``get_progress`` por migración y dirección sobre TODO el historial
+    (2N viajes al gateway por apply). Ahora: una consulta por BD, y el resume sigue
+    funcionando con el checkpoint que esa consulta devuelve.
+    """
+    loader_calls: list[int] = []
+
+    def fake_loader(managed_database_id):
+        loader_calls.append(managed_database_id)
+        return {
+            (2, "up"): migration_progress.ProgressState(
+                last_statement_index=1, total_statements=2, migration_checksum="x",
+            ),
+        }
+
+    def forbidden_get_progress(*args, **kwargs):
+        raise AssertionError("el codegen no debe consultar el checkpoint migración por migración")
+
+    monkeypatch.setattr(migration_progress, "load_database_progress", fake_loader)
+    monkeypatch.setattr(migration_progress, "get_progress", forbidden_get_progress)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        versions_dir = Path(tmp) / "versions"
+        versions_dir.mkdir()
+        MigrationRunner()._write_revision_files(
+            versions_dir, _resumable_history(), EngineType.mysql, 7
+        )
+        resumed_revision = (versions_dir / "rev_0002.py").read_text()
+
+    assert loader_calls == [7]
+    # La sentencia 1 ya se ejecutó en el intento previo: el archivo arranca en la 2.
+    assert "CREATE TABLE b" not in resumed_revision
+    assert "CREATE TABLE c" in resumed_revision
+
+
+def test_write_revision_files_still_fails_closed_on_a_stale_checkpoint(monkeypatch):
+    """El 409 por checkpoint que ya no coincide con el SQL vigente se conserva."""
+    from app.exceptions import AppHttpException
+
+    stale_checkpoint = {
+        (2, "up"): migration_progress.ProgressState(
+            last_statement_index=1, total_statements=2, migration_checksum="otro",
+        ),
+    }
+    monkeypatch.setattr(
+        migration_progress, "load_database_progress", lambda *a, **k: stale_checkpoint
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        versions_dir = Path(tmp) / "versions"
+        versions_dir.mkdir()
+        with pytest.raises(AppHttpException) as raised:
+            MigrationRunner()._write_revision_files(
+                versions_dir, _resumable_history(), EngineType.mysql, 7
+            )
+
+    assert raised.value.status_code == 409
+
+
+def test_write_revision_files_skips_the_checkpoint_query_in_transactional_mode(monkeypatch):
+    """Con DDL transaccional no hay checkpoint, así que tampoco hay consulta al gateway."""
+    loader_calls: list[int] = []
+    monkeypatch.setattr(
+        migration_progress,
+        "load_database_progress",
+        lambda managed_database_id: loader_calls.append(managed_database_id) or {},
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        versions_dir = Path(tmp) / "versions"
+        versions_dir.mkdir()
+        MigrationRunner()._write_revision_files(
+            versions_dir, _resumable_history(), EngineType.mysql, 7, transactional=True
+        )
+
+    assert loader_calls == []
+
+
 @_no_checkpoint()
 def test_render_does_not_treat_colon_as_bind_param():
     """
@@ -418,6 +507,7 @@ def _capture_connection_flags(monkeypatch) -> list[dict]:
     monkeypatch.setattr(mig, "database_connection", fake_conn)
     monkeypatch.setattr(prog, "get_progress", lambda *a, **k: None)
     monkeypatch.setattr(mig.migration_progress, "get_progress", lambda *a, **k: None)
+    monkeypatch.setattr(prog, "load_database_progress", lambda *a, **k: {})
     return calls
 
 

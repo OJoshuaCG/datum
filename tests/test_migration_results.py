@@ -41,6 +41,7 @@ def _no_checkpoint():
     """Neutraliza el checkpoint (vive en la BD del gateway; estos tests no la usan)."""
     with (
         mock.patch.object(migration_progress, "get_progress", return_value=None),
+        mock.patch.object(migration_progress, "load_database_progress", return_value={}),
         mock.patch.object(migration_progress, "record_statement", lambda *a, **k: None),
     ):
         yield

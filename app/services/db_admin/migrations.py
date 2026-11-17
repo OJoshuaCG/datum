@@ -521,6 +521,10 @@ class MigrationRunner:
         rastrear, así que no hay nada que grabar.
         """
         prev: str | None = None
+        # Los checkpoints de la BD se leen con UNA consulta, y solo si alguna migración es
+        # reanudable. Antes era una consulta por migración y dirección sobre TODO el historial
+        # del blueprint (también las ya aplicadas): ~2N viajes al gateway por cada apply.
+        checkpoints: dict[tuple[int, str], migration_progress.ProgressState] | None = None
         # Orden NUMÉRICO (no lexicográfico): "9999" < "10000" debe respetarse.
         for spec in sorted(specs, key=lambda s: version_sort_key(s.version)):
             # Re-validar version antes de usarla en un path: los datos vienen de la BD
@@ -542,11 +546,16 @@ class MigrationRunner:
                     has_non_portable=spec.has_non_portable, manifest_pinned=pinned,
                 )
             )
+            if (up_resumable or down_resumable) and checkpoints is None:
+                checkpoints = migration_progress.load_database_progress(managed_db_id)
+            database_checkpoints = checkpoints if checkpoints is not None else {}
             up_resume_from = self._resolve_resume_offset(
-                managed_db_id, spec, "up", up_resumable, len(up_statements)
+                managed_db_id, spec, "up", up_resumable, len(up_statements),
+                database_checkpoints,
             )
             down_resume_from = self._resolve_resume_offset(
-                managed_db_id, spec, "down", down_resumable, len(down_statements)
+                managed_db_id, spec, "down", down_resumable, len(down_statements),
+                database_checkpoints,
             )
 
             # Captura de resultados de SELECT: opt-in POR MIGRACIÓN + kill switch global.
@@ -579,6 +588,7 @@ class MigrationRunner:
         direction: str,
         resumable: bool,
         total: int,
+        checkpoints: dict[tuple[int, str], migration_progress.ProgressState],
     ) -> int:
         """
         0 si no hay checkpoint útil (empezar desde la sentencia 1). Si hay un checkpoint
@@ -593,7 +603,7 @@ class MigrationRunner:
         """
         if not resumable or total == 0:
             return 0
-        progress = migration_progress.get_progress(managed_db_id, spec.id, direction)
+        progress = checkpoints.get((spec.id, direction))
         if progress is None:
             return 0
         if progress.migration_checksum != spec.checksum or progress.total_statements != total:

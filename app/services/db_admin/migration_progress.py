@@ -37,6 +37,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from sqlalchemy import func
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.models.migration_statement_progress import MigrationStatementProgress
@@ -52,6 +57,9 @@ _SESSION_STATEMENT_PREFIXES = (
     "start transaction", "begin", "savepoint", "release savepoint",
     "declare ", "commit", "rollback",
 )
+
+# Clave natural del checkpoint (``uq_msp_db_migration_direction``): el conflicto del upsert.
+_CHECKPOINT_KEY_COLUMNS = ["managed_database_id", "model_migration_id", "direction"]
 
 # Indicios de bloque procedural. El splitter ya los parte bien (ver arriba); esto excluye
 # la migración del checkpoint por prudencia, no porque el split sea incorrecto.
@@ -131,6 +139,40 @@ def get_progress(
         session.close()
 
 
+def load_database_progress(
+    managed_database_id: int,
+) -> dict[tuple[int, str], ProgressState]:
+    """Todos los checkpoints de una BD gestionada, indexados por ``(model_migration_id, direction)``.
+
+    Una sola consulta por apply/rollback en vez de un ``get_progress`` por migración y
+    dirección: el codegen recorre el historial COMPLETO del blueprint. Usa el
+    ``UniqueConstraint`` (``managed_database_id`` primero) como índice.
+    """
+    session = _session()
+    try:
+        rows = (
+            session.query(
+                MigrationStatementProgress.model_migration_id,
+                MigrationStatementProgress.direction,
+                MigrationStatementProgress.last_statement_index,
+                MigrationStatementProgress.total_statements,
+                MigrationStatementProgress.migration_checksum,
+            )
+            .filter(MigrationStatementProgress.managed_database_id == managed_database_id)
+            .all()
+        )
+        checkpoints: dict[tuple[int, str], ProgressState] = {}
+        for row in rows:
+            checkpoints[(row.model_migration_id, row.direction)] = ProgressState(
+                last_statement_index=row.last_statement_index,
+                total_statements=row.total_statements,
+                migration_checksum=row.migration_checksum,
+            )
+        return checkpoints
+    finally:
+        session.close()
+
+
 def record_statement(
     managed_database_id: int,
     model_migration_id: int,
@@ -143,31 +185,72 @@ def record_statement(
 
     Sesión corta y dedicada (no la del request en curso, no la conexión al motor
     destino): este write es completamente independiente del DDL que se está aplicando.
+
+    Se llama una vez por SENTENCIA de la migración, así que es un upsert nativo de una sola
+    sentencia (un viaje + COMMIT) y no un SELECT seguido de INSERT/UPDATE: en una baseline
+    de cientos de DDL rápidos esos viajes extra al gateway dominaban el tiempo del apply.
     """
     session = _session()
     try:
-        row = (
-            session.query(MigrationStatementProgress)
-            .filter(
-                MigrationStatementProgress.managed_database_id == managed_database_id,
-                MigrationStatementProgress.model_migration_id == model_migration_id,
-                MigrationStatementProgress.direction == direction,
-            )
-            .first()
+        statement = _checkpoint_upsert(
+            session.get_bind().dialect.name,
+            managed_database_id=managed_database_id,
+            model_migration_id=model_migration_id,
+            direction=direction,
+            index=index,
+            total=total,
+            migration_checksum=migration_checksum,
         )
-        if row is None:
-            row = MigrationStatementProgress(
-                managed_database_id=managed_database_id,
-                model_migration_id=model_migration_id,
-                direction=direction,
-            )
-            session.add(row)
-        row.last_statement_index = index
-        row.total_statements = total
-        row.migration_checksum = migration_checksum
+        session.execute(statement)
         session.commit()
     finally:
         session.close()
+
+
+def _checkpoint_upsert(
+    dialect_name: str,
+    *,
+    managed_database_id: int,
+    model_migration_id: int,
+    direction: str,
+    index: int,
+    total: int,
+    migration_checksum: str,
+):
+    """INSERT ... ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE sobre ``uq_msp_db_migration_direction``.
+
+    Los motores son los que admite la BD de metadatos (``app/core/database.py``). Un upsert
+    Core no dispara el ``onupdate`` del ORM, por eso ``updated_at`` va explícito.
+    """
+    table = MigrationStatementProgress.__table__
+    inserted_values = {
+        "managed_database_id": managed_database_id,
+        "model_migration_id": model_migration_id,
+        "direction": direction,
+        "last_statement_index": index,
+        "total_statements": total,
+        "migration_checksum": migration_checksum,
+    }
+    updated_values = {
+        "last_statement_index": index,
+        "total_statements": total,
+        "migration_checksum": migration_checksum,
+        "updated_at": func.now(),
+    }
+    if dialect_name in ("mysql", "mariadb"):
+        mysql_statement = mysql_insert(table).values(**inserted_values)
+        return mysql_statement.on_duplicate_key_update(**updated_values)
+    if dialect_name == "postgresql":
+        postgresql_statement = postgresql_insert(table).values(**inserted_values)
+        return postgresql_statement.on_conflict_do_update(
+            index_elements=_CHECKPOINT_KEY_COLUMNS, set_=updated_values
+        )
+    if dialect_name == "sqlite":
+        sqlite_statement = sqlite_insert(table).values(**inserted_values)
+        return sqlite_statement.on_conflict_do_update(
+            index_elements=_CHECKPOINT_KEY_COLUMNS, set_=updated_values
+        )
+    raise ValueError(f"Motor de BD de metadatos sin upsert de checkpoint: {dialect_name}")
 
 
 def clear_progress(

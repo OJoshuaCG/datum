@@ -455,6 +455,37 @@ def test_delete_migration_allowed_when_history_is_only_failed(admin_client):
     ).status_code == 404
 
 
+def test_record_statement_upserts_a_single_checkpoint_row(admin_client):
+    """
+    El checkpoint se escribe tras CADA sentencia: el upsert de una sola sentencia tiene que
+    dejar exactamente el estado que dejaba el SELECT + INSERT/UPDATE de antes (una fila por
+    BD, migración y dirección, con los valores de la última llamada).
+    """
+    from app.services.db_admin import migration_progress
+
+    model_id = _new_model(admin_client, slug="ckupsert", name="CkUpsert")
+    r = _create_migration(admin_client, model_id)
+    mig = r.json()["data"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5484)
+
+    migration_progress.record_statement(db_id, mig["id"], "up", 1, 5, mig["checksum"])
+    migration_progress.record_statement(db_id, mig["id"], "up", 2, 5, mig["checksum"])
+    migration_progress.record_statement(db_id, mig["id"], "down", 1, 3, mig["checksum"])
+
+    checkpoints = migration_progress.load_database_progress(db_id)
+    assert checkpoints == {
+        (mig["id"], "up"): migration_progress.ProgressState(
+            last_statement_index=2, total_statements=5, migration_checksum=mig["checksum"],
+        ),
+        (mig["id"], "down"): migration_progress.ProgressState(
+            last_statement_index=1, total_statements=3, migration_checksum=mig["checksum"],
+        ),
+    }
+    assert migration_progress.get_progress(db_id, mig["id"], "up") == checkpoints[
+        (mig["id"], "up")
+    ]
+
+
 def test_delete_migration_blocked_by_partial_application_409(admin_client):
     """
     Un intento fallido puede haber dejado sentencias commiteadas a medias. El checkpoint es
