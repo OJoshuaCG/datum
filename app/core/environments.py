@@ -362,6 +362,22 @@ MIGRATION_MIRROR_ENABLED = (
 # ``lock_timeout`` en ``remote_engine._connect_args``.
 MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS = int(os.getenv("MIGRATION_LOCK_WAIT_TIMEOUT_SECONDS", "60"))
 
+# ======= Ejecutor de migraciones de blueprint ======= #
+# ``alembic``: ``alembic.command`` a través del env.py compartido. Usa el proxy GLOBAL
+# ``alembic.context``, así que cada upgrade/downgrade/stamp del servicio espera en una única
+# cola (``_ALEMBIC_LOCK``): un ALTER de 10 minutos sobre la base A frena a la base B.
+# ``native``: el mismo ``MigrationContext`` de Alembic armado sin proxies globales, en
+# paralelo entre bases distintas (cada base sigue serializada por su advisory lock). La tabla
+# de versión la escribe el mismo código de Alembic. Ver docs/plans/14-fan-out-de-migraciones.md.
+MIGRATION_EXECUTOR_ALEMBIC = "alembic"
+MIGRATION_EXECUTOR_NATIVE = "native"
+MIGRATION_EXECUTOR = os.getenv("MIGRATION_EXECUTOR", MIGRATION_EXECUTOR_ALEMBIC).strip().lower()
+if MIGRATION_EXECUTOR not in (MIGRATION_EXECUTOR_ALEMBIC, MIGRATION_EXECUTOR_NATIVE):
+    raise ValueError(
+        f"MIGRATION_EXECUTOR inválido: debe ser '{MIGRATION_EXECUTOR_ALEMBIC}' o "
+        f"'{MIGRATION_EXECUTOR_NATIVE}'."
+    )
+
 # ======= Captura de resultados de SELECT en migraciones de blueprint ======= #
 # KILL SWITCH global. False = ninguna migración captura resultados, ni con
 # capture_selects=true en la versión (el SQL se ejecuta exactamente igual que hoy: la

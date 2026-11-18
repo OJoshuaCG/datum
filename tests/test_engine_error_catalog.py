@@ -229,7 +229,7 @@ def _run_failing_apply(monkeypatch, exc) -> MigrationResult:
     def boom(cfg, version):
         raise exc
 
-    monkeypatch.setattr(mig.command, "upgrade", boom)
+    monkeypatch.setattr(mig.migration_executor, "upgrade", boom)
     monkeypatch.setattr(mig.migration_results, "begin", lambda *a, **k: None)
     monkeypatch.setattr(mig.migration_results, "finalize", lambda *a, **k: 0)
     monkeypatch.setattr(mig.migration_progress, "get_progress", lambda *a, **k: None)

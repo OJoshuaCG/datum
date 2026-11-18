@@ -14,11 +14,12 @@ Diseño:
   derivados reconstituibles. Esto evita estado de filesystem persistente y carreras
   entre motores distintos del mismo blueprint.
 - **Aplicación incremental**: se aplica UNA migración por llamada a
-  ``command.upgrade`` para obtener tiempo y error por migración, y para detener la
-  cadena en la primera que falle.
-- **Thread-safety**: el proxy global ``alembic.context`` NO es thread-safe; todas
-  las llamadas a ``command.*`` se serializan con ``_ALEMBIC_LOCK``. El fan-out
-  masivo real (multiprocessing) se aborda en el Plan 06.
+  ``migration_executor.upgrade`` para obtener tiempo y error por migración, y para
+  detener la cadena en la primera que falle.
+- **Thread-safety**: ``upgrade``/``downgrade``/``stamp`` pasan por
+  ``migration_executor``. Con ``MIGRATION_EXECUTOR=alembic`` se serializan en una cola
+  global (el proxy ``alembic.context`` no es thread-safe); con ``native`` bases distintas
+  corren en paralelo. Ver el docstring de ``migration_executor``.
 - **Advisory lock** por BD antes de mutar, en la MISMA conexión (lock de sesión que
   sobrevive a los commits de Alembic): evita doble aplicación concurrente.
 """
@@ -28,14 +29,12 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Connection, inspect
@@ -55,7 +54,7 @@ from app.core.remote_engine import (
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
 from app.services import engine_error_catalog, provisioning_catalog
-from app.services.db_admin import migration_progress, migration_results
+from app.services.db_admin import migration_executor, migration_progress, migration_results
 from app.services.db_admin.identifiers import (
     GATEWAY_TABLE_PREFIXES,
     quote_identifier,
@@ -75,9 +74,6 @@ logger = get_logger(__name__)
 
 # Directorio del env.py compartido (contiene env.py + script.py.mako).
 _SHARED_DIR = Path(__file__).resolve().parents[3] / "migrations" / "_shared"
-
-# Alembic usa un EnvironmentContext GLOBAL de módulo: serializamos command.*.
-_ALEMBIC_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -1218,8 +1214,7 @@ class MigrationRunner:
             else None
         )
         try:
-            with _ALEMBIC_LOCK:
-                command.upgrade(cfg, spec.version)
+            migration_executor.upgrade(cfg, spec.version)
             ms = int((time.monotonic() - t0) * 1000)
             # Capturas de SELECT: la transacción (si hubo) confirmó.
             captured = migration_results.finalize(
@@ -1318,8 +1313,7 @@ class MigrationRunner:
                     migration_results.begin(managed_db_id, mig_id, "down")
                 captured = 0
                 try:
-                    with _ALEMBIC_LOCK:
-                        command.downgrade(cfg, "-1")
+                    migration_executor.downgrade(cfg, "-1")
                 except Exception as exc:  # noqa: BLE001 — registrar fallo y detener
                     ms = int((time.monotonic() - t0) * 1000)
                     logger.warning("Falló el rollback de %s: %s", current, exc, exc_info=True)
@@ -1520,8 +1514,7 @@ class MigrationRunner:
             target, db_name=db_name, slug=slug, engine=engine, specs=specs,
             managed_db_id=managed_db_id, op="migration_stamp",
         ) as (_conn, cfg, _vt):
-            with _ALEMBIC_LOCK:
-                command.stamp(cfg, version, purge=purge)
+            migration_executor.stamp(cfg, version, purge=purge)
 
     # ------------------------------------------------------------------ #
     # Ejecución AD-HOC (Opción B del diff estructural)                    #
