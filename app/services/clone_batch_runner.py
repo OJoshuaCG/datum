@@ -20,55 +20,39 @@ grande que con un clon suelto, así que ``WORKERS=1`` en el arranque de uvicorn 
 default cómodo y pasa a ser un requisito: el barrido marca ``interrupted`` todo lo que esté
 ``running``, sin distinguir de qué proceso es.
 
-NOTA (``P-23``): éste es el CUARTO módulo de esta familia con el mismo esqueleto de runner
-(clon, collation, export y lote). El ticket pide unificarlos y sigue abierto: acá NO se
-unificó nada, para no atar una feature nueva a un refactor de tres módulos en producción.
-Lo que sí cambió es el conteo — quien tome ``P-23`` ahora tiene cuatro copias, no tres.
+El esqueleto (pool perezoso, guards por clave, log del worker y del barrido) es el compartido
+de ``app/services/inprocess_job_runner.py`` (``P-23``); acá queda lo propio del lote.
 """
 
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 from app.core.environments import CLONE_BATCH_MAX_WORKERS
 from app.core.logger import get_logger
+from app.services.inprocess_job_runner import (
+    InProcessJobPool,
+    KeyedGuards,
+    run_logged,
+    sweep_logged,
+)
 
 logger = get_logger(__name__)
 
-_executor: ThreadPoolExecutor | None = None
-_executor_lock = threading.Lock()
+_pool = InProcessJobPool(
+    max_workers=CLONE_BATCH_MAX_WORKERS, thread_name_prefix="clone-batch"
+)
 
 # Guard in-process por SERVIDOR destino (no por BD, como en ``clone_runner``): un lote
 # escribe sobre N bases del mismo servidor, así que la clave natural es el servidor. Evita
 # que dos lotes hacia el mismo destino se pisen dentro de este proceso. La serialización
 # cross-proceso real la sigue dando el advisory lock del motor que toma cada job.
-_server_guards: dict[int, threading.Lock] = {}
-_guards_lock = threading.Lock()
-
-
-def _get_executor() -> ThreadPoolExecutor:
-    global _executor
-    if _executor is None:
-        # Doble chequeo bajo lock: dos requests concurrentes en el arranque podrían crear
-        # dos pools, y el segundo se perdería con sus hilos ya levantados.
-        with _executor_lock:
-            if _executor is None:
-                _executor = ThreadPoolExecutor(
-                    max_workers=max(1, CLONE_BATCH_MAX_WORKERS),
-                    thread_name_prefix="clone-batch",
-                )
-    return _executor
+_server_guards = KeyedGuards()
 
 
 def server_guard(server_id: int) -> threading.Lock:
     """Lock in-process por servidor destino (misma instancia por ``server_id``)."""
-    with _guards_lock:
-        lock = _server_guards.get(server_id)
-        if lock is None:
-            lock = threading.Lock()
-            _server_guards[server_id] = lock
-        return lock
+    return _server_guards.get(server_id)
 
 
 def enqueue(batch_id: int, item_ids: tuple[int, ...] | None = None) -> None:
@@ -78,17 +62,19 @@ def enqueue(batch_id: int, item_ids: tuple[int, ...] | None = None) -> None:
     ``item_ids`` acota el recorrido a las filas que la capa 2 autorizó al confirmar; ``None`` las
     recorre todas. El worker no re-evalúa permisos: ejecuta exactamente lo que se le encola.
     """
-    _get_executor().submit(_run, batch_id, item_ids)
+    _pool.submit(_run, batch_id, item_ids)
 
 
 def _run(batch_id: int, item_ids: tuple[int, ...] | None = None) -> None:
     """Punto de entrada del worker: delega en el controller (importado tarde por los ciclos)."""
     from app.controllers.clone_batch_controller import CloneBatchController
 
-    try:
-        CloneBatchController().run_batch(batch_id, item_ids)
-    except Exception:  # noqa: BLE001 — el worker nunca debe morir silenciosamente sin log
-        logger.error("Lote de clonación %s falló de forma inesperada", batch_id, exc_info=True)
+    run_logged(
+        logger,
+        "Lote de clonación %s falló de forma inesperada",
+        batch_id,
+        lambda: CloneBatchController().run_batch(batch_id, item_ids),
+    )
 
 
 def sweep_interrupted() -> int:
@@ -102,8 +88,8 @@ def sweep_interrupted() -> int:
     """
     from app.controllers.clone_batch_controller import CloneBatchController
 
-    try:
-        return CloneBatchController().sweep_interrupted()
-    except Exception:  # noqa: BLE001 — el arranque nunca debe romperse por esto
-        logger.warning("No se pudo barrer lotes de clonación interrumpidos", exc_info=True)
-        return 0
+    return sweep_logged(
+        logger,
+        "No se pudo barrer lotes de clonación interrumpidos",
+        lambda: CloneBatchController().sweep_interrupted(),
+    )

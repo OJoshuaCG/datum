@@ -17,15 +17,19 @@ arranque. El pipeline real (limpiar → estructura → datos → adopt) vive en
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 from app.core.environments import CLONE_MAX_WORKERS
 from app.core.logger import get_logger
+from app.services.inprocess_job_runner import (
+    InProcessJobPool,
+    KeyedGuards,
+    run_logged,
+    sweep_logged,
+)
 
 logger = get_logger(__name__)
 
-_executor: ThreadPoolExecutor | None = None
-_executor_lock = threading.Lock()
+_pool = InProcessJobPool(max_workers=CLONE_MAX_WORKERS, thread_name_prefix="clone")
 
 # Guards in-process por BD destino (clave física "server_id:db"). Serializan dos clones
 # concurrentes a la misma BD destino DENTRO de este proceso (evitan lanzar el pipeline dos
@@ -33,44 +37,29 @@ _executor_lock = threading.Lock()
 # da el advisory lock del motor, que ``CloneController._pipeline`` sostiene UNA vez sobre una
 # conexión dedicada durante TODAS las fases (limpiar → estructura → datos → adopt), no por
 # sentencia — ver ``MigrationRunner.advisory_lock``.
-_target_guards: dict[str, threading.Lock] = {}
-_guards_lock = threading.Lock()
-
-
-def _get_executor() -> ThreadPoolExecutor:
-    global _executor
-    if _executor is None:
-        with _executor_lock:
-            if _executor is None:
-                _executor = ThreadPoolExecutor(
-                    max_workers=max(1, CLONE_MAX_WORKERS), thread_name_prefix="clone"
-                )
-    return _executor
+_target_guards = KeyedGuards()
 
 
 def target_guard(target_ref: str) -> threading.Lock:
     """Lock in-process para una BD destino (misma instancia por ``target_ref``)."""
-    with _guards_lock:
-        lock = _target_guards.get(target_ref)
-        if lock is None:
-            lock = threading.Lock()
-            _target_guards[target_ref] = lock
-        return lock
+    return _target_guards.get(target_ref)
 
 
 def enqueue(job_id: int) -> None:
     """Encola la ejecución del job en el pool de hilos."""
-    _get_executor().submit(_run, job_id)
+    _pool.submit(_run, job_id)
 
 
 def _run(job_id: int) -> None:
     """Punto de entrada del worker: delega en el controller (importado tarde para evitar ciclos)."""
     from app.controllers.clone_controller import CloneController
 
-    try:
-        CloneController().run_job(job_id)
-    except Exception:  # noqa: BLE001 — el worker nunca debe morir silenciosamente sin log
-        logger.error("Job de clonación %s falló de forma inesperada", job_id, exc_info=True)
+    run_logged(
+        logger,
+        "Job de clonación %s falló de forma inesperada",
+        job_id,
+        lambda: CloneController().run_job(job_id),
+    )
 
 
 def sweep_interrupted() -> int:
@@ -80,8 +69,8 @@ def sweep_interrupted() -> int:
     """
     from app.controllers.clone_controller import CloneController
 
-    try:
-        return CloneController().sweep_interrupted()
-    except Exception:  # noqa: BLE001 — el arranque nunca debe romperse por esto
-        logger.warning("No se pudo barrer jobs de clonación interrumpidos", exc_info=True)
-        return 0
+    return sweep_logged(
+        logger,
+        "No se pudo barrer jobs de clonación interrumpidos",
+        lambda: CloneController().sweep_interrupted(),
+    )

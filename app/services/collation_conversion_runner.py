@@ -3,9 +3,9 @@ Subsistema de ejecución asíncrona de jobs de conversión de charset/collation.
 
 MISMO patrón que ``app/services/clone_runner.py`` (worker IN-PROCESS con
 ``ThreadPoolExecutor``, estado en la BD de metadatos, barrido de ``running`` huérfanos en el
-``lifespan``) y a propósito un módulo SEPARADO: generalizar ``clone_runner`` en una
-abstracción compartida es alcance de otra tarea, y duplicar ~90 líneas de administración de
-pool cuesta menos que acoplar dos features que todavía pueden divergir.
+``lifespan``), sobre el esqueleto compartido de ``app/services/inprocess_job_runner.py``
+(``P-23``). Es un módulo SEPARADO porque el pool, los guards y el barrido son propios de la
+conversión: no compite por hilos con el clon.
 
 POR QUÉ ASÍNCRONO: ``ALTER TABLE ... CONVERT TO CHARACTER SET`` REESCRIBE la tabla completa
 (la doc de MySQL lo confirma: cambia el default de la tabla *y* todas las columnas de
@@ -24,15 +24,21 @@ barrido de arranque. El pipeline real vive en
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 from app.core.environments import COLLATION_CONVERSION_MAX_WORKERS
 from app.core.logger import get_logger
+from app.services.inprocess_job_runner import (
+    InProcessJobPool,
+    KeyedGuards,
+    run_logged,
+    sweep_logged,
+)
 
 logger = get_logger(__name__)
 
-_executor: ThreadPoolExecutor | None = None
-_executor_lock = threading.Lock()
+_pool = InProcessJobPool(
+    max_workers=COLLATION_CONVERSION_MAX_WORKERS, thread_name_prefix="collation"
+)
 
 # Guards in-process por BD (clave física "server_id:db"). Serializan dos conversiones
 # concurrentes de la MISMA BD dentro de este proceso. La serialización CROSS-PROCESO real la
@@ -41,35 +47,17 @@ _executor_lock = threading.Lock()
 # Comparte espacio de claves con el clon y con schema-comparisons (misma ``lock_key``
 # derivada del ``managed_database_id`` o de la clave sintética negativa), así que una
 # conversión y un clon sobre la misma BD física NO pueden pisarse.
-_db_guards: dict[str, threading.Lock] = {}
-_guards_lock = threading.Lock()
-
-
-def _get_executor() -> ThreadPoolExecutor:
-    global _executor
-    if _executor is None:
-        with _executor_lock:
-            if _executor is None:
-                _executor = ThreadPoolExecutor(
-                    max_workers=max(1, COLLATION_CONVERSION_MAX_WORKERS),
-                    thread_name_prefix="collation",
-                )
-    return _executor
+_db_guards = KeyedGuards()
 
 
 def database_guard(db_ref: str) -> threading.Lock:
     """Lock in-process para una BD (misma instancia por ``db_ref``)."""
-    with _guards_lock:
-        lock = _db_guards.get(db_ref)
-        if lock is None:
-            lock = threading.Lock()
-            _db_guards[db_ref] = lock
-        return lock
+    return _db_guards.get(db_ref)
 
 
 def enqueue(job_id: int) -> None:
     """Encola la ejecución del job en el pool de hilos."""
-    _get_executor().submit(_run, job_id)
+    _pool.submit(_run, job_id)
 
 
 def _run(job_id: int) -> None:
@@ -78,13 +66,12 @@ def _run(job_id: int) -> None:
         CollationConversionController,
     )
 
-    try:
-        CollationConversionController().run_job(job_id)
-    except Exception:  # noqa: BLE001 — el worker nunca debe morir sin dejar log
-        logger.error(
-            "Job de conversión de collation %s falló de forma inesperada", job_id,
-            exc_info=True,
-        )
+    run_logged(
+        logger,
+        "Job de conversión de collation %s falló de forma inesperada",
+        job_id,
+        lambda: CollationConversionController().run_job(job_id),
+    )
 
 
 def sweep_interrupted() -> int:
@@ -96,10 +83,8 @@ def sweep_interrupted() -> int:
         CollationConversionController,
     )
 
-    try:
-        return CollationConversionController().sweep_interrupted()
-    except Exception:  # noqa: BLE001 — el arranque nunca debe romperse por esto
-        logger.warning(
-            "No se pudo barrer jobs de conversión de collation interrumpidos", exc_info=True
-        )
-        return 0
+    return sweep_logged(
+        logger,
+        "No se pudo barrer jobs de conversión de collation interrumpidos",
+        lambda: CollationConversionController().sweep_interrupted(),
+    )

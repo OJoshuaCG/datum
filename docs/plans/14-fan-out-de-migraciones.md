@@ -113,7 +113,7 @@ job: si falla, no se crea nada.
 - **Un job activo por blueprint** (`409 migration_apply_job.already_active`).
 - **El barrido marca `pending` y `running`:** el plan vive en memoria, así que tras un reinicio
   ni un `pending` puede arrancar.
-- `P-23` (unificar el esqueleto de runners) **no** se hizo: sigue abierto.
+- `P-23`: el esqueleto de runners se unificó después, en `app/services/inprocess_job_runner.py`; los vocabularios de ítem siguen abiertos.
 
 ### Riesgos
 

@@ -1,14 +1,11 @@
 """
 Subsistema de ejecución asíncrona de jobs de EXPORTACIÓN de bases de datos.
 
-TERCERA COPIA CONSCIENTE del patrón de ``clone_runner.py`` y
-``collation_conversion_runner.py`` (worker IN-PROCESS con ``ThreadPoolExecutor``, estado en
-la BD de metadatos, barrido de ``running`` huérfanos en el ``lifespan``). Se copia en vez de
-extraer la abstracción compartida por el mismo motivo que la segunda: unificar tres runners
-y dos vocabularios de ítem es un refactor propio, con su propia superficie de regresión, y
-acoplar hoy tres features que todavía pueden divergir cuesta más que ~90 líneas de
-administración de pool. **Queda anotado como deuda** (§16.6 del diseño): el cuarto módulo de
-esta familia debería ser el disparador de unificarlas, no éste.
+Mismo patrón que ``clone_runner.py`` y ``collation_conversion_runner.py`` (worker IN-PROCESS
+con ``ThreadPoolExecutor``, estado en la BD de metadatos, barrido de ``running`` huérfanos en
+el ``lifespan``), sobre el esqueleto compartido de ``app/services/inprocess_job_runner.py``
+(``P-23``). Lo propio de la exportación es el techo de admisión (``_inflight``) y la
+ausencia del advisory lock, ambos explicados abajo.
 
 POR QUÉ ASÍNCRONO: una exportación lee la base ENTERA del origen y puede tardar horas. No
 cabe en una llamada HTTP, y el §19.5 exige progreso, cancelación y reintento — los tres
@@ -38,46 +35,30 @@ NO es durable: si el proceso se reinicia, los jobs ``running`` quedan ``interrup
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 from app.core.environments import EXPORT_MAX_WORKERS
 from app.core.logger import get_logger
+from app.services.inprocess_job_runner import (
+    InProcessJobPool,
+    KeyedGuards,
+    run_logged,
+    sweep_logged,
+)
 
 logger = get_logger(__name__)
 
-_executor: ThreadPoolExecutor | None = None
-_executor_lock = threading.Lock()
+_pool = InProcessJobPool(max_workers=EXPORT_MAX_WORKERS, thread_name_prefix="export")
 
 # Guards in-process por BD de ORIGEN (clave física "server_id:db"). Serializan dos
 # exportaciones concurrentes de la MISMA base dentro de este proceso. NO comparten espacio de
 # claves con el advisory lock del motor (ver el docstring del módulo): son mecanismos
 # distintos y la exportación solo usa éste.
-_db_guards: dict[str, threading.Lock] = {}
-_guards_lock = threading.Lock()
-
-
-def _get_executor() -> ThreadPoolExecutor:
-    global _executor
-    if _executor is None:
-        with _executor_lock:
-            # Doble chequeo: entre el ``is None`` de afuera y el lock, otro hilo pudo haberlo
-            # creado ya. Sin esto se instancian dos pools y uno queda huérfano.
-            if _executor is None:
-                _executor = ThreadPoolExecutor(
-                    max_workers=max(1, EXPORT_MAX_WORKERS),
-                    thread_name_prefix="export",
-                )
-    return _executor
+_db_guards = KeyedGuards()
 
 
 def database_guard(db_ref: str) -> threading.Lock:
     """Lock in-process para una BD de origen (misma instancia por ``db_ref``)."""
-    with _guards_lock:
-        lock = _db_guards.get(db_ref)
-        if lock is None:
-            lock = threading.Lock()
-            _db_guards[db_ref] = lock
-        return lock
+    return _db_guards.get(db_ref)
 
 
 # Jobs ADMITIDOS: encolados y todavía sin terminar (los que esperan turno y el que corre).
@@ -101,7 +82,7 @@ def enqueue(job_id: int) -> None:
     with _inflight_lock:
         _inflight.add(job_id)
     try:
-        _get_executor().submit(_run, job_id)
+        _pool.submit(_run, job_id)
     except BaseException:
         # Si el submit falla, el job NO quedó admitido: dejarlo contado inflaría el techo
         # para siempre y terminaría rechazando exportaciones legítimas.
@@ -115,10 +96,11 @@ def _run(job_id: int) -> None:
     from app.controllers.export_controller import ExportController
 
     try:
-        ExportController().run_job(job_id)
-    except Exception:
-        logger.error(
-            "Job de exportación %s falló de forma inesperada", job_id, exc_info=True
+        run_logged(
+            logger,
+            "Job de exportación %s falló de forma inesperada",
+            job_id,
+            lambda: ExportController().run_job(job_id),
         )
     finally:
         with _inflight_lock:
@@ -135,10 +117,8 @@ def sweep_interrupted() -> int:
     """
     from app.controllers.export_controller import ExportController
 
-    try:
-        return ExportController().sweep_interrupted()
-    except Exception:
-        logger.warning(
-            "No se pudo barrer jobs de exportación interrumpidos", exc_info=True
-        )
-        return 0
+    return sweep_logged(
+        logger,
+        "No se pudo barrer jobs de exportación interrumpidos",
+        lambda: ExportController().sweep_interrupted(),
+    )
