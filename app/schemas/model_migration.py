@@ -1,6 +1,7 @@
 """Schemas Pydantic del recurso ModelMigration (migraciones de un blueprint)."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -914,6 +915,48 @@ class ApplyAllOut(BaseModel):
         ),
     )
     results: list[ApplyAllItemOut]
+
+
+class MigrationApplyJobOut(BaseModel):
+    """Job de ``apply-all`` en background: progreso y, al consultar uno, el ítem por base."""
+
+    id: int
+    model_id: int
+    status: Literal["pending", "running", "done", "partial", "failed", "interrupted"] = Field(
+        ...,
+        description=(
+            "'done' = todas las bases recorridas sin error; 'partial' = alguna falló; "
+            "'failed' = el job se cortó por un error inesperado; 'interrupted' = el proceso se "
+            "reinició (no se re-encola: se relanza a mano). El polling termina en cualquiera "
+            "salvo 'pending' y 'running'."
+        ),
+    )
+    environment_id: int | None = None
+    target_version: str | None = Field(
+        None, description="Tope del lote ya resuelto (si se pidió por canal, la versión del canal)."
+    )
+    channel_slug: str | None = None
+    on_failure: str
+    force: bool
+    total_databases: int = Field(
+        ..., description="TODAS las BDs del blueprint, igual que en el apply-all síncrono."
+    )
+    matched_databases: int
+    planned: int = Field(..., description="Bases que el job recorre (tope 'max_databases' aplicado).")
+    processed: int = Field(..., description="Bases ya terminadas: el progreso es 'processed de planned'.")
+    failed: int = Field(..., description="Bases recorridas que terminaron con ok=false.")
+    error: str | None = Field(None, description="Motivo acotado si el JOB falló o se interrumpió.")
+    created_by_username: str | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    results: list[ApplyAllItemOut] | None = Field(
+        None,
+        description=(
+            "Mismo ítem que 'results' del apply-all síncrono, uno por base TERMINADA, en orden. "
+            "Al cerrar se agregan los omitidos por scope. Null en el listado de jobs."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #

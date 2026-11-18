@@ -33,14 +33,21 @@ recomienda como solución.
 
 ## Fase A — Ejecutar las revisiones sin `alembic.context`
 
-### Decisión propuesta
+### Decisión tomada (implementada en `app/services/db_admin/migration_executor.py`)
 
-Reemplazar `command.upgrade/downgrade/stamp` por un ejecutor propio que corre sobre la conexión que
-`_prepared` ya abre. Es viable porque las revisiones generadas no usan nada de Alembic salvo
-`op.get_bind().exec_driver_sql(...)` (más `record_statement` y `capture_statement`, que son
-funciones nuestras). El ejecutor no tiene estado global, así que el lock deja de hacer falta. La
-serialización POR BASE la sigue dando el advisory lock del motor (`GET_LOCK` /
-`pg_advisory_lock`), que ya existe.
+El ejecutor `native` **no reimplementa la contabilidad de versión**: arma el mismo
+`MigrationContext` de Alembic que arma el env.py, como instancia local y sin pasar por los proxies
+globales `alembic.context` / `alembic.op`. La tabla de versión la sigue escribiendo el código de
+Alembic (`HeadMaintainer`) en los dos modos. Lo único global que toca el código generado es
+`op.get_bind()`; en `native`, cada módulo de revisión de la corrida recibe su propio `op`, que solo
+devuelve la conexión de esa corrida. Es seguro porque Alembic carga cada revisión como un módulo
+nuevo que no registra en `sys.modules`. La serialización POR BASE la sigue dando el advisory lock
+del motor (`GET_LOCK` / `pg_advisory_lock`).
+
+Esto achica el riesgo frente a la propuesta original (un ejecutor que escribiera la tabla de
+versión a mano). La lista de abajo sigue siendo lo que el test de paridad tiene que probar.
+Dependencia interna: `ScriptDirectory._upgrade_revs/_downgrade_revs/_stamp_revs`, los mismos que
+usa `alembic.command`.
 
 | Alternativa | Por qué no |
 |-------------|------------|
@@ -94,11 +101,24 @@ job: si falla, no se crea nada.
 | Durabilidad | Igual que la familia: no es cola durable; un reinicio deja el lote `interrupted` y se relanza a mano. |
 | Deuda | Sería la QUINTA copia del esqueleto de runner (ticket `P-23`). Conviene hacer `P-23` antes o junto con esta fase. |
 
+### Decisión tomada
+
+- **Endpoint nuevo, el síncrono no cambia:** `POST .../apply-all-jobs` responde `202`;
+  `POST .../apply-all` sigue con su `200` síncrono. Así no hay que coordinar un corte con la SPA:
+  migra cuando quiera.
+- **Una sola tabla** `migration_apply_jobs`, con los ítems como JSON en `results`, en vez de tabla
+  de lote más tabla de ítems: el ítem ya es el dict de `apply-all` y nadie lo consulta por columna.
+- **El ítem es idéntico por construcción:** `apply_all` se partió en `_prepare_apply_all` →
+  `_apply_all_item` → `_finish_apply_all`, y el job reusa los tres.
+- **Un job activo por blueprint** (`409 migration_apply_job.already_active`).
+- **El barrido marca `pending` y `running`:** el plan vive en memoria, así que tras un reinicio
+  ni un `pending` puede arrancar.
+- `P-23` (unificar el esqueleto de runners) **no** se hizo: sigue abierto.
+
 ### Riesgos
 
-- **Contrato que consume el frontend** (item de alto riesgo 3): el `200` síncrono pasa a `202`. Hace
-  falta coordinar con la SPA o mantener el modo síncrono detrás de un parámetro durante la
-  transición.
+- **Contrato que consume el frontend** (item de alto riesgo 3): mitigado con el endpoint nuevo; el
+  refactor de `apply_all` sí toca el camino síncrono y lo cubren sus suites existentes.
 
 ## Verificación
 

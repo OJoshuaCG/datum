@@ -144,6 +144,7 @@ async def lifespan(app: FastAPI):
         collation_conversion_runner,
         export_runner,
         export_storage,
+        migration_apply_job_runner,
     )
 
     clone_runner.sweep_interrupted()
@@ -154,6 +155,7 @@ async def lifespan(app: FastAPI):
     clone_batch_runner.sweep_interrupted()
     collation_conversion_runner.sweep_interrupted()
     export_runner.sweep_interrupted()
+    migration_apply_job_runner.sweep_interrupted()
     # Capacidades puntuales: las solicitudes pendientes vencidas pasan a 'expired' (D6). Es solo
     # prolijidad —una pendiente nunca surte efecto—, así que un fallo (p. ej. la tabla todavía
     # no migrada) NO puede impedir el arranque.

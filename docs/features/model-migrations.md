@@ -94,10 +94,17 @@ del camino (pendientes hacia adelante, o versiones a revertir hacia atrás) tien
 
 ```http
 POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1..100) ?force= ?dry_run= ?confirm_token= ?confirm_phrase= (3/min)
+POST   /api/v1/database-models/{id}/migrations/apply-all-jobs           # mismos query sin dry_run → 202 (3/min)
+GET    /api/v1/database-models/{id}/migrations/apply-all-jobs           # ?limit=(1..100)
+GET    /api/v1/database-models/{id}/migrations/apply-all-jobs/{job_id}
 ```
 
 `apply-all` es **síncrono y acotado** (`max_databases` ≤100); continúa con las demás BDs
-aunque una falle. El fan-out asíncrono real es del Plan 06.
+aunque una falle. `apply-all-jobs` hace lo mismo en background: valida y corre el preflight
+destructivo en el request (un lote rechazado no crea job), responde `202` y se consulta por polling.
+Un job activo por blueprint (`409 migration_apply_job.already_active`); no es cola durable (un
+reinicio lo deja `interrupted`). `MIGRATION_APPLY_MAX_WORKERS` (default 1) fija cuántos jobs de
+blueprints distintos corren a la vez. Contrato completo en `docs/api-reference.md`.
 
 ### Versiones destructivas en un entorno protegido
 
@@ -1123,6 +1130,16 @@ quedar encolada hasta el timeout de volcado bloqueando toda consulta nueva a esa
 lo que **trabaja** el `ALTER`, solo lo que **espera** para empezar. PostgreSQL ya lleva
 `lock_timeout` en la conexión.
 
+**Bases distintas en paralelo: `MIGRATION_EXECUTOR`.** Con `alembic` (default), cada `apply`,
+`rollback` y `stamp` del servicio espera en una única cola, porque `alembic.command` usa un
+contexto global de módulo: un `ALTER` de 10 minutos sobre la base A hace esperar 10 minutos a la
+B. Con `native`, el runner arma el mismo `MigrationContext` de Alembic sin ese contexto global y
+las bases distintas se migran a la vez. La MISMA base sigue de a una, por su advisory lock. La
+tabla de versión la sigue escribiendo Alembic en los dos modos, y un test de paridad
+(`tests/test_migration_executor.py`) compara lo que deja cada uno. El detalle está en el docstring
+de `app/services/db_admin/migration_executor.py`. Volver a `alembic` es cambiar la variable y
+reiniciar, sin migrar nada.
+
 **Por qué los 15 s no eran una protección.** El reflejo es que subir el timeout deja pasar una
 migración descontrolada. Con *ese* timeout no era así: en MySQL/MariaDB son
 `read_timeout`/`write_timeout` **de socket, del CLIENTE**, y **no cancelan nada en el motor**. Lo
@@ -1180,7 +1197,7 @@ queda **correcto** — lo que falta es que el operador lo vea, y para eso está
 | Rate limit `apply`/`rollback`/`stamp`/`reconcile-partial` | 10/min |
 | Rate limit `apply-all` | 3/min |
 | Rate limit `GET .../select-results` | 20/min |
-| Concurrencia | advisory lock por BD; `command.*` serializado en el proceso (multiprocessing = Plan 06) |
+| Concurrencia | advisory lock por BD; entre bases, una sola cola con `MIGRATION_EXECUTOR=alembic` (default) o en paralelo con `native` |
 
 ## Verificación
 

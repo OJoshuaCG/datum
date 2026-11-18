@@ -1304,6 +1304,9 @@ created_at }`. `applied_database_count` (cuántas BDs tienen la versión aplicad
 | `PATCH` | `/api/v1/database-models/{model_id}/migrations/{version}` | Confirma `down_sql` / añade overrides / **aprueba un baseline de snapshot** (`reviewed: true`, gate R1). |
 | `DELETE` | `/api/v1/database-models/{model_id}/migrations/{version}` | Elimina — **solo la última versión** (la punta), **solo si ninguna BD la aplicó con éxito** y **solo si no hay una aplicación parcial sin resolver**; si no, `409`. Un intento que solo **falló** ya **no** bloquea el borrado (antes sí, y como no existe purga de historial la versión quedaba imborrable para siempre): se descarta su historial y queda constancia en auditoría de qué BDs se vieron afectadas. Mismo criterio que el `PATCH` del SQL. |
 | `POST` | `/api/v1/database-models/{model_id}/migrations/apply-all` 🔌 | Aplica a las BDs del blueprint. Con `database_ids` se acota a **destinos concretos** (un id ajeno al blueprint → `422` con la lista); sin él, a todas hasta `max_databases`. Acepta `on_failure`. Rate limit **3/min**. |
+| `POST` | `/api/v1/database-models/{model_id}/migrations/apply-all-jobs` 🔌 | Igual que `apply-all` (sin `dry_run`), pero el recorrido corre en background: responde **`202`** con el job. Las validaciones y el preflight destructivo corren en el request. Un job activo por blueprint (`409 migration_apply_job.already_active`). Rate limit **3/min**. |
+| `GET` | `/api/v1/database-models/{model_id}/migrations/apply-all-jobs` | Jobs del blueprint, del más nuevo al más viejo, sin `results` (`limit` `1..100`, default `20`). |
+| `GET` | `/api/v1/database-models/{model_id}/migrations/apply-all-jobs/{job_id}` | Estado, progreso (`processed` de `planned`) y el ítem por base. `404` si el job es de otro blueprint. |
 | `POST` | `/api/v1/database-models/{model_id}/migrations/validate` | Analiza el SQL **antes** de aplicarlo: parseo, traducción a PostgreSQL, siembra de datos, `COLLATE` forzados, sentencias destructivas y tablas internas del gateway. Con `managed_database_id` **🔌** comprueba además contra el catálogo de esa BD que las tablas referenciadas existan. Rate limit **20/min**. Ver el historial de git (`api-reference-v11.md`, eliminado). |
 
 **Banderas de política (en `ModelMigrationSummary` y en `ModelMigrationOut`).** El gateway publica
@@ -1420,8 +1423,31 @@ curl -X POST "https://<host>/api/v1/database-models/3/migrations/apply-all?max_d
   "message": "Aplicación masiva ejecutada." }
 ```
 
-> Continúa con las demás BDs aunque una falle (cada `result` trae `ok`/`error`). El
-> fan-out asíncrono real (jobs) es del Plan 06; hoy es síncrono y acotado por `max_databases`.
+> Continúa con las demás BDs aunque una falle (cada `result` trae `ok`/`error`). Es síncrono
+> y acotado por `max_databases`; para no bloquear el request, la versión en background es
+> `apply-all-jobs` (abajo).
+
+**Aplicación masiva en background (`apply-all-jobs`)** 🔌:
+
+```bash
+curl -X POST "https://<host>/api/v1/database-models/3/migrations/apply-all-jobs?max_databases=50" \
+  -b cookies.txt
+# 202 → data.id = 17; después, polling:
+curl "https://<host>/api/v1/database-models/3/migrations/apply-all-jobs/17" -b cookies.txt
+```
+
+| Tema | Comportamiento |
+|---|---|
+| Query | Los mismos que `apply-all` (`max_databases`, `database_ids`, `environment_id`, `force`, `on_failure`, `target_version`, `channel`, `confirm_token`, `confirm_phrase`) **menos `dry_run`**: el dry-run (y el `confirm_token` de un lote destructivo) sigue saliendo de `apply-all?dry_run=true`. |
+| Qué corre en el request | Todo lo que puede rechazar el lote: alcance, capa 2, guards por motor, canal y el preflight destructivo todo-o-nada. Cualquier error responde con el **mismo código** que `apply-all` y no se crea ningún job. |
+| Un job por blueprint | Si ya hay uno `pending` o `running`: `409`, `public_context.code = migration_apply_job.already_active` y `public_context.active_job_id`. Seguir ese job en vez de crear otro. |
+| No se pudo encolar | `503`, `public_context.code = migration_apply_job.enqueue_failed` y `public_context.job_id`: el job quedó `failed` en el acto y no bloquea el blueprint, así que se puede volver a pedir. |
+| Respuesta | `MigrationApplyJobOut`: `id`, `status`, `planned` (bases a recorrer), `processed`, `failed`, `total_databases`, `matched_databases`, `target_version`, `channel_slug`, `on_failure`, `force`, `error`, fechas y `results`. |
+| `results` | El **mismo ítem** que `results[]` de `apply-all`, uno por base terminada, en orden. Al cerrar se agregan los omitidos por scope (`error_code = access.forbidden`). `null` en el listado. |
+| `status` | `pending` → `running` → `done` (sin errores) \| `partial` (alguna base con `ok=false`; los omitidos por scope no cuentan) \| `failed` (el job se cortó por un error inesperado) \| `interrupted` (el proceso se reinició). El polling termina en cualquiera salvo `pending`/`running`. |
+| Durabilidad | **No** es una cola durable: tras un reinicio el job queda `interrupted` y se relanza a mano (las bases que ya terminaron reportan cero pendientes). |
+| Paralelismo | Dentro de un job las bases van en serie. `MIGRATION_APPLY_MAX_WORKERS` (default `1`) fija cuántos jobs de blueprints distintos corren a la vez; solo acelera con `MIGRATION_EXECUTOR=native`. |
+| Auditoría | La misma que `apply-all` (`migration.apply_all` al terminar, rechazos por base), con el Request ID del request que creó el job. |
 
 ---
 
@@ -2719,6 +2745,9 @@ alta pendiente.
 | 86 | POST | `/api/v1/capability-grants/{grant_id}/approve` | 🔒 `access_admin` | — |
 | 87 | POST | `/api/v1/capability-grants/{grant_id}/reject` | 🔒 `access_admin` | — |
 | 88 | GET | `/api/v1/gateway-users/{user_id}/effective-access` | 🔒 `access_admin` | — |
+| 89 | POST | `/api/v1/database-models/{model_id}/migrations/apply-all-jobs` | 🔒 | 🔌 |
+| 90 | GET | `/api/v1/database-models/{model_id}/migrations/apply-all-jobs` | 🔒 | — |
+| 91 | GET | `/api/v1/database-models/{model_id}/migrations/apply-all-jobs/{job_id}` | 🔒 | — |
 
 \* Toca el motor solo cuando el flag (`provision` / `drop_remote` / `execute_immediately`)
 es `true`. Los grants y `provision`/`apply-profile` tocan el motor siempre. Los
@@ -3500,6 +3529,9 @@ Query nuevos: `dry_run`, `confirm_token`, `confirm_name`. `confirm_version` pasa
 `rollback_path_versions`, `blocked_by` y `destructive_plan` con `direction: "down"`.
 
 #### Aplicar a todas — `POST /database-models/{id}/migrations/apply-all`
+
+Todo lo de esta sección vale igual para `POST .../apply-all-jobs`: el preflight corre en el request que crea el
+job, así que un lote rechazado no crea job.
 
 Query nuevos: `confirm_token` (≤200) y `confirm_phrase` (≤128, el **slug del entorno**, por ejemplo `production`).
 

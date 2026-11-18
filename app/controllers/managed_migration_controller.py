@@ -126,6 +126,43 @@ class _BatchPreflight:
     confirmation: dict | None = None
 
 
+@dataclass(frozen=True)
+class _ApplyAllPlan:
+    """
+    Lote de ``apply_all`` ya validado: lo que ``_prepare_apply_all`` resolvió en el request.
+
+    Vive solo en memoria (incluye el closure memoizado ``destructive_by_engine``). El job en
+    background lo recibe tal cual en su worker; por eso no es durable: un reinicio deja el job
+    ``interrupted`` en vez de reconstruir el plan.
+    """
+
+    model_id: int
+    slug: str
+    specs: list
+    total: int
+    matched: int
+    dbs: list[tuple]
+    omitted: list[int]
+    env_policies: dict
+    targets: dict[int, tuple]
+    environment_id: int | None
+    target_version: str | None
+    resolved_channel: dict | None
+    dry_run: bool
+    force: bool
+    on_failure: str
+    destructive_by_engine: Callable
+    up_to_target_specs: list
+    preflight: _BatchPreflight
+
+
+class _ApplyAllItemOutcome(NamedTuple):
+    """Ítem de una base de ``apply_all`` y si un guard de entorno o confirmación la denegó."""
+
+    item: dict
+    denied: bool
+
+
 class ManagedMigrationController:
     def __init__(self):
         self.db = Database(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
@@ -2943,7 +2980,9 @@ class ManagedMigrationController:
     ) -> dict:
         """
         Aplica las pendientes a TODAS las BDs del blueprint (síncrono, acotado).
-        Continúa con las demás BDs aunque una falle. El job asíncrono es del Plan 06.
+        Continúa con las demás BDs aunque una falle. La versión en background es
+        ``start_apply_all_job``: mismos tres pasos (``_prepare_apply_all``, ``_apply_all_item``,
+        ``_finish_apply_all``), así que las dos devuelven el mismo ítem por base.
 
         ``target_version`` o ``channel`` (excluyentes) acotan el lote: ninguna BD avanza más
         allá de esa versión. Una BD que YA la superó no se toca ni se revierte: reporta cero
@@ -2958,6 +2997,46 @@ class ManagedMigrationController:
         pendientes, ``_preflight_destructive_batch`` decide ANTES de tocar la primera base: todo o
         nada, con un único ``confirm_token`` del dry-run y el slug del entorno como re-tipeo
         (``confirm_phrase``). Un lote que abarca más de un entorno protegido se rechaza (422).
+        """
+        plan = self._prepare_apply_all(
+            model_id,
+            max_databases=max_databases,
+            database_ids=database_ids,
+            environment_id=environment_id,
+            force=force,
+            dry_run=dry_run,
+            on_failure=on_failure,
+            target_version=target_version,
+            channel=channel,
+            admin=admin,
+            confirm_token=confirm_token,
+            confirm_phrase=confirm_phrase,
+        )
+        outcomes = [self._apply_all_item(plan, database, admin=admin) for database in plan.dbs]
+        return self._finish_apply_all(plan, outcomes, admin=admin)
+
+    def _prepare_apply_all(
+        self,
+        model_id: int,
+        *,
+        max_databases: int,
+        database_ids: list[int] | None = None,
+        environment_id: int | None = None,
+        force: bool = False,
+        dry_run: bool = False,
+        on_failure: str = "auto",
+        target_version: str | None = None,
+        channel: str | None = None,
+        admin: "dict | Actor | None" = None,
+        confirm_token: str | None = None,
+        confirm_phrase: str | None = None,
+    ) -> _ApplyAllPlan:
+        """
+        Paso 1 de ``apply_all``: TODAS las validaciones del lote y el preflight destructivo.
+
+        No toca ninguna base administrada (el preflight solo LEE). Si algo falla lanza la
+        excepción y no se ejecutó nada; el job en background lo corre en el request, antes de
+        crear su fila, para que un lote inválido nunca llegue al worker.
         """
         # Mismo guard que ``apply``: el parámetro llega ahora desde la ruta (antes se
         # aceptaba en la firma pero la ruta no lo exponía, así que siempre valía "auto" y el
@@ -3117,8 +3196,6 @@ class ManagedMigrationController:
         self._assert_target_version_exists(specs, target_version, model_id)
         self._verify_integrity(specs)  # una sola vez para todo el lote
 
-        items: list[dict] = []
-        denied: list[int] = []
         # El set de versiones destructivas depende del MOTOR (por los overrides por motor), y
         # un lote puede ser heterogéneo. Se memoiza por motor para no re-analizar el mismo SQL
         # por cada BD; ``migration_facts.analyze`` ya cachea, esto además evita rearmar el dict.
@@ -3166,125 +3243,192 @@ class ManagedMigrationController:
             confirm_phrase=confirm_phrase,
         )
 
-        for db_id, name, server_id, status in dbs:
-            target, engine = targets[server_id]
-            item = {
-                "managed_database_id": db_id, "database_name": name,
-                "server_id": server_id, "applied": [], "ok": False,
-            }
-            policy = env_policies.get(db_id)
-            item["environment_slug"] = policy[1] if policy else None
-            try:
-                quarantined = status == ProvisionStatus.error
-                self._guard_quarantine(db_id, quarantined, force, dry_run)
-                if dry_run:
-                    plan = self._dry_run_plan(
-                        db_id, name, server_id, target, slug, specs, target_version,
-                        env_policy=policy,
-                        destructive_for=lambda pending_specs, eng=engine: destructive_by_engine(
-                            eng, pending_specs
-                        ),
-                        admin=admin,
-                        issue_token=False,
-                    )
-                    item["ok"] = True
-                    item["pending_versions"] = plan["pending_versions"]
-                    item["dry_run"] = True
-                    item["blocked_by"] = plan["blocked_by"]
-                    item["destructive_plan"] = plan["destructive_plan"]
-                else:
-                    out = self._run_apply(
-                        db_id, db_name=name, server_id=server_id, target=target,
-                        engine=engine, slug=slug, specs=specs, model_id=model_id,
-                        up_to_version=target_version,
-                        was_quarantined=quarantined, admin=admin,
-                        on_failure=on_failure,
-                        env_blocks_destructive=bool(policy and policy[0]),
-                        env_slug=policy[1] if policy else None,
-                        destructive_versions=(
-                            destructive_by_engine(engine, up_to_target_specs)
-                            if policy and policy[0]
-                            else None
-                        ),
-                        batch_confirmed=preflight.confirmed,
-                    )
-                    item["ok"] = not out["failed"]
-                    item["applied"] = out["results"]
-                    # Paridad con el apply por BD: sin esto, tras un apply masivo no había
-                    # forma de saber en qué BDs quedaron capturas ni cómo llegar a ellas.
-                    item["captured_select_count"] = out.get("captured_select_count", 0)
-                    item["captured_versions"] = out.get("captured_versions", [])
-                    item["select_results_available"] = out.get(
-                        "select_results_available", False
-                    )
-            except AppHttpException as exc:
-                item["error"] = exc.message
-                # El código estructurado se copia APARTE de la prosa. Este ``except`` se
-                # quedaba solo con ``exc.message`` y tiraba el ``public_context`` a la basura,
-                # así que para los guards del bucle el canal habitual (``public_context`` de la
-                # respuesta HTTP) no existe: la ruta responde 200 con los ítems adentro. Sin
-                # este campo el cliente vuelve a matchear prosa con expresiones regulares.
-                item["error_code"] = (exc.public_context or {}).get("code")
-                if item["error_code"] == ecodes.CODE_DESTRUCTIVE_BLOCKED:
-                    item["blocked_by"] = list(
-                        (exc.public_context or {}).get("blocked_versions") or []
-                    )
-                    denied.append(db_id)
-                    audit.record(
-                        "migration.environment_denied",
-                        status="denied",
-                        admin=admin,
-                        target_type="managed_database",
-                        target_id=db_id,
-                        server_id=server_id,
-                        touched_engine=False,
-                        detail=(
-                            f"guard=destructive environment={item['environment_slug']} "
-                            f"versions={','.join(item['blocked_by'])}"
-                        ),
-                    )
-                elif item["error_code"] in (CODE_CONFIRMATION_REQUIRED, CODE_EXECUTOR_FORBIDDEN):
-                    # Defensa ante carreras: el preflight ya validó el lote, así que llegar acá
-                    # significa que las aprobaciones o la capacidad cambiaron durante la corrida.
-                    denied.append(db_id)
-                    audit.record(
-                        "migration.environment_denied",
-                        status="denied",
-                        admin=admin,
-                        target_type="managed_database",
-                        target_id=db_id,
-                        server_id=server_id,
-                        touched_engine=False,
-                        detail=(
-                            f"guard=destructive_confirmation code={item['error_code']} "
-                            f"environment={item['environment_slug']}"
-                        ),
-                    )
-                elif item["error_code"] == ccodes.CODE_UNREVIEWED_CAPTURE:
-                    # Mismo criterio que el rechazo por entorno: un guard que frena una BD del
-                    # lote tiene que dejar rastro propio. La ruta responde 200, así que sin esto
-                    # el rechazo solo vive dentro del JSON de la respuesta.
-                    item["unreviewed_capture"] = list(
-                        (exc.public_context or {}).get("unreviewed_capture") or []
-                    )
-                    audit.record(
-                        "migration.capture_review_denied",
-                        status="denied",
-                        admin=admin,
-                        target_type="managed_database",
-                        target_id=db_id,
-                        server_id=server_id,
-                        touched_engine=False,
-                        detail=(
-                            "guard=unreviewed_capture "
-                            f"versions={','.join(item['unreviewed_capture'])}"
-                        ),
-                    )
-            except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote
-                logger.warning("apply_all: error inesperado en BD %s: %s", db_id, exc,
-                               exc_info=True)
-                item["error"] = f"error inesperado: {type(exc).__name__}"
-            items.append(item)
+        return _ApplyAllPlan(
+            model_id=model_id,
+            slug=slug,
+            specs=specs,
+            total=total,
+            matched=matched,
+            dbs=dbs,
+            omitted=omitted,
+            env_policies=env_policies,
+            targets=targets,
+            environment_id=environment_id,
+            target_version=target_version,
+            resolved_channel=resolved_channel,
+            dry_run=dry_run,
+            force=force,
+            on_failure=on_failure,
+            destructive_by_engine=destructive_by_engine,
+            up_to_target_specs=up_to_target_specs,
+            preflight=preflight,
+        )
+
+    def _apply_all_item(
+        self,
+        plan: _ApplyAllPlan,
+        database: tuple,
+        *,
+        admin: "dict | Actor | None",
+    ) -> _ApplyAllItemOutcome:
+        """
+        Paso 2 de ``apply_all``: aplica (o simula) UNA base del plan y arma su ítem.
+
+        Nunca lanza: un error de esta base queda en el ítem y el lote sigue con la próxima.
+        ``admin`` tiene que ser el ``Actor`` vivo del request (también en el worker del job):
+        un dict reconstruido no pasa ``can_at`` y las versiones destructivas se rechazarían.
+        """
+        db_id, name, server_id, status = database
+        model_id = plan.model_id
+        slug = plan.slug
+        specs = plan.specs
+        target_version = plan.target_version
+        dry_run = plan.dry_run
+        force = plan.force
+        on_failure = plan.on_failure
+        destructive_by_engine = plan.destructive_by_engine
+        up_to_target_specs = plan.up_to_target_specs
+        preflight = plan.preflight
+        env_policies = plan.env_policies
+        targets = plan.targets
+        denied = False
+        target, engine = targets[server_id]
+        item = {
+            "managed_database_id": db_id, "database_name": name,
+            "server_id": server_id, "applied": [], "ok": False,
+        }
+        policy = env_policies.get(db_id)
+        item["environment_slug"] = policy[1] if policy else None
+        try:
+            quarantined = status == ProvisionStatus.error
+            self._guard_quarantine(db_id, quarantined, force, dry_run)
+            if dry_run:
+                plan = self._dry_run_plan(
+                    db_id, name, server_id, target, slug, specs, target_version,
+                    env_policy=policy,
+                    destructive_for=lambda pending_specs, eng=engine: destructive_by_engine(
+                        eng, pending_specs
+                    ),
+                    admin=admin,
+                    issue_token=False,
+                )
+                item["ok"] = True
+                item["pending_versions"] = plan["pending_versions"]
+                item["dry_run"] = True
+                item["blocked_by"] = plan["blocked_by"]
+                item["destructive_plan"] = plan["destructive_plan"]
+            else:
+                out = self._run_apply(
+                    db_id, db_name=name, server_id=server_id, target=target,
+                    engine=engine, slug=slug, specs=specs, model_id=model_id,
+                    up_to_version=target_version,
+                    was_quarantined=quarantined, admin=admin,
+                    on_failure=on_failure,
+                    env_blocks_destructive=bool(policy and policy[0]),
+                    env_slug=policy[1] if policy else None,
+                    destructive_versions=(
+                        destructive_by_engine(engine, up_to_target_specs)
+                        if policy and policy[0]
+                        else None
+                    ),
+                    batch_confirmed=preflight.confirmed,
+                )
+                item["ok"] = not out["failed"]
+                item["applied"] = out["results"]
+                # Paridad con el apply por BD: sin esto, tras un apply masivo no había
+                # forma de saber en qué BDs quedaron capturas ni cómo llegar a ellas.
+                item["captured_select_count"] = out.get("captured_select_count", 0)
+                item["captured_versions"] = out.get("captured_versions", [])
+                item["select_results_available"] = out.get(
+                    "select_results_available", False
+                )
+        except AppHttpException as exc:
+            item["error"] = exc.message
+            # El código estructurado se copia APARTE de la prosa. Este ``except`` se
+            # quedaba solo con ``exc.message`` y tiraba el ``public_context`` a la basura,
+            # así que para los guards del bucle el canal habitual (``public_context`` de la
+            # respuesta HTTP) no existe: la ruta responde 200 con los ítems adentro. Sin
+            # este campo el cliente vuelve a matchear prosa con expresiones regulares.
+            item["error_code"] = (exc.public_context or {}).get("code")
+            if item["error_code"] == ecodes.CODE_DESTRUCTIVE_BLOCKED:
+                item["blocked_by"] = list(
+                    (exc.public_context or {}).get("blocked_versions") or []
+                )
+                denied = True
+                audit.record(
+                    "migration.environment_denied",
+                    status="denied",
+                    admin=admin,
+                    target_type="managed_database",
+                    target_id=db_id,
+                    server_id=server_id,
+                    touched_engine=False,
+                    detail=(
+                        f"guard=destructive environment={item['environment_slug']} "
+                        f"versions={','.join(item['blocked_by'])}"
+                    ),
+                )
+            elif item["error_code"] in (CODE_CONFIRMATION_REQUIRED, CODE_EXECUTOR_FORBIDDEN):
+                # Defensa ante carreras: el preflight ya validó el lote, así que llegar acá
+                # significa que las aprobaciones o la capacidad cambiaron durante la corrida.
+                denied = True
+                audit.record(
+                    "migration.environment_denied",
+                    status="denied",
+                    admin=admin,
+                    target_type="managed_database",
+                    target_id=db_id,
+                    server_id=server_id,
+                    touched_engine=False,
+                    detail=(
+                        f"guard=destructive_confirmation code={item['error_code']} "
+                        f"environment={item['environment_slug']}"
+                    ),
+                )
+            elif item["error_code"] == ccodes.CODE_UNREVIEWED_CAPTURE:
+                # Mismo criterio que el rechazo por entorno: un guard que frena una BD del
+                # lote tiene que dejar rastro propio. La ruta responde 200, así que sin esto
+                # el rechazo solo vive dentro del JSON de la respuesta.
+                item["unreviewed_capture"] = list(
+                    (exc.public_context or {}).get("unreviewed_capture") or []
+                )
+                audit.record(
+                    "migration.capture_review_denied",
+                    status="denied",
+                    admin=admin,
+                    target_type="managed_database",
+                    target_id=db_id,
+                    server_id=server_id,
+                    touched_engine=False,
+                    detail=(
+                        "guard=unreviewed_capture "
+                        f"versions={','.join(item['unreviewed_capture'])}"
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote
+            logger.warning("apply_all: error inesperado en BD %s: %s", db_id, exc,
+                           exc_info=True)
+            item["error"] = f"error inesperado: {type(exc).__name__}"
+        return _ApplyAllItemOutcome(item=item, denied=denied)
+
+    def _finish_apply_all(
+        self,
+        plan: _ApplyAllPlan,
+        outcomes: list[_ApplyAllItemOutcome],
+        *,
+        admin: "dict | Actor | None",
+    ) -> dict:
+        """Paso 3 de ``apply_all``: agrega los omitidos, audita el lote y arma la respuesta."""
+        items = [outcome.item for outcome in outcomes]
+        denied_count = sum(1 for outcome in outcomes if outcome.denied)
+        model_id = plan.model_id
+        omitted = plan.omitted
+        dbs = plan.dbs
+        total = plan.total
+        environment_id = plan.environment_id
+        target_version = plan.target_version
+        resolved_channel = plan.resolved_channel
+        dry_run = plan.dry_run
 
         # Ítems omitidos por la capa 2: SOLO el id que mandó el cliente. Sin nombre, servidor ni
         # entorno, y sin tocar nada: son indistinguibles de un "no podés" genérico.
@@ -3300,18 +3444,18 @@ class ManagedMigrationController:
             + (f" (entorno {environment_id})" if environment_id is not None else "")
             + (f" hasta {target_version}" if target_version is not None else "")
             + (f" canal={resolved_channel['slug']}" if resolved_channel is not None else "")
-            + (f" — {len(denied)} denegadas por entorno" if denied else "")
+            + (f" — {denied_count} denegadas por entorno" if denied_count else "")
             + (f" — {len(omitted)} omitidas por scope" if omitted else "")
             + (" (dry-run)" if dry_run else ""),
         )
         return {
             "model_id": model_id,
             "total_databases": total,
-            "matched_databases": matched,
+            "matched_databases": plan.matched,
             "processed": len(dbs),
             "target_version": target_version,
             "resolved_channel": resolved_channel,
-            "destructive_confirmation": preflight.confirmation,
+            "destructive_confirmation": plan.preflight.confirmation,
             "results": items,
         }
 

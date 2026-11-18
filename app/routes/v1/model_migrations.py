@@ -2,7 +2,8 @@
 Endpoints de migraciones de blueprints (``/database-models/{id}/migrations``).
 
 CRUD de migraciones sobre el inventario del gateway (NO toca motores) y el apply
-masivo (síncrono, acotado) sobre todas las BDs del blueprint.
+masivo sobre todas las BDs del blueprint: síncrono y acotado (``apply-all``) o en background
+(``apply-all-jobs``).
 """
 
 from datetime import date
@@ -11,6 +12,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Path, Query, Request
 
 from app.controllers.managed_migration_controller import ManagedMigrationController
+from app.controllers.migration_apply_job_controller import MigrationApplyJobController
 from app.controllers.model_migration_controller import (
     SEARCH_MAX_LENGTH,
     SEARCH_MIN_LENGTH,
@@ -27,6 +29,7 @@ from app.core.limiter import limiter
 from app.core.scope_targets import migration_batch, model
 from app.schemas.model_migration import (
     ApplyAllOut,
+    MigrationApplyJobOut,
     MigrationDeleteOut,
     MigrationDeletePlanOut,
     MigrationEditPreviewIn,
@@ -208,6 +211,112 @@ def apply_all(
     )
     msg = "Plan masivo (dry-run)." if dry_run else "Aplicación masiva ejecutada."
     return success(data=result, message=msg)
+
+
+_APPLY_JOBS_LIST_DEFAULT_LIMIT = 20
+_APPLY_JOBS_LIST_MAX_LIMIT = 100
+
+
+@router.post(
+    "/{model_id}/migrations/apply-all-jobs",
+    response_model=ApiResponse[MigrationApplyJobOut],
+    status_code=202,
+)
+@limiter.limit("3/minute")
+def start_apply_all_job(
+    request: Request,
+    actor: BlueprintsApplyBatch,
+    model_id: int,
+    max_databases: int = Query(10, ge=1, le=100, description="Cota de BDs a procesar"),
+    database_ids: list[int] | None = Query(
+        None, description="Igual que en 'apply-all': destinos concretos del blueprint."
+    ),
+    environment_id: int | None = Query(
+        None, ge=1, description="Igual que en 'apply-all': acota el lote a un entorno."
+    ),
+    force: bool = Query(
+        False,
+        description="Override de cuarentena. NO saltea el bloqueo destructivo por entorno.",
+    ),
+    confirm_token: str | None = Query(
+        None,
+        max_length=200,
+        description="Token de 'destructive_confirmation' del dry-run de 'apply-all'.",
+    ),
+    confirm_phrase: str | None = Query(
+        None,
+        max_length=128,
+        description="Slug del entorno protegido, re-escrito a mano. Se exige con 'confirm_token'.",
+    ),
+    on_failure: str = Query("auto", description="'auto' | 'reconcile' | 'leave', como en 'apply-all'."),
+    target_version: str | None = Query(
+        None, pattern=r"^\d{4,10}$", description="Tope del lote. Excluyente con 'channel'."
+    ),
+    channel: str | None = Query(
+        None,
+        min_length=1,
+        max_length=60,
+        description="Slug de un canal de liberación como tope. Excluyente con 'target_version'.",
+    ),
+):
+    """
+    Igual que ``apply-all``, pero el recorrido corre en background y responde ``202`` al toque 🔌.
+
+    **Lo que corre en ESTE request** es todo lo que puede rechazar el lote: alcance, capa 2,
+    guards por motor, canal y el preflight destructivo todo-o-nada. Cualquier error responde acá
+    con el mismo código que ``apply-all`` y no se crea ningún job. El dry-run sigue siendo
+    ``apply-all?dry_run=true`` (de ahí sale el ``confirm_token``).
+
+    **Un job activo por blueprint**: si ya hay uno ``pending`` o ``running``, responde 409
+    ``migration_apply_job.already_active`` con ``active_job_id``.
+
+    El progreso se consulta en ``GET .../apply-all-jobs/{job_id}``: el ítem por base es el mismo
+    que devuelve ``apply-all``. No es una cola durable: si el proceso se reinicia, el job queda
+    ``interrupted`` y se relanza a mano.
+    """
+    job = MigrationApplyJobController().start_job(
+        model_id,
+        max_databases=max_databases,
+        database_ids=database_ids,
+        environment_id=environment_id,
+        force=force,
+        on_failure=on_failure,
+        target_version=target_version,
+        channel=channel,
+        admin=actor,
+        confirm_token=confirm_token,
+        confirm_phrase=confirm_phrase,
+    )
+    return success(data=job, message="Aplicación masiva encolada.")
+
+
+@router.get(
+    "/{model_id}/migrations/apply-all-jobs",
+    response_model=ApiResponse[list[MigrationApplyJobOut]],
+)
+def list_apply_all_jobs(
+    actor: BlueprintsRead,
+    model_id: int,
+    limit: int = Query(
+        _APPLY_JOBS_LIST_DEFAULT_LIMIT,
+        ge=1,
+        le=_APPLY_JOBS_LIST_MAX_LIMIT,
+        description="Cuántos jobs devolver, del más nuevo al más viejo.",
+    ),
+):
+    """Jobs de ``apply-all`` del blueprint, sin ``results`` (para eso, el GET por id)."""
+    jobs = MigrationApplyJobController().list_jobs(model_id, limit=limit)
+    return success(data=jobs)
+
+
+@router.get(
+    "/{model_id}/migrations/apply-all-jobs/{job_id}",
+    response_model=ApiResponse[MigrationApplyJobOut],
+)
+def get_apply_all_job(actor: BlueprintsRead, model_id: int, job_id: int):
+    """Estado, progreso e ítem por base del job. 404 si el job es de otro blueprint."""
+    job = MigrationApplyJobController().get_job(model_id, job_id)
+    return success(data=job)
 
 
 @router.post(

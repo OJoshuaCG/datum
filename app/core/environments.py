@@ -378,6 +378,12 @@ if MIGRATION_EXECUTOR not in (MIGRATION_EXECUTOR_ALEMBIC, MIGRATION_EXECUTOR_NAT
         f"'{MIGRATION_EXECUTOR_NATIVE}'."
     )
 
+# ======= Jobs de apply-all en background ======= #
+# Cuántos jobs de ``apply-all-jobs`` (de blueprints DISTINTOS) corren a la vez. Dentro de un
+# job las bases se recorren siempre en serie, igual que el apply-all síncrono. Con
+# ``MIGRATION_EXECUTOR=alembic`` subirlo no acelera nada: todos esperan en ``_ALEMBIC_LOCK``.
+MIGRATION_APPLY_MAX_WORKERS = int(os.getenv("MIGRATION_APPLY_MAX_WORKERS", "1"))
+
 # ======= Captura de resultados de SELECT en migraciones de blueprint ======= #
 # KILL SWITCH global. False = ninguna migración captura resultados, ni con
 # capture_selects=true en la versión (el SQL se ejecuta exactamente igual que hoy: la
